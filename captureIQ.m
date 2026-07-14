@@ -4,8 +4,9 @@
 % -------------------------------------------------------------------------
 %  概要:
 %    Ettus Research USRP B205 mini-i を SDR 受信機として使用し、
-%    Wi-Fi (IEEE 802.11) が使用する周波数帯の複素ベースバンド (IQ) 信号を
-%    受信して、USB 外部ストレージにバイナリ形式で保存します。
+%    Wi-Fi (IEEE 802.11) の 5GHz 帯 チャネル36 (中心 5.180 GHz, 帯域 20 MHz)
+%    の複素ベースバンド (IQ) 信号を受信して、USB 外部ストレージに
+%    .mat 形式で保存します。
 %
 %  必要環境:
 %    - MATLAB
@@ -16,12 +17,12 @@
 %    - 十分な空き容量のある USB 外部ストレージ
 %
 %  出力ファイル:
-%    <保存先>/<プレフィックス>_<日時>.bin  … IQ 生データ (complex, interleaved)
-%    <保存先>/<プレフィックス>_<日時>.mat  … 取得条件などのメタデータ
+%    <保存先>/yyyymmddcccc.mat
+%      yyyy=年, mmdd=月日, cccc=時刻(HHMM)。 例: 202607141822.mat
 %
-%  データ形式 (.bin):
-%    I0, Q0, I1, Q1, ... の順にインターリーブされた float32 (single) 実数列。
-%    後で読み込む場合は本ファイル末尾の loadIQ ローカル関数を参照。
+%  .mat の内容:
+%    iq   … 受信 IQ サンプル (complex single 列ベクトル)
+%    meta … 中心周波数・サンプルレート等の取得条件 (構造体)
 %
 %  注意:
 %    電波の受信・記録は、利用地域の電波法および関連法令を遵守し、
@@ -40,13 +41,11 @@ clear; clc;
 % macOS   の例: '/Volumes/USBDRIVE/iq_capture'
 usbSavePath = fullfile('E:', 'iq_capture');   % ★環境に合わせて変更してください
 
-filePrefix  = 'wifi_iq';                       % 出力ファイル名のプレフィックス
-
 % --- Wi-Fi 受信パラメータ -----------------------------------------------
 % Wi-Fi チャンネルの中心周波数 [Hz]
 %   2.4GHz 帯:  ch1=2.412e9, ch6=2.437e9, ch11=2.462e9
 %   5GHz   帯:  ch36=5.180e9, ch40=5.200e9, ch44=5.220e9, ch48=5.240e9
-centerFrequency = 2.412e9;      % [Hz] 例: 2.4GHz 帯 ch1
+centerFrequency = 5.180e9;      % [Hz] 5GHz 帯 ch36 (20MHz 帯域幅)
 
 % サンプリングレート [Sps] = 受信帯域幅
 %   20MHz 幅の Wi-Fi チャンネルを取り込むには 20e6 以上を推奨。
@@ -93,10 +92,11 @@ end
 fclose(fidTest);
 delete(testFile);
 
-% タイムスタンプ付きの出力ファイル名を生成
-timestamp   = datestr(now, 'yyyymmdd_HHMMSS');
-baseName    = sprintf('%s_%s', filePrefix, timestamp);
-binFileName = fullfile(usbSavePath, [baseName '.bin']);
+% 出力ファイル名を生成
+%   形式: yyyymmddcccc.mat  (yyyy=年, mmdd=月日, cccc=時刻HHMM)
+%   例: 2026年07月14日 18:22 に取得 -> 202607141822.mat
+timestamp   = datestr(now, 'yyyymmddHHMM');   % 例: '202607141822'
+baseName    = timestamp;
 matFileName = fullfile(usbSavePath, [baseName '.mat']);
 
 %% ------------------------------------------------------------------------
@@ -144,29 +144,26 @@ fprintf('  中心周波数      : %.4f GHz\n', centerFrequency / 1e9);
 fprintf('  サンプルレート  : %.3f MSps (帯域幅)\n', actualSampleRate / 1e6);
 fprintf('  ゲイン          : %d dB\n', gain);
 fprintf('  キャプチャ時間  : %.2f s\n', captureDuration);
-fprintf('  保存先(.bin)    : %s\n', binFileName);
+fprintf('  保存先(.mat)    : %s\n', matFileName);
 
 %% ------------------------------------------------------------------------
-%  4. IQ 信号のキャプチャと USB への逐次保存
+%  4. IQ 信号のキャプチャ
 %  ------------------------------------------------------------------------
-% メモリ枯渇を避けるため、受信フレームごとにバイナリファイルへ追記書き込み。
+% 取得した複素 IQ サンプルをメモリ上のバッファに蓄積し、
+% 終了後に .mat ファイルへまとめて保存する。
 
 totalSamplesTarget = round(captureDuration * actualSampleRate);
 totalSamplesSaved  = 0;
 overrunCount       = 0;
 
-fidBin = fopen(binFileName, 'w');
-if fidBin == -1
-    release(rx);
-    error('captureIQ:openBinFailed', ...
-        '出力バイナリファイルを開けませんでした: %s', binFileName);
-end
+% 出力バッファを事前確保 (complex single)。少し余裕を持たせる。
+iqBuffer = complex(zeros(totalSamplesTarget + samplesPerFrame, 1, 'single'));
 
 fprintf('\nキャプチャを開始します...\n');
 captureTic = tic;
 
-% cleanup: エラー時でも必ずファイルと機器を解放する
-cleanupObj = onCleanup(@() cleanupResources(fidBin, rx));
+% cleanup: エラー時でも必ず機器を解放する
+cleanupObj = onCleanup(@() cleanupResources(rx));
 
 while totalSamplesSaved < totalSamplesTarget
     % USRP から 1 フレーム受信
@@ -181,21 +178,22 @@ while totalSamplesSaved < totalSamplesTarget
         overrunCount = overrunCount + 1;   % ホスト側処理が追いつかず取りこぼし
     end
 
-    % complex single を [I Q I Q ...] の実数列(float32)に変換して書き込み
-    interleaved = zeros(2 * dataLen, 1, 'single');
-    interleaved(1:2:end) = real(iqData(1:dataLen));
-    interleaved(2:2:end) = imag(iqData(1:dataLen));
-    fwrite(fidBin, interleaved, 'single');
+    % バッファへ格納
+    idx = totalSamplesSaved + (1:dataLen);
+    iqBuffer(idx) = iqData(1:dataLen);
 
     totalSamplesSaved = totalSamplesSaved + dataLen;
 end
 
 elapsed = toc(captureTic);
 
-% ファイル・機器を明示的に解放 (onCleanup と二重でも安全)
-fclose(fidBin);
+% 機器を明示的に解放 (onCleanup と二重でも安全)
 release(rx);
 clear cleanupObj;   % onCleanup を無効化 (既に解放済みのため)
+
+% 目標サンプル数ちょうどに切り詰め
+iq = iqBuffer(1:totalSamplesSaved);
+clear iqBuffer;
 
 fprintf('キャプチャ完了。\n');
 fprintf('  取得サンプル数  : %d\n', totalSamplesSaved);
@@ -207,14 +205,18 @@ if overrunCount > 0
 end
 
 %% ------------------------------------------------------------------------
-%  5. メタデータの保存
+%  5. IQ 信号とメタデータを .mat ファイルへ保存 (USB 外部ストレージ)
 %  ------------------------------------------------------------------------
+% 変数 iq  : complex single 列ベクトル (受信 IQ サンプル)
+% 変数 meta: 取得条件などのメタデータ構造体
 meta = struct();
-meta.description      = 'USRP B205 mini-i captured Wi-Fi IQ samples';
-meta.binFileName      = binFileName;
-meta.dataFormat       = 'interleaved float32 (single): I0,Q0,I1,Q1,...';
+meta.description      = 'USRP B205 mini-i captured Wi-Fi IQ samples (5GHz ch36)';
+meta.matFileName      = matFileName;
+meta.dataFormat       = 'complex single column vector, variable name: iq';
+meta.wifiChannel      = 36;
 meta.centerFrequency  = centerFrequency;      % [Hz]
-meta.sampleRate       = actualSampleRate;     % [Sps]
+meta.sampleRate       = actualSampleRate;     % [Sps] = 帯域幅
+meta.bandwidth        = 20e6;                 % [Hz]
 meta.gain             = gain;                 % [dB]
 meta.platform         = usrpPlatform;
 meta.serialNum        = usrpSerialNum;
@@ -222,27 +224,19 @@ meta.captureDuration  = captureDuration;      % [s]
 meta.samplesPerFrame  = samplesPerFrame;
 meta.totalSamplesSaved= totalSamplesSaved;
 meta.overrunCount     = overrunCount;
-meta.captureDatetime  = timestamp;
+meta.captureDatetime  = timestamp;            % 'yyyymmddHHMM'
 meta.matlabVersion    = version;
 
-save(matFileName, 'meta');
-fprintf('\nメタデータを保存しました: %s\n', matFileName);
+% IQ が大きい場合に備えて -v7.3 (HDF5 ベース, 2GB 超対応) で保存
+save(matFileName, 'iq', 'meta', '-v7.3');
+fprintf('\nIQ 信号を保存しました: %s\n', matFileName);
 fprintf('すべての処理が完了しました。\n');
 
 %% ------------------------------------------------------------------------
 %  ローカル関数
 %  ------------------------------------------------------------------------
-function cleanupResources(fidBin, rx)
+function cleanupResources(rx)
     % エラー発生時などに呼ばれるクリーンアップ処理
-    try
-        if ~isempty(fidBin) && fidBin ~= -1
-            fs = fopen('all');
-            if any(fs == fidBin)
-                fclose(fidBin);
-            end
-        end
-    catch
-    end
     try
         if ~isempty(rx) && isvalid(rx)
             release(rx);
@@ -252,19 +246,12 @@ function cleanupResources(fidBin, rx)
 end
 
 %% ------------------------------------------------------------------------
-%  参考: 保存した IQ データを読み込む関数
+%  参考: 保存した IQ データを読み込む例
 %  ------------------------------------------------------------------------
-%  使い方:
-%     iq = loadIQ('E:\iq_capture\wifi_iq_20260714_120000.bin');
-%  以下をコピーして別ファイル loadIQ.m として保存すると単体で使えます。
+%  .mat には変数 iq (complex single) と meta が保存されています。
+%     S  = load('E:\iq_capture\202607141822.mat');
+%     iq = S.iq;          % 受信 IQ サンプル
+%     fs = S.meta.sampleRate;
+%     % 例: スペクトログラム表示
+%     % spectrogram(iq, 1024, 512, 1024, fs, 'centered', 'yaxis');
 % -------------------------------------------------------------------------
-function iq = loadIQ(binFile) %#ok<DEFNU>
-    fid = fopen(binFile, 'r');
-    if fid == -1
-        error('loadIQ:openFailed', 'ファイルを開けません: %s', binFile);
-    end
-    raw = fread(fid, Inf, 'single=>single');
-    fclose(fid);
-    % [I Q I Q ...] を complex に復元
-    iq = complex(raw(1:2:end), raw(2:2:end));
-end
