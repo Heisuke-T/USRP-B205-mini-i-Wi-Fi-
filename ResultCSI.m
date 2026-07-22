@@ -102,24 +102,24 @@ phaseUnwrap = unwrap(phase, [], 2);              % サブキャリア方向 (周
 %  ------------------------------------------------------------------------
 figure('Name', 'CSI Amplitude / Phase Map');
 
-subplot(2,1,1);
-imagesc(subcarrierIndices, timeAxis, amplitude);
+subplot(1,2,1);
+imagesc(timeAxis, subcarrierIndices, amplitude.');
 axis xy;
 colormap(gca, 'jet');
 cb1 = colorbar;
 ylabel(cb1, 'Amplitude [dB]');
-xlabel('Subcarrier index k');
-ylabel('Time [s]');
+xlabel('Time [s]');
+ylabel('Subcarrier index k');
 title('CSI Amplitude Map');
 
-subplot(2,1,2);
-imagesc(subcarrierIndices, timeAxis, phaseUnwrap);
+subplot(1,2,2);
+imagesc(timeAxis, subcarrierIndices, phaseUnwrap.');
 axis xy;
 colormap(gca, 'jet');
 cb2 = colorbar;
 ylabel(cb2, 'Phase [rad]');
-xlabel('Subcarrier index k');
-ylabel('Time [s]');
+xlabel('Time [s]');
+ylabel('Subcarrier index k');
 title('CSI Phase Map (unwrapped)');
 
 %% ------------------------------------------------------------------------
