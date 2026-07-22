@@ -42,7 +42,7 @@ clear; clc;
 inputMatFile = '';
 
 % IQ ファイルを探すフォルダ (USB 外部ストレージ)。inputMatFile 指定時は無視。
-usbSavePath  = fullfile('E:', 'iq_capture');   % ★環境に合わせて変更
+usbSavePath  = 'D:\IQ';
 
 % --- 検出パラメータ ------------------------------------------------------
 detThreshold   = 0.6;    % L-STF 遅延相関のしきい値 (0〜1)

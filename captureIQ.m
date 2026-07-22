@@ -39,7 +39,7 @@ clear; clc;
 % Windows の例: 'E:\iq_capture'
 % Linux   の例: '/media/username/USBDRIVE/iq_capture'
 % macOS   の例: '/Volumes/USBDRIVE/iq_capture'
-usbSavePath = fullfile('E:', 'iq_capture');   % ★環境に合わせて変更してください
+usbSavePath = 'D:\IQ';
 
 % --- Wi-Fi 受信パラメータ -----------------------------------------------
 % Wi-Fi チャンネルの中心周波数 [Hz]
