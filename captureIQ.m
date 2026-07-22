@@ -66,7 +66,11 @@ samplesPerFrame = 20000;        % [samples/frame]
 % USRP プラットフォーム名 (B205 mini-i は B200 系列)
 usrpPlatform    = 'B200';
 
-% USRP のシリアル番号 ('' で最初に見つかった機器を使用)
+% USRP のシリアル番号
+%   '' の場合は下記 findsdru の検出結果から自動的に補完される。
+%   (B200 系は SerialNum を明示的に指定しないと setupImpl でエラーになるため)
+%   複数台接続時や自動検出がうまくいかない場合は、findsdru の表示を見て
+%   ここに直接シリアル番号の文字列 (例 '3240497') を指定してください。
 usrpSerialNum   = '';
 
 %% ------------------------------------------------------------------------
@@ -102,7 +106,9 @@ matFileName = fullfile(usbSavePath, [baseName '.mat']);
 %% ------------------------------------------------------------------------
 %  3. USRP B205 mini-i 受信機オブジェクトの生成
 %  ------------------------------------------------------------------------
-% 接続確認 (任意): findsdru で機器情報を取得
+% findsdru で機器情報を取得 (B200 系は SerialNum を明示指定しないと
+% comm.SDRuReceiver の setupImpl でエラーになるため、ここで自動取得する)
+radioInfo = [];
 try
     radioInfo = findsdru();
     if isempty(radioInfo)
@@ -120,20 +126,38 @@ catch ME
         'findsdru の実行に失敗しました: %s', ME.message);
 end
 
+% usrpSerialNum が未指定の場合、findsdru の検出結果 (Status=Success かつ
+% usrpPlatform に一致する機器) から自動的に補完する。
+if isempty(usrpSerialNum) && ~isempty(radioInfo)
+    isMatch = strcmp({radioInfo.Platform}, usrpPlatform) & ...
+              strcmp({radioInfo.Status}, 'Success');
+    matched = radioInfo(isMatch);
+    if numel(matched) == 1
+        usrpSerialNum = matched(1).SerialNum;
+        fprintf('SerialNum を自動検出しました: %s\n', usrpSerialNum);
+    elseif numel(matched) > 1
+        error('captureIQ:multipleRadios', ...
+            ['%s の機器が複数検出されました。usrpSerialNum に使用する ', ...
+             'シリアル番号を明示的に指定してください。'], usrpPlatform);
+    end
+end
+
+if isempty(usrpSerialNum)
+    error('captureIQ:noSerialNum', ...
+        ['USRP のシリアル番号を自動検出できませんでした。findsdru の表示を確認し、', ...
+         'usrpSerialNum に文字列で指定してください (例: ''3240497'')。']);
+end
+
 % comm.SDRuReceiver の構築
 rxArgs = { ...
     'Platform',            usrpPlatform, ...
+    'SerialNum',           usrpSerialNum, ...
     'CenterFrequency',     centerFrequency, ...
     'Gain',                gain, ...
     'MasterClockRate',     sampleRate * 2, ...   % B200: MCR は 5MHz〜61.44MHz
     'DecimationFactor',    2, ...                 % 出力レート = MCR / Decimation
     'OutputDataType',      'single', ...          % 複素 single で出力
     'SamplesPerFrame',     samplesPerFrame };
-
-% シリアル番号が指定されていれば追加
-if ~isempty(usrpSerialNum)
-    rxArgs = [rxArgs, {'SerialNum', usrpSerialNum}];
-end
 
 rx = comm.SDRuReceiver(rxArgs{:});
 
