@@ -44,6 +44,7 @@ inputMatFile = '';
 % IQ ファイルを探すフォルダ (USB 外部ストレージ)。inputMatFile 指定時は無視。
 usbSavePath  = 'D:\IQ';
 
+
 % --- 検出パラメータ ------------------------------------------------------
 detThreshold   = 0.6;    % L-STF 遅延相関のしきい値 (0〜1)
 minPlateauLen  = 32;     % プラトーと見なす最小連続長 [samples]
