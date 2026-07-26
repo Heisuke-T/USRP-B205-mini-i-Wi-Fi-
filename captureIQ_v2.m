@@ -220,9 +220,11 @@ bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
 stats = struct('detected', 0, 'timingSkip', 0, 'nonHT', 0, 'vht', 0, ...
     'ht', 0, 'other', 0, 'vhtUnsupported', 0, 'decodeOK', 0, ...
     'noAddr2', 0, 'errors', 0);
-errMsgs      = containers.Map('KeyType', 'char', 'ValueType', 'double');
-vhtRejects   = containers.Map('KeyType', 'char', 'ValueType', 'double');
-vhtBWCounts  = containers.Map('KeyType', 'double', 'ValueType', 'double');
+errMsgs       = containers.Map('KeyType', 'char', 'ValueType', 'double');
+vhtRejects    = containers.Map('KeyType', 'char', 'ValueType', 'double');
+vhtBWCounts   = containers.Map('KeyType', 'double', 'ValueType', 'double');
+vhtNSTSCounts = containers.Map('KeyType', 'double', 'ValueType', 'double');
+vhtReservedOK = 0;   % VHT-SIG-A の予約ビットが仕様どおりだった件数
 
 minPreambleLen = 560;   % L-STF..L-SIG + 2シンボル (フォーマット検出まで)
 searchOffset = 0;
@@ -298,6 +300,16 @@ while searchOffset + minPreambleLen <= numel(iq)
                     else
                         vhtBWCounts(vhtInfo.bwMHz) = 1;
                     end
+                end
+                if vhtInfo.nsts > 0
+                    if isKey(vhtNSTSCounts, vhtInfo.nsts)
+                        vhtNSTSCounts(vhtInfo.nsts) = vhtNSTSCounts(vhtInfo.nsts) + 1;
+                    else
+                        vhtNSTSCounts(vhtInfo.nsts) = 1;
+                    end
+                end
+                if vhtInfo.reservedOK
+                    vhtReservedOK = vhtReservedOK + 1;
                 end
                 if ~isempty(vhtInfo.reason)
                     stats.vhtUnsupported = stats.vhtUnsupported + 1;
@@ -382,6 +394,14 @@ if stats.vht > 0
         end
         fprintf('\n');
     end
+    if vhtNSTSCounts.Count > 0
+        nKeys = cell2mat(keys(vhtNSTSCounts));
+        fprintf('    空間ストリーム数: ');
+        for k = 1:numel(nKeys)
+            fprintf('NSTS=%d が %d回  ', nKeys(k), vhtNSTSCounts(nKeys(k)));
+        end
+        fprintf('\n');
+    end
     if vhtRejects.Count > 0
         rKeys = keys(vhtRejects);
         fprintf('    非対応の理由    : ');
@@ -389,6 +409,13 @@ if stats.vht > 0
             fprintf('%s=%d回  ', rKeys{k}, vhtRejects(rKeys{k}));
         end
         fprintf('\n');
+    end
+    % VHT-SIG-A のビット解釈が正しいかの自己判定
+    fprintf('    SIG-A予約ビット検証: %d/%d 個が仕様どおり', vhtReservedOK, stats.vht);
+    if vhtReservedOK < stats.vht * 0.5
+        fprintf('  <-- 大半が不一致。ビット解釈がズレている可能性あり\n');
+    else
+        fprintf('  (ビット解釈は妥当)\n');
     end
 end
 fprintf('  MAC まで復号成功          : %d\n', stats.decodeOK);
@@ -559,7 +586,7 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     %   info:   診断用 (棄却理由・観測された帯域幅/NSTS/MCS)
     entry = [];
     consumed = 560;   % L-STF..VHT-SIG-A
-    info = struct('reason', '', 'bwMHz', 0, 'nsts', 0, 'mcs', 0);
+    info = struct('reason', '', 'bwMHz', 0, 'nsts', 0, 'mcs', 0, 'reservedOK', false);
 
     % --- VHT-SIG-A 復号 (2シンボル) ---
     [sigaBits, sigaFail] = wlanVHTSIGARecover(pkt(401:560), lltfChanEst, noiseEst, chanBW);
@@ -570,9 +597,10 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     end
 
     vhtA = parseVHTSIGABits(sigaBits);
-    info.bwMHz = vhtA.bwMHz;
-    info.nsts  = vhtA.nsts;
-    info.mcs   = vhtA.mcs;
+    info.bwMHz      = vhtA.bwMHz;
+    info.nsts       = vhtA.nsts;
+    info.mcs        = vhtA.mcs;
+    info.reservedOK = vhtA.reservedOK;
 
     % 以下はいずれも SISO(受信1本)/20MHz 受信では扱えない構成
     if ~vhtA.isValid
@@ -785,11 +813,16 @@ function out = parseVHTSIGABits(bits)
     bits = double(bits(:)).';
     out = struct('isValid', false, 'is20MHz', false, 'isSU', false, ...
         'nsts', 0, 'stbc', false, 'groupId', 0, 'gi', 0, 'coding', 0, ...
-        'mcs', 0, 'bwMHz', 0);
+        'mcs', 0, 'bwMHz', 0, 'reservedOK', false);
 
-    if numel(bits) < 32
+    if numel(bits) < 34
         return;
     end
+
+    % 自己チェック: 仕様上 1 に固定されている予約ビット
+    %   SIG-A1 B2  -> bits(3),  SIG-A1 B23 -> bits(24),  SIG-A2 B9 -> bits(34)
+    % これが揃わない場合、本関数のビット位置の想定がズレている。
+    out.reservedOK = (bits(3) == 1) && (bits(24) == 1) && (bits(34) == 1);
 
     bw       = bits(1:2);
     stbcBit  = bits(4);
