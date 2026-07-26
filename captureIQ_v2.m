@@ -246,6 +246,8 @@ vhtRejects    = containers.Map('KeyType', 'char', 'ValueType', 'double');
 vhtBWCounts   = containers.Map('KeyType', 'double', 'ValueType', 'double');
 vhtNSTSCounts = containers.Map('KeyType', 'double', 'ValueType', 'double');
 vhtReservedOK = 0;   % VHT-SIG-A の予約ビットが仕様どおりだった件数
+vhtDetailShown = 0;  % 内訳を表示した VHT パケット数
+vhtDetailMax   = 5;  % 内訳を表示する最大件数
 
 minPreambleLen = 560;   % L-STF..L-SIG + 2シンボル (フォーマット検出まで)
 searchOffset = 0;
@@ -331,6 +333,17 @@ while searchOffset + minPreambleLen <= numel(iq)
                 end
                 if vhtInfo.reservedOK
                     vhtReservedOK = vhtReservedOK + 1;
+                end
+                % 最初の数件だけ内訳を表示 (パケット長算出が妥当か確認するため)
+                if vhtDetailShown < vhtDetailMax && vhtInfo.nsts == 1 && vhtInfo.bwMHz == 20
+                    vhtDetailShown = vhtDetailShown + 1;
+                    fprintf(['    <VHT#%d> MCS=%d GI=%s 符号化=%s | L-SIG長=%d NSYM=%d\n', ...
+                             '            APEP: L-SIG由来=%d SIG-B由来=%d 採用=%d | ', ...
+                             'A-MPDU分解=%s MPDU数=%d\n'], ...
+                        vhtDetailShown, vhtInfo.mcs, ternary(vhtInfo.gi==1,'Short','Long'), ...
+                        ternary(vhtInfo.coding==1,'LDPC','BCC'), vhtInfo.lsigLen, vhtInfo.nsym, ...
+                        vhtInfo.apepFromLSIG, vhtInfo.apepFromSIGB, vhtInfo.apepUsed, ...
+                        vhtInfo.deagStatus, vhtInfo.mpduCount);
                 end
                 if ~isempty(vhtInfo.reason)
                     stats.vhtUnsupported = stats.vhtUnsupported + 1;
@@ -582,7 +595,11 @@ function [status, consumed, entry] = processNonHT(pkt, chanEst, noiseEst, chanBW
     rxPSDU = wlanNonHTDataRecover(pkt(ind.NonHTData(1):ind.NonHTData(2)), ...
         chanEst, noiseEst, cfgNonHT);
 
+    % 未対応サブタイプの警告は頻出するためここでは抑止する (サマリで集計)
+    wState = warning('off', 'all');
     [cfgMAC, payload, mpduStatus] = wlanMPDUDecode(rxPSDU, cfgNonHT, 'DataFormat', 'bits');
+    warning(wState);
+
     if ~strcmpi(string(mpduStatus), "Success")
         status = 0;
         return;
@@ -598,7 +615,10 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     %   info:   診断用 (棄却理由・観測された帯域幅/NSTS/MCS)
     entry = [];
     consumed = 560;   % L-STF..VHT-SIG-A
-    info = struct('reason', '', 'bwMHz', 0, 'nsts', 0, 'mcs', 0, 'reservedOK', false);
+    info = struct('reason', '', 'bwMHz', 0, 'nsts', 0, 'mcs', 0, ...
+        'reservedOK', false, 'gi', 0, 'coding', 0, 'lsigLen', 0, 'nsym', 0, ...
+        'apepFromLSIG', 0, 'apepFromSIGB', 0, 'apepUsed', 0, ...
+        'mpduCount', 0, 'deagStatus', '');
 
     % --- VHT-SIG-A 復号 (2シンボル) ---
     [sigaBits, sigaFail] = wlanVHTSIGARecover(pkt(401:560), lltfChanEst, noiseEst, chanBW);
@@ -613,6 +633,8 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     info.nsts       = vhtA.nsts;
     info.mcs        = vhtA.mcs;
     info.reservedOK = vhtA.reservedOK;
+    info.gi         = vhtA.gi;
+    info.coding     = vhtA.coding;
 
     % 以下はいずれも SISO(受信1本)/20MHz 受信では扱えない構成
     if ~vhtA.isValid
@@ -659,42 +681,86 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     demodVHTLTF = wlanVHTLTFDemodulate(pkt(indProbe.VHTLTF(1):indProbe.VHTLTF(2)), chanBW, 1);
     vhtChanEst  = wlanVHTLTFChannelEstimate(demodVHTLTF, chanBW, 1);
 
-    % --- VHT-SIG-B 復号 (APEP長を取得) ---
-    sigbBits = wlanVHTSIGBRecover(pkt(indProbe.VHTSIGB(1):indProbe.VHTSIGB(2)), ...
-        vhtChanEst, noiseEst, chanBW);
-    apepLen = decodeVHTSIGBLength(sigbBits);
-    if isempty(apepLen) || apepLen <= 0
-        info.reason = 'SIG-B長不正';
-        status = 0;
-        return;
+    % --- パケット長の決定 ---
+    % MathWorks の helperVHTConfigRecover と同様、L-SIG と VHT-SIG-A から
+    % 求めるのを主とする。VHT-SIG-B の Length は参考値として併記する。
+    [lsigBits, lsigFail] = wlanLSIGRecover(pkt(321:400), lltfChanEst, noiseEst, chanBW);
+    if ~lsigFail
+        [~, info.lsigLen] = decodeLSIGBits(lsigBits);
     end
 
+    % VHT PPDU の受信時間 [us] (IEEE 802.11ac の L-SIG LENGTH との関係)
+    %   RXTIME = 4*ceil((L_LENGTH+3)/3) + 20
+    ndbps  = vhtNDBPS20MHz(vhtA.mcs);
+    symLen = ternary(vhtA.gi == 1, 72, 80);   % Short GI: 3.6us, Long GI: 4us
+    if info.lsigLen > 0 && ~isempty(ndbps)
+        totalSamples    = (4 * ceil((info.lsigLen + 3) / 3) + 20) * 20;  % 20 samples/us
+        dataSamples     = totalSamples - indProbe.VHTSIGB(2);   % プリアンブル分を除く
+        info.nsym       = floor(dataSamples / symLen);
+        if info.nsym > 0
+            % NSYM = ceil((8*APEP + 22)/NDBPS) を満たす最大の APEP
+            info.apepFromLSIG = floor((info.nsym * ndbps - 22) / 8);
+        end
+    end
+
+    % --- VHT-SIG-B 復号 (参考・比較用) ---
     try
-        cfgVHT = wlanVHTConfig('ChannelBandwidth', chanBW, ...
-            'NumTransmitAntennas', 1, 'NumSpaceTimeStreams', 1, ...
-            'MCS', vhtA.mcs, 'APEPLength', apepLen, ...
-            'ChannelCoding', codingStr, 'GuardInterval', giStr);
-        ind = wlanFieldIndices(cfgVHT);
+        sigbBits = wlanVHTSIGBRecover(pkt(indProbe.VHTSIGB(1):indProbe.VHTSIGB(2)), ...
+            vhtChanEst, noiseEst, chanBW);
+        sigbLen = decodeVHTSIGBLength(sigbBits);
+        if ~isempty(sigbLen)
+            info.apepFromSIGB = sigbLen;
+        end
     catch
-        % APEPLength が不正 (VHT-SIG-B のビット解釈ミスの可能性)
-        info.reason = sprintf('APEPLength不正(%d)', apepLen);
+    end
+
+    % L-SIG 由来を優先し、駄目なら VHT-SIG-B 由来を使う
+    apepCandidates = [info.apepFromLSIG, info.apepFromSIGB];
+    apepCandidates = apepCandidates(apepCandidates > 0);
+    if isempty(apepCandidates)
+        info.reason = 'パケット長を決定できず';
         status = 0;
         return;
     end
 
-    if numel(pkt) < ind.VHTData(2)
-        status = -1;
+    cfgVHT = [];
+    for c = 1:numel(apepCandidates)
+        try
+            cfgTry = wlanVHTConfig('ChannelBandwidth', chanBW, ...
+                'NumTransmitAntennas', 1, 'NumSpaceTimeStreams', 1, ...
+                'MCS', vhtA.mcs, 'APEPLength', apepCandidates(c), ...
+                'ChannelCoding', codingStr, 'GuardInterval', giStr);
+            indTry = wlanFieldIndices(cfgTry);
+            if numel(pkt) >= indTry.VHTData(2)
+                cfgVHT = cfgTry;
+                ind = indTry;
+                info.apepUsed = apepCandidates(c);
+                break;
+            end
+        catch
+            % この候補は不正。次の候補へ
+        end
+    end
+
+    if isempty(cfgVHT)
+        info.reason = sprintf('APEPLength不正/長さ不足(LSIG=%d,SIGB=%d)', ...
+            info.apepFromLSIG, info.apepFromSIGB);
+        status = -1;   % データがまだ揃っていない可能性もある
         return;
     end
+
     consumed = double(ind.VHTData(2));
 
     rxPSDU = wlanVHTDataRecover(pkt(ind.VHTData(1):ind.VHTData(2)), ...
         vhtChanEst, noiseEst, cfgVHT);
 
     % --- VHT の PSDU は A-MPDU なので分解してから MPDU を復号 ---
-    [cfgMAC, payload, ok] = decodeVHTPSDU(rxPSDU, cfgVHT);
+    [cfgMAC, payload, ok, deagInfo] = decodeVHTPSDU(rxPSDU, cfgVHT);
+    info.mpduCount  = deagInfo.mpduCount;
+    info.deagStatus = deagInfo.status;
     if ~ok
-        info.reason = 'MPDU復号失敗';
+        info.reason = sprintf('MPDU復号失敗(分解=%s,MPDU数=%d)', ...
+            deagInfo.status, deagInfo.mpduCount);
         status = 0;
         return;
     end
@@ -703,41 +769,56 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     status = 1;
 end
 
-function [cfgMAC, payload, ok] = decodeVHTPSDU(rxPSDU, cfgVHT)
+function [cfgMAC, payload, ok, deagInfo] = decodeVHTPSDU(rxPSDU, cfgVHT)
     % VHT の PSDU (A-MPDU) を分解し、最初に復号できた MPDU を返す。
     cfgMAC = [];
     payload = [];
     ok = false;
+    deagInfo = struct('status', 'N/A', 'mpduCount', 0);
 
+    mpduList = {};
     try
         [mpduList, ~, deagStatus] = wlanAMPDUDeaggregate(rxPSDU, cfgVHT, 'DataFormat', 'bits');
-    catch
-        mpduList = {};
-        deagStatus = "Fail";
+        deagInfo.status = char(string(deagStatus));
+    catch ME
+        deagInfo.status = ['例外: ' ME.message];
     end
+    deagInfo.mpduCount = numel(mpduList);
 
-    if ~isempty(mpduList) && strcmpi(string(deagStatus), "Success")
-        for m = 1:numel(mpduList)
-            try
-                [c, p, st] = wlanMPDUDecode(mpduList{m}, cfgVHT, 'DataFormat', 'bits');
-                if strcmpi(string(st), "Success")
-                    cfgMAC = c; payload = p; ok = true;
-                    return;
-                end
-            catch
-                % この MPDU は読み飛ばす
+    % 全体の status が Success でなくても、取り出せた MPDU は個別に試す
+    % (一部のサブフレームだけ壊れている場合でも残りは復号できるため)
+    for m = 1:numel(mpduList)
+        try
+            [c, p, st] = wlanMPDUDecode(mpduList{m}, cfgVHT, 'DataFormat', 'bits');
+            if strcmpi(string(st), "Success")
+                cfgMAC = c; payload = p; ok = true;
+                return;
             end
+        catch
+            % この MPDU は読み飛ばす
         end
-        return;
     end
 
-    % A-MPDU として分解できない場合は単一 MPDU として試す
-    try
-        [c, p, st] = wlanMPDUDecode(rxPSDU, cfgVHT, 'DataFormat', 'bits');
-        if strcmpi(string(st), "Success")
-            cfgMAC = c; payload = p; ok = true;
+    % A-MPDU として分解できなかった場合は単一 MPDU として試す
+    if isempty(mpduList)
+        try
+            [c, p, st] = wlanMPDUDecode(rxPSDU, cfgVHT, 'DataFormat', 'bits');
+            if strcmpi(string(st), "Success")
+                cfgMAC = c; payload = p; ok = true;
+            end
+        catch
         end
-    catch
+    end
+end
+
+function ndbps = vhtNDBPS20MHz(mcs)
+    % VHT 20MHz / 1空間ストリーム の NDBPS (1 OFDM シンボルあたりのデータビット数)
+    % NSD=52, NDBPS = 52 * NBPSCS * 符号化率
+    table = [26 52 78 104 156 208 234 260 312];   % MCS0..MCS8
+    if mcs >= 0 && mcs <= 8
+        ndbps = table(mcs + 1);
+    else
+        ndbps = [];   % MCS9 は 20MHz/1SS では未定義
     end
 end
 
