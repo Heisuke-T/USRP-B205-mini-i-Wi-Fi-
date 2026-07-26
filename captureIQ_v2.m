@@ -1,19 +1,24 @@
 %% captureIQ_v2.m
 % =========================================================================
-%  USRP B205 mini-i でWi-Fiをリアルタイム受信し、
-%  WLAN Toolbox でパケットを復号して「指定SSIDのAPだけ」のCSIを記録する
+%  USRP B205 mini-i でWi-Fiを受信し、WLAN Toolbox でパケットを復号して
+%  「指定SSIDのAPだけ」のCSIを記録する
 % -------------------------------------------------------------------------
 %  概要:
-%    captureIQ.m (生IQをそのまま保存) とは異なり、本スクリプトは受信しながら
-%    その場で WLAN Toolbox を使ってパケットを検出・復号し、
-%      1) Beacon/Probe Response フレームから SSID と 送信元アドレス(BSSID) の
-%         対応関係を学習
-%      2) 復号できた全パケットについて、プリアンブル (Non-HTはL-LTF、VHTは
-%         VHT-LTF) から CSI (チャネル応答 H(k)) と送信元アドレス(Address2)
-%         を記録
-%      3) キャプチャ終了後、学習した BSSID の中から targetSSID に一致する
-%         ものを探し、そのBSSIDのパケットのCSIだけを抽出して .mat 保存
-%    という処理を行います。
+%    処理を2段階に分けています。
+%      [第1段] 生IQのキャプチャ (captureIQ.m と同じ方式)
+%              復号処理を挟まずにひたすら受信するため、オーバーランが
+%              起きにくく取りこぼしが少ない。
+%      [第2段] キャプチャ済みIQのオフライン復号
+%              WLAN Toolbox でパケットを検出・復号し、
+%                1) Beacon/Probe Response から SSID と 送信元アドレス(BSSID)
+%                   の対応を学習
+%                2) 復号できた全パケットについて、プリアンブル (Non-HTは
+%                   L-LTF、VHTは VHT-LTF) から CSI (チャネル応答 H(k)) を算出
+%                3) targetSSID に対応する BSSID のパケットのCSIだけを抽出
+%              して .mat 保存する。
+%
+%    ※ 第2段は受信と独立しているため、条件を変えて復号だけやり直すことも
+%      できます (saveRawIQ を true にすると生IQも保存されます)。
 %
 %  対応フォーマット:
 %    Non-HT (802.11a/g レガシー) と VHT (802.11ac / Wi-Fi 5, SU-VHTのみ) に
@@ -23,51 +28,39 @@
 %    VHT対応の制約 (いずれもUSRP B205 mini-iが受信アンテナ1本=SISOのため):
 %      - NSTS(空間ストリーム数) = 1 のパケットのみ復号します。
 %        マルチストリーム(NSTS>=2)は1本アンテナでは原理的に復号できません。
-%      - 20MHz動作 (VHT-SIG-A の BW フィールドが 20MHz) のパケットのみ
-%        対象です。40/80/160MHzで送信されたVHTパケットは、本機の受信帯域
-%        (20MHz) では正しく復号できません。
-%      - SU-VHT (GroupID = 0 または 63) のみ対応。MU-MIMO(GroupID 1-62)は
-%        非対応です。
+%      - 20MHz動作のVHTパケットのみ対象です。40/80/160MHzで送信された
+%        パケットは本機の受信帯域(20MHz)では正しく復号できません。
+%      - SU-VHT (GroupID = 0 または 63) のみ対応。MU-MIMOは非対応です。
 %      - STBC を使用しているパケットは非対応としてスキップします。
-%    上記に該当しないVHTパケットは検出はされますが、復号エラーとして
-%    読み捨てられ、CSI記録の対象外となります(キャプチャ自体は継続します)。
 %
-%    VHT-SIG-A/VHT-SIG-B のビットフィールド解釈は WLAN Toolbox が自動で
-%    行ってくれる関数が存在しないため、IEEE Std 802.11ac-2013 の仕様
-%    (Table 22-12 等) に基づき本スクリプト内で実装しています。実機での
-%    検証を行っていないため、特に VHT-SIG-B の Length フィールドの解釈
-%    (20MHzでは 17bit, 4byte単位と想定) は動作しない場合に最初に疑うべき
-%    箇所です。うまく復号できない場合はコメントを参照し調整してください。
+%    VHT-SIG-A/VHT-SIG-B のビットフィールド解釈は WLAN Toolbox に専用関数が
+%    無いため、IEEE Std 802.11ac-2013 (Table 22-12 等) に基づき本スクリプト
+%    内で実装しています。特に VHT-SIG-B の Length フィールドの解釈
+%    (20MHzでは17bit・4オクテット単位と想定) は実機未検証のため、VHTだけ
+%    復号できない場合に最初に疑うべき箇所です。
 %
 %  必要環境:
-%    - MATLAB
-%    - Communications Toolbox
+%    - MATLAB / Communications Toolbox / WLAN Toolbox
 %    - Communications Toolbox Support Package for USRP Radio
-%    - WLAN Toolbox
 %    - USB 3.0 接続された USRP B205 mini-i
 %
 %  出力ファイル:
 %    <保存先>/<yyyymmddHHMM>_<SSID>_CSI.mat
 %      csi          … {numPackets x 1} セル配列。各セルは1パケット分の
-%                      CSI (H(k)) の行ベクトル (Non-HTなら52本、VHT-20なら
-%                      56本と、フォーマットにより長さが異なるためセル配列)
-%      phyFormat    … {numPackets x 1} cellstr, 各パケットの物理層フォーマット
-%                      ('Non-HT' または 'VHT')
+%                      CSI (H(k)) の行ベクトル (Non-HTは52本、VHT-20は56本と
+%                      フォーマットにより長さが異なるためセル配列)
+%      phyFormat    … {numPackets x 1} 'Non-HT' または 'VHT'
 %      subcarrierIndicesNonHT … [1 x 52] Non-HT の使用サブキャリア番号
 %      subcarrierIndicesVHT20 … [1 x 56] VHT-20MHz の使用サブキャリア番号
 %      timeSec      … [numPackets x 1] キャプチャ開始からの相対時刻 [s]
-%      frameType    … [numPackets x 1] cellstr, 各パケットのフレーム種別
-%      targetSSIDOut  … 指定した SSID 文字列
-%      targetBSSIDOut … 学習された対象 AP の MAC アドレス文字列
-%      seenNetworks … 受信中に検出できた全 BSSID/SSID の一覧 (診断用)
-%      resultMeta   … 処理条件
+%      frameType    … [numPackets x 1] 各パケットのフレーム種別
+%      targetSSIDOut / targetBSSIDOut … 指定SSIDと学習されたBSSID
+%      seenNetworks … 検出できた全 BSSID/SSID の一覧 (診断用)
+%      resultMeta   … 処理条件・復号統計
 %
 %  注意:
 %    電波の受信・記録は、利用地域の電波法および関連法令を遵守し、
 %    自身が管理する機器・許可された環境でのみ実施してください。
-%    本スクリプトは MATLAB 上での実機テストを前提に作成しています。
-%    WLAN Toolbox のバージョンによっては関数の挙動に差異がある場合が
-%    あるため、まずは短時間 (1秒程度) のキャプチャで動作確認してください。
 % =========================================================================
 
 clear; clc;
@@ -93,10 +86,13 @@ samplesPerFrame = 20000;        % [samples/frame]
 usrpPlatform    = 'B200';
 usrpSerialNum   = '3240497';
 
-% --- パケット検出パラメータ ----------------------------------------------
+% --- 復号パラメータ ------------------------------------------------------
 pktDetThreshold = 0.5;          % wlanPacketDetect のしきい値 (0〜1)
-maxBufferMargin = 4000;         % バッファを間引く前に保持する最大サンプル数
-trimKeepSamples = 2000;         % 間引き後に残すサンプル数 (パケット境界保護用)
+                                 % 検出数が少なすぎる場合は下げる (例 0.3)
+saveRawIQ       = false;        % true にすると生IQも別ファイルに保存する
+                                 % (2秒/20MHz で約 320MB になるので注意)
+verboseErrors   = false;        % true にすると復号エラーを毎回表示する
+                                 % (通常は最後に集計のみ表示)
 
 %% ------------------------------------------------------------------------
 %  2. 保存先の準備
@@ -119,9 +115,10 @@ end
 fclose(fidTest);
 delete(testFile);
 
-timestamp = datestr(now, 'yyyymmddHHMM');
-ssidSafe  = regexprep(targetSSID, '[^A-Za-z0-9_-]', '_');
+timestamp  = datestr(now, 'yyyymmddHHMM');
+ssidSafe   = regexprep(targetSSID, '[^A-Za-z0-9_-]', '_');
 outMatFile = fullfile(usbSavePath, [timestamp '_' ssidSafe '_CSI.mat']);
+rawIQFile  = fullfile(usbSavePath, [timestamp '_raw.mat']);
 
 %% ------------------------------------------------------------------------
 %  3. USRP B205 mini-i 受信機オブジェクトの生成
@@ -167,22 +164,14 @@ fprintf('  対象 SSID       : %s\n', targetSSID);
 fprintf('  保存先(.mat)    : %s\n', outMatFile);
 
 %% ------------------------------------------------------------------------
-%  4. リアルタイム パケット検出・復号ループ
+%  4. 第1段: 生IQのキャプチャ (復号は行わない)
 %  ------------------------------------------------------------------------
-subcarrierIndicesNonHT = [-26:-1, 1:26];    % Non-HT CBW20 (52本)
-subcarrierIndicesVHT20 = [-28:-1, 1:28];    % VHT CBW20 (56本)
-
-pktLog = struct('timeSec', {}, 'bssid', {}, 'frameType', {}, 'ssid', {}, ...
-    'phyFormat', {}, 'csi', {});
-bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
-
-buffer            = zeros(0, 1);
-bufferGlobalOffset = 0;           % buffer(1) がキャプチャ全体の何サンプル目か
 totalSamplesTarget = round(captureDuration * sampleRate);
+iqBuffer = complex(zeros(totalSamplesTarget + samplesPerFrame, 1));
 totalSamplesCaptured = 0;
 overrunCount = 0;
 
-fprintf('\nキャプチャ・リアルタイム復号を開始します...\n');
+fprintf('\n[第1段] IQ キャプチャを開始します...\n');
 cleanupObj = onCleanup(@() cleanupResources(rx));
 captureTic = tic;
 
@@ -194,129 +183,200 @@ while totalSamplesCaptured < totalSamplesTarget
     if overrun
         overrunCount = overrunCount + 1;
     end
-
-    buffer = [buffer; iqData(1:dataLen)]; %#ok<AGROW>
+    iqBuffer(totalSamplesCaptured + (1:dataLen)) = iqData(1:dataLen);
     totalSamplesCaptured = totalSamplesCaptured + dataLen;
-
-    % バッファ先頭から検出・復号できるだけ処理する
-    while true
-        if numel(buffer) < 320
-            break;   % L-STF+L-LTF に満たない
-        end
-
-        startOffset = wlanPacketDetect(buffer, chanBW, 0, pktDetThreshold);
-
-        if isempty(startOffset)
-            % 候補なし。バッファが大きくなり過ぎたら末尾だけ残して間引く
-            if numel(buffer) > maxBufferMargin
-                nDrop = numel(buffer) - trimKeepSamples;
-                buffer(1:nDrop) = [];
-                bufferGlobalOffset = bufferGlobalOffset + nDrop;
-            end
-            break;   % 次のSDRフレームを待つ
-        end
-
-        pkt = buffer(startOffset + 1 : end);
-        if numel(pkt) < 320
-            break;   % タイミング/CFO推定に必要な分がまだ足りない -> 次フレーム待ち
-        end
-
-        try
-            % --- 粗CFO補正 (L-STF) ---
-            coarseCFO = wlanCoarseCFOEstimate(pkt(1:160), chanBW);
-            pkt = applyCFO(pkt, sampleRate, -coarseCFO);
-
-            % --- シンボルタイミング精同期 (L-STF+L-LTF) ---
-            fineTimingOffset = wlanSymbolTimingEstimate(pkt(1:320), chanBW);
-            pkt = pkt(1 + fineTimingOffset : end);
-            if numel(pkt) < 320
-                break;   % 微調整後にサンプル不足 -> 次フレーム待ち
-            end
-
-            % --- 精CFO補正 (L-LTF) ---
-            lltf = pkt(161:320);
-            fineCFO = wlanFineCFOEstimate(lltf, chanBW);
-            pkt = applyCFO(pkt, sampleRate, -fineCFO);
-            lltf = pkt(161:320);
-
-            % --- レガシー部のチャネル推定・ノイズ推定 (L-LTF) ---
-            lltfChanEst = wlanLLTFChannelEstimate(lltf, chanBW);
-            noiseEst    = wlanLLTFNoiseEstimate(lltf);
-
-            % --- フォーマット検出に必要な分 (L-SIG + 2シンボル) ---
-            if numel(pkt) < 560
-                break;   % 次フレーム待ち
-            end
-            fmt = wlanFormatDetect(pkt(321:560));
-
-            switch true
-                case strcmpi(fmt, 'Non-HT')
-                    [ok, advanceBy, entry] = processNonHT(pkt, startOffset, ...
-                        lltfChanEst, noiseEst, chanBW, sampleRate, bufferGlobalOffset);
-                    if ok < 0
-                        break;   % サンプル不足 -> 次フレーム待ち (バッファ変更なし)
-                    end
-
-                case strcmpi(fmt, 'VHT')
-                    [ok, advanceBy, entry] = processVHT(pkt, startOffset, ...
-                        lltfChanEst, noiseEst, chanBW, sampleRate, bufferGlobalOffset);
-                    if ok < 0
-                        break;   % サンプル不足 -> 次フレーム待ち (バッファ変更なし)
-                    end
-
-                otherwise
-                    % HT(Wi-Fi4) / HE(Wi-Fi6) は非対応。読み捨てて次を探す。
-                    ok = 0;
-                    advanceBy = startOffset + 320;
-                    entry = [];
-            end
-
-            if ok > 0 && ~isempty(entry)
-                pktLog(end+1) = entry; %#ok<SAGROW>
-                if any(strcmpi(entry.frameType, {'Beacon', 'Probe Response'})) ...
-                        && ~isempty(entry.ssid)
-                    bssidToSSID(entry.bssid) = entry.ssid;
-                end
-                fprintf('  [%.3fs] %-6s %-14s BSSID=%s%s\n', entry.timeSec, ...
-                    entry.phyFormat, entry.frameType, entry.bssid, ...
-                    ternary(~isempty(entry.ssid), sprintf('  SSID="%s"', entry.ssid), ''));
-            end
-
-            buffer(1:advanceBy) = [];
-            bufferGlobalOffset = bufferGlobalOffset + advanceBy;
-
-        catch ME
-            % 復号エラーは検出誤り(ノイズ等)や非対応パケットとしてスキップし、
-            % キャプチャを継続する
-            warning('captureIQ_v2:decodeError', 'パケット処理中にエラー: %s', ME.message);
-            advanceBy = startOffset + 1;
-            buffer(1:advanceBy) = [];
-            bufferGlobalOffset = bufferGlobalOffset + advanceBy;
-        end
-    end
 end
 
-elapsed = toc(captureTic);
+elapsedCapture = toc(captureTic);
 release(rx);
 clear cleanupObj;
 
-fprintf('\nキャプチャ完了。\n');
-fprintf('  経過時間        : %.2f s\n', elapsed);
-fprintf('  オーバーラン回数: %d\n', overrunCount);
-fprintf('  復号できたパケット数: %d\n', numel(pktLog));
+iq = iqBuffer(1:totalSamplesCaptured);
+clear iqBuffer;
+
+fprintf('  キャプチャ完了: %d サンプル, %.2f s, オーバーラン %d 回\n', ...
+    totalSamplesCaptured, elapsedCapture, overrunCount);
+
+if saveRawIQ
+    meta = struct('centerFrequency', centerFrequency, 'sampleRate', sampleRate, ...
+        'gain', gain, 'captureDatetime', timestamp);       %#ok<NASGU>
+    iqSingle = single(iq);                                  %#ok<NASGU>
+    save(rawIQFile, 'iqSingle', 'meta', '-v7.3');
+    fprintf('  生IQを保存しました: %s\n', rawIQFile);
+    clear iqSingle;
+end
 
 %% ------------------------------------------------------------------------
-%  5. 対象 SSID の BSSID を特定し、CSI を抽出
+%  5. 第2段: オフライン復号 (パケット検出 → CSI 推定 → MAC 復号)
+%  ------------------------------------------------------------------------
+subcarrierIndicesNonHT = [-26:-1, 1:26];    % Non-HT CBW20 (52本)
+subcarrierIndicesVHT20 = [-28:-1, 1:28];    % VHT CBW20 (56本)
+
+pktLog = struct('timeSec', {}, 'bssid', {}, 'frameType', {}, 'ssid', {}, ...
+    'phyFormat', {}, 'csi', {});
+bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
+
+% 復号統計 (診断用)
+stats = struct('detected', 0, 'timingSkip', 0, 'nonHT', 0, 'vht', 0, ...
+    'ht', 0, 'other', 0, 'vhtUnsupported', 0, 'decodeOK', 0, 'errors', 0);
+errMsgs = containers.Map('KeyType', 'char', 'ValueType', 'double');
+
+minPreambleLen = 560;   % L-STF..L-SIG + 2シンボル (フォーマット検出まで)
+searchOffset = 0;
+
+fprintf('\n[第2段] オフライン復号を開始します...\n');
+decodeTic = tic;
+
+while searchOffset + minPreambleLen <= numel(iq)
+    % --- パケット検出 (wlanPacketDetect は searchOffset からの相対位置を返す) ---
+    relOffset = wlanPacketDetect(iq, chanBW, searchOffset, pktDetThreshold);
+    if isempty(relOffset)
+        break;   % これ以上パケットは見つからない
+    end
+    pktOffset = searchOffset + relOffset;   % 0-based の絶対位置
+
+    if numel(iq) - pktOffset < minPreambleLen
+        break;   % 末尾が足りない
+    end
+
+    stats.detected = stats.detected + 1;
+
+    % 次回の検索開始位置 (最低でも L-STF 分は進める。成功時は後で上書き)
+    nextSearch = pktOffset + 160;
+
+    try
+        % --- 粗CFO推定 (L-STF) ---
+        coarseCFO = wlanCoarseCFOEstimate(iq(pktOffset + (1:160)), chanBW);
+
+        % --- 精タイミング推定 (粗CFO補正した Non-HT プリアンブル) ---
+        nonHTPre  = applyCFO(iq(pktOffset + (1:400)), sampleRate, -coarseCFO);
+        symOffset = wlanSymbolTimingEstimate(nonHTPre, chanBW);
+
+        % wlanSymbolTimingEstimate は負値を返し得る。真の先頭が
+        % バッファ範囲外になる場合は誤検出として読み捨てる。
+        pktStart = pktOffset + symOffset;    % 0-based
+        if pktStart < 0 || numel(iq) - pktStart < minPreambleLen
+            stats.timingSkip = stats.timingSkip + 1;
+            searchOffset = nextSearch;
+            continue;
+        end
+
+        % --- 精CFO推定・補正 (L-LTF) ---
+        pkt     = applyCFO(iq(pktStart+1:end), sampleRate, -coarseCFO);
+        fineCFO = wlanFineCFOEstimate(pkt(161:320), chanBW);
+        pkt     = applyCFO(pkt, sampleRate, -fineCFO);
+
+        % --- L-LTF を復調してからチャネル推定・ノイズ推定 ---
+        %     (wlanLLTFChannelEstimate は時間領域波形ではなく復調済み
+        %      シンボルを受け取る点に注意)
+        lltfDemod   = wlanLLTFDemodulate(pkt(161:320), chanBW);
+        lltfChanEst = wlanLLTFChannelEstimate(lltfDemod, chanBW);
+        noiseEst    = wlanLLTFNoiseEstimate(lltfDemod);
+
+        % --- フォーマット検出 (L-SIG + 後続2シンボル) ---
+        fmt = wlanFormatDetect(pkt(321:560), lltfChanEst, noiseEst, chanBW);
+        fmtStr = upper(string(fmt));
+
+        switch true
+            case fmtStr == "NON-HT"
+                stats.nonHT = stats.nonHT + 1;
+                [st, consumed, entry] = processNonHT(pkt, lltfChanEst, noiseEst, chanBW);
+
+            case fmtStr == "VHT"
+                stats.vht = stats.vht + 1;
+                [st, consumed, entry] = processVHT(pkt, lltfChanEst, noiseEst, chanBW);
+                if st == 0 && isempty(entry)
+                    stats.vhtUnsupported = stats.vhtUnsupported + 1;
+                end
+
+            case startsWith(fmtStr, "HT")
+                stats.ht = stats.ht + 1;
+                st = 0; consumed = 320; entry = [];
+
+            otherwise
+                stats.other = stats.other + 1;
+                st = 0; consumed = 320; entry = [];
+        end
+
+        if st < 0
+            % パケット後半がキャプチャ範囲外 (末尾で切れている)
+            searchOffset = nextSearch;
+            continue;
+        end
+
+        if st > 0 && ~isempty(entry)
+            entry.timeSec = pktStart / sampleRate;
+            pktLog(end+1) = entry; %#ok<SAGROW>
+            stats.decodeOK = stats.decodeOK + 1;
+
+            if any(strcmpi(entry.frameType, {'Beacon', 'Probe Response'})) && ~isempty(entry.ssid)
+                bssidToSSID(entry.bssid) = entry.ssid;
+            end
+
+            fprintf('  [%7.4fs] %-6s %-16s BSSID=%s%s\n', entry.timeSec, ...
+                entry.phyFormat, entry.frameType, entry.bssid, ...
+                ternary(~isempty(entry.ssid), sprintf('  SSID="%s"', entry.ssid), ''));
+        end
+
+        searchOffset = pktStart + max(consumed, 160);
+
+    catch ME
+        stats.errors = stats.errors + 1;
+        key = ME.message;
+        if isKey(errMsgs, key)
+            errMsgs(key) = errMsgs(key) + 1;
+        else
+            errMsgs(key) = 1;
+        end
+        if verboseErrors
+            warning('captureIQ_v2:decodeError', 'パケット処理中にエラー: %s', ME.message);
+        end
+        searchOffset = nextSearch;
+    end
+end
+
+elapsedDecode = toc(decodeTic);
+
+%% ------------------------------------------------------------------------
+%  6. 復号結果のサマリ表示
+%  ------------------------------------------------------------------------
+fprintf('\n[復号サマリ] (所要 %.2f s)\n', elapsedDecode);
+fprintf('  パケット検出数            : %d\n', stats.detected);
+fprintf('    タイミング不正でスキップ: %d\n', stats.timingSkip);
+fprintf('    Non-HT として検出       : %d\n', stats.nonHT);
+fprintf('    VHT    として検出       : %d  (うち非対応構成 %d)\n', stats.vht, stats.vhtUnsupported);
+fprintf('    HT     として検出       : %d  (非対応)\n', stats.ht);
+fprintf('    その他フォーマット      : %d  (非対応)\n', stats.other);
+fprintf('  MAC まで復号成功          : %d\n', stats.decodeOK);
+fprintf('  復号エラー                : %d\n', stats.errors);
+
+if stats.errors > 0
+    fprintf('  エラー内訳 (上位):\n');
+    ks = keys(errMsgs);
+    vs = cell2mat(values(errMsgs));
+    [~, sortIdx] = sort(vs, 'descend');
+    for k = 1:min(5, numel(ks))
+        fprintf('    %4d回: %s\n', vs(sortIdx(k)), ks{sortIdx(k)});
+    end
+end
+
+%% ------------------------------------------------------------------------
+%  7. 対象 SSID の BSSID を特定し、CSI を抽出
 %  ------------------------------------------------------------------------
 seenNetworks = struct('bssid', {}, 'ssid', {});
 bssidKeys = keys(bssidToSSID);
 for k = 1:numel(bssidKeys)
-    seenNetworks(end+1) = struct('bssid', bssidKeys{k}, 'ssid', bssidToSSID(bssidKeys{k})); %#ok<SAGROW>
+    seenNetworks(end+1) = struct('bssid', bssidKeys{k}, ...
+        'ssid', bssidToSSID(bssidKeys{k})); %#ok<SAGROW>
 end
 
 fprintf('\n検出できたネットワーク一覧:\n');
-for k = 1:numel(seenNetworks)
-    fprintf('  BSSID=%s  SSID="%s"\n', seenNetworks(k).bssid, seenNetworks(k).ssid);
+if isempty(seenNetworks)
+    fprintf('  (なし)\n');
+else
+    for k = 1:numel(seenNetworks)
+        fprintf('  BSSID=%s  SSID="%s"\n', seenNetworks(k).bssid, seenNetworks(k).ssid);
+    end
 end
 
 targetBSSID = '';
@@ -335,8 +395,8 @@ frameType = {};
 if isempty(targetBSSID)
     warning('captureIQ_v2:ssidNotFound', ...
         ['指定した SSID "%s" の Beacon/Probe Response を検出できませんでした。\n', ...
-         'captureDuration を長くする、SSID の綴りを確認する、電波状況を確認する' ...
-         'などをお試しください。'], targetSSID);
+         'captureDuration を長くする、pktDetThreshold を下げる (例 0.3)、', ...
+         'SSID の綴り・電波状況を確認する、などをお試しください。'], targetSSID);
 else
     isMatch = strcmp({pktLog.bssid}, targetBSSID);
     matched = pktLog(isMatch);
@@ -355,10 +415,10 @@ else
 end
 
 %% ------------------------------------------------------------------------
-%  6. 保存 (.mat)
+%  8. 保存 (.mat)
 %  ------------------------------------------------------------------------
 resultMeta = struct();
-resultMeta.description      = 'CSI filtered by target SSID (Non-HT and SU-VHT/NSTS=1/20MHz frames)';
+resultMeta.description      = 'CSI filtered by target SSID (Non-HT and SU-VHT/NSTS=1/20MHz)';
 resultMeta.centerFrequency  = centerFrequency;
 resultMeta.sampleRate       = sampleRate;
 resultMeta.gain             = gain;
@@ -366,17 +426,18 @@ resultMeta.captureDuration  = captureDuration;
 resultMeta.wifiChannel      = 36;
 resultMeta.platform         = usrpPlatform;
 resultMeta.serialNum        = usrpSerialNum;
+resultMeta.pktDetThreshold  = pktDetThreshold;
 resultMeta.overrunCount     = overrunCount;
-resultMeta.totalDecodedPackets = numel(pktLog);
+resultMeta.decodeStats      = stats;
 resultMeta.captureDatetime  = timestamp;
 resultMeta.matlabVersion    = version;
 
-targetSSIDOut = targetSSID; %#ok<NASGU>
+targetSSIDOut  = targetSSID;  %#ok<NASGU>
 targetBSSIDOut = targetBSSID; %#ok<NASGU>
 
-save(outMatFile, 'csi', 'phyFormat', 'subcarrierIndicesNonHT', 'subcarrierIndicesVHT20', ...
-    'timeSec', 'frameType', 'targetSSIDOut', 'targetBSSIDOut', 'seenNetworks', ...
-    'resultMeta', '-v7.3');
+save(outMatFile, 'csi', 'phyFormat', 'subcarrierIndicesNonHT', ...
+    'subcarrierIndicesVHT20', 'timeSec', 'frameType', 'targetSSIDOut', ...
+    'targetBSSIDOut', 'seenNetworks', 'resultMeta', '-v7.3');
 
 fprintf('\n結果を保存しました: %s\n', outMatFile);
 fprintf('すべての処理が完了しました。\n');
@@ -394,77 +455,66 @@ function cleanupResources(rx)
 end
 
 function y = applyCFO(x, fs, cfoHz)
-    % x に周波数オフセット cfoHz [Hz] を回転補正として与える
+    % x に周波数オフセット cfoHz [Hz] 分の位相回転を与える (補正には -cfo を渡す)
     n = (0:numel(x)-1).';
     y = x .* exp(1j * 2 * pi * cfoHz * n / fs);
 end
 
-function [status, advanceBy, entry] = processNonHT(pkt, startOffset, chanEst, noiseEst, chanBW, sampleRate, bufferGlobalOffset)
+function [status, consumed, entry] = processNonHT(pkt, chanEst, noiseEst, chanBW)
     % Non-HT (802.11a/g) パケットを復号する。
-    % status: 1=成功(entryあり), 0=失敗(読み捨て,entry=[]), -1=サンプル不足(待機)
+    %   status: 1=成功(entryあり), 0=失敗/読み捨て, -1=サンプル不足
+    %   consumed: pkt 先頭から消費したサンプル数
     entry = [];
-    advanceBy = startOffset + 320;
+    consumed = 400;   % L-STF..L-SIG
 
     % --- L-SIG 復号 (レート・PSDU長を取得) ---
     [recLSIGBits, lsigFail] = wlanLSIGRecover(pkt(321:400), chanEst, noiseEst, chanBW);
     if lsigFail
         status = 0;
-        advanceBy = startOffset + 400;
         return;
     end
 
     [mcs, psduLen] = decodeLSIGBits(recLSIGBits);
     if isempty(mcs) || psduLen <= 0 || psduLen > 4095
         status = 0;
-        advanceBy = startOffset + 400;
         return;
     end
 
-    ndbpsTable = [24 36 48 72 96 144 192 216];   % MCS0..7 (bits/symbol)
-    numDataSym = ceil((16 + 8 * psduLen + 6) / ndbpsTable(mcs + 1));
-    numDataSamples = numDataSym * 80;
-
-    if numel(pkt) < 400 + numDataSamples
-        status = -1;
-        return;   % データ部がまだ届いていない -> 次フレーム待ち
+    try
+        cfgNonHT = wlanNonHTConfig('MCS', mcs, 'PSDULength', psduLen, ...
+            'ChannelBandwidth', chanBW);
+        ind = wlanFieldIndices(cfgNonHT);
+    catch
+        status = 0;
+        return;
     end
 
-    cfgNonHT = wlanNonHTConfig('MCS', mcs, 'PSDULength', psduLen, ...
-        'ChannelBandwidth', chanBW);
-    rxData = pkt(401 : 400 + numDataSamples);
-    rxPSDU = wlanNonHTDataRecover(rxData, chanEst, noiseEst, cfgNonHT);
+    if numel(pkt) < ind.NonHTData(2)
+        status = -1;
+        return;   % データ部がキャプチャ範囲外
+    end
+    consumed = double(ind.NonHTData(2));
+
+    rxPSDU = wlanNonHTDataRecover(pkt(ind.NonHTData(1):ind.NonHTData(2)), ...
+        chanEst, noiseEst, cfgNonHT);
 
     [cfgMAC, payload, mpduStatus] = wlanMPDUDecode(rxPSDU, cfgNonHT, 'DataFormat', 'bits');
-    advanceBy = startOffset + 400 + numDataSamples;
-
     if ~strcmpi(string(mpduStatus), "Success")
         status = 0;
         return;
     end
 
-    frameType = char(cfgMAC.FrameType);
-    ssidStr = '';
-    if any(strcmpi(frameType, {'Beacon', 'Probe Response'})) && numel(payload) >= 14
-        ssidStr = parseSSIDFromMgmtFrame(payload);
-    end
-
-    entry = struct( ...
-        'timeSec',   (bufferGlobalOffset + startOffset) / sampleRate, ...
-        'bssid',     char(cfgMAC.Address2), ...
-        'frameType', frameType, ...
-        'ssid',      ssidStr, ...
-        'phyFormat', 'Non-HT', ...
-        'csi',       chanEst(:).');
+    entry = buildEntry(cfgMAC, payload, 'Non-HT', chanEst);
     status = 1;
 end
 
-function [status, advanceBy, entry] = processVHT(pkt, startOffset, lltfChanEst, noiseEst, chanBW, sampleRate, bufferGlobalOffset)
+function [status, consumed, entry] = processVHT(pkt, lltfChanEst, noiseEst, chanBW)
     % SU-VHT (802.11ac, NSTS=1, 20MHz) パケットを復号する。
-    % status: 1=成功(entryあり), 0=失敗/非対応(読み捨て,entry=[]), -1=サンプル不足(待機)
+    %   status: 1=成功(entryあり), 0=失敗/非対応, -1=サンプル不足
     entry = [];
-    advanceBy = startOffset + 560;   % 最低限、SIG-Aまでは読み進めたとみなす
+    consumed = 560;   % L-STF..VHT-SIG-A
 
-    % --- VHT-SIG-A 復号 (2シンボル, pkt(401:560)) ---
+    % --- VHT-SIG-A 復号 (2シンボル) ---
     [sigaBits, sigaFail] = wlanVHTSIGARecover(pkt(401:560), lltfChanEst, noiseEst, chanBW);
     if sigaFail
         status = 0;
@@ -473,33 +523,7 @@ function [status, advanceBy, entry] = processVHT(pkt, startOffset, lltfChanEst, 
 
     vhtA = parseVHTSIGABits(sigaBits);
     if ~vhtA.isValid || ~vhtA.is20MHz || ~vhtA.isSU || vhtA.nsts ~= 1 || vhtA.stbc
-        % NSTS>=2(マルチストリーム,SISOでは復号不可)/MU-MIMO/STBC/非20MHzは非対応
-        status = 0;
-        return;
-    end
-
-    % --- VHT-STF / VHT-LTF / VHT-SIG-B の位置を取得 (仮のPSDULengthで算出) ---
-    % STF/LTF/SIG-Bの位置は BW と NSTS だけで決まり PSDULength に依存しないため、
-    % 仮の値(MCS=0,PSDULength=1)で構成した cfgVHT から位置を求める。
-    cfgVHT0 = wlanVHTConfig('ChannelBandwidth', chanBW, 'NumSpaceTimeStreams', 1, ...
-        'MCS', 0, 'PSDULength', 1, 'ChannelCoding', 'BCC', 'GuardInterval', 'Long');
-    ind0 = wlanFieldIndices(cfgVHT0);
-
-    if numel(pkt) < ind0.VHTSIGB(2)
-        status = -1;
-        return;   % VHT-LTF/VHT-SIG-B がまだ届いていない -> 次フレーム待ち
-    end
-
-    % --- VHT-LTF チャネル推定 (= CSI) ---
-    rxVHTLTF = pkt(ind0.VHTLTF(1):ind0.VHTLTF(2));
-    demodVHTLTF = wlanVHTLTFDemodulate(rxVHTLTF, chanBW, 1);
-    vhtChanEst = wlanVHTLTFChannelEstimate(demodVHTLTF, chanBW, 1);
-
-    % --- VHT-SIG-B 復号 (PSDU長を取得) ---
-    rxVHTSIGB = pkt(ind0.VHTSIGB(1):ind0.VHTSIGB(2));
-    sigbBits = wlanVHTSIGBRecover(rxVHTSIGB, vhtChanEst, noiseEst, chanBW);
-    psduLenBytes = decodeVHTSIGBLength(sigbBits);
-    if isempty(psduLenBytes) || psduLenBytes <= 0 || psduLenBytes > 65535
+        % NSTS>=2 (SISOでは復号不可) / MU-MIMO / STBC / 非20MHz は非対応
         status = 0;
         return;
     end
@@ -507,151 +531,247 @@ function [status, advanceBy, entry] = processVHT(pkt, startOffset, lltfChanEst, 
     codingStr = ternary(vhtA.coding == 1, 'LDPC', 'BCC');
     giStr     = ternary(vhtA.gi == 1, 'Short', 'Long');
 
+    % --- VHT-STF/LTF/SIG-B の位置を取得 ---
+    %     これらの位置は帯域幅と NSTS だけで決まり APEPLength に依存しないため、
+    %     暫定の APEPLength を持つコンフィグから求めてよい。
     try
-        cfgVHT = wlanVHTConfig('ChannelBandwidth', chanBW, 'NumSpaceTimeStreams', 1, ...
-            'MCS', vhtA.mcs, 'PSDULength', psduLenBytes, 'ChannelCoding', codingStr, ...
-            'GuardInterval', giStr);
-        ind = wlanFieldIndices(cfgVHT);
+        cfgProbe = wlanVHTConfig('ChannelBandwidth', chanBW, ...
+            'NumTransmitAntennas', 1, 'NumSpaceTimeStreams', 1, ...
+            'MCS', vhtA.mcs, 'APEPLength', 1024, ...
+            'ChannelCoding', codingStr, 'GuardInterval', giStr);
+        indProbe = wlanFieldIndices(cfgProbe);
     catch
-        % MCS/長さの組み合わせが不正 (ビット解釈ミスの可能性)
         status = 0;
         return;
     end
 
-    advanceBy = startOffset + ind.VHTData(2);
+    if numel(pkt) < indProbe.VHTSIGB(2)
+        status = -1;
+        return;
+    end
+
+    % --- VHT-LTF を復調してチャネル推定 (= CSI) ---
+    demodVHTLTF = wlanVHTLTFDemodulate(pkt(indProbe.VHTLTF(1):indProbe.VHTLTF(2)), chanBW, 1);
+    vhtChanEst  = wlanVHTLTFChannelEstimate(demodVHTLTF, chanBW, 1);
+
+    % --- VHT-SIG-B 復号 (APEP長を取得) ---
+    sigbBits = wlanVHTSIGBRecover(pkt(indProbe.VHTSIGB(1):indProbe.VHTSIGB(2)), ...
+        vhtChanEst, noiseEst, chanBW);
+    apepLen = decodeVHTSIGBLength(sigbBits);
+    if isempty(apepLen) || apepLen <= 0
+        status = 0;
+        return;
+    end
+
+    try
+        cfgVHT = wlanVHTConfig('ChannelBandwidth', chanBW, ...
+            'NumTransmitAntennas', 1, 'NumSpaceTimeStreams', 1, ...
+            'MCS', vhtA.mcs, 'APEPLength', apepLen, ...
+            'ChannelCoding', codingStr, 'GuardInterval', giStr);
+        ind = wlanFieldIndices(cfgVHT);
+    catch
+        % APEPLength が不正 (VHT-SIG-B のビット解釈ミスの可能性)
+        status = 0;
+        return;
+    end
 
     if numel(pkt) < ind.VHTData(2)
         status = -1;
-        advanceBy = startOffset + 560;   % データ未達なので進めすぎない
-        return;   % VHT Data がまだ届いていない -> 次フレーム待ち
+        return;
     end
+    consumed = double(ind.VHTData(2));
 
-    rxVHTData = pkt(ind.VHTData(1):ind.VHTData(2));
-    rxPSDU = wlanVHTDataRecover(rxVHTData, vhtChanEst, noiseEst, cfgVHT);
+    rxPSDU = wlanVHTDataRecover(pkt(ind.VHTData(1):ind.VHTData(2)), ...
+        vhtChanEst, noiseEst, cfgVHT);
 
-    [cfgMAC, payload, mpduStatus] = wlanMPDUDecode(rxPSDU, cfgVHT, 'DataFormat', 'bits');
-
-    if ~strcmpi(string(mpduStatus), "Success")
+    % --- VHT の PSDU は A-MPDU なので分解してから MPDU を復号 ---
+    [cfgMAC, payload, ok] = decodeVHTPSDU(rxPSDU, cfgVHT);
+    if ~ok
         status = 0;
         return;
     end
 
+    entry = buildEntry(cfgMAC, payload, 'VHT', vhtChanEst);
+    status = 1;
+end
+
+function [cfgMAC, payload, ok] = decodeVHTPSDU(rxPSDU, cfgVHT)
+    % VHT の PSDU (A-MPDU) を分解し、最初に復号できた MPDU を返す。
+    cfgMAC = [];
+    payload = [];
+    ok = false;
+
+    try
+        [mpduList, ~, deagStatus] = wlanAMPDUDeaggregate(rxPSDU, cfgVHT, 'DataFormat', 'bits');
+    catch
+        mpduList = {};
+        deagStatus = "Fail";
+    end
+
+    if ~isempty(mpduList) && strcmpi(string(deagStatus), "Success")
+        for m = 1:numel(mpduList)
+            try
+                [c, p, st] = wlanMPDUDecode(mpduList{m}, cfgVHT, 'DataFormat', 'bits');
+                if strcmpi(string(st), "Success")
+                    cfgMAC = c; payload = p; ok = true;
+                    return;
+                end
+            catch
+                % この MPDU は読み飛ばす
+            end
+        end
+        return;
+    end
+
+    % A-MPDU として分解できない場合は単一 MPDU として試す
+    try
+        [c, p, st] = wlanMPDUDecode(rxPSDU, cfgVHT, 'DataFormat', 'bits');
+        if strcmpi(string(st), "Success")
+            cfgMAC = c; payload = p; ok = true;
+        end
+    catch
+    end
+end
+
+function entry = buildEntry(cfgMAC, payload, phyFormat, chanEst)
+    % 復号済み MAC 情報と CSI から記録用の構造体を作る
     frameType = char(cfgMAC.FrameType);
     ssidStr = '';
-    if any(strcmpi(frameType, {'Beacon', 'Probe Response'})) && numel(payload) >= 14
+    if any(strcmpi(frameType, {'Beacon', 'Probe Response'}))
         ssidStr = parseSSIDFromMgmtFrame(payload);
     end
 
     entry = struct( ...
-        'timeSec',   (bufferGlobalOffset + startOffset) / sampleRate, ...
+        'timeSec',   0, ...            % 呼び出し側で設定
         'bssid',     char(cfgMAC.Address2), ...
         'frameType', frameType, ...
         'ssid',      ssidStr, ...
-        'phyFormat', 'VHT', ...
-        'csi',       vhtChanEst(:).');
-    status = 1;
+        'phyFormat', phyFormat, ...
+        'csi',       chanEst(:).');
 end
 
 function [mcs, psduLen] = decodeLSIGBits(bits)
     % 802.11a/g L-SIG (24bit: RATE(4)+Reserved(1)+LENGTH(12)+Parity(1)+Tail(6))
     % を解釈し、Non-HT MCS インデックス (0..7) と PSDU長 [byte] を返す。
-    % パリティ不一致の場合は mcs=[] を返す。
+    % RATE の対応は IEEE Std 802.11-2016 Table 17-6 による。
     bits = double(bits(:)).';
-
-    % パリティチェック (RATE+Reserved+LENGTHの17bit + Parityビットで偶数)
-    parityOk = mod(sum(bits(1:18)), 2) == 0;
-    if ~parityOk
-        mcs = [];
-        psduLen = 0;
+    if numel(bits) < 17
+        mcs = []; psduLen = 0;
         return;
     end
 
-    rateBits = bits(1:4);
+    rateKey = sprintf('%d', bits(1:4));
     rateMap = containers.Map( ...
         {'1101','1111','0101','0111','1001','1011','0001','0011'}, ...
         {0,      1,     2,     3,     4,     5,     6,     7});
-    rateKey = sprintf('%d', rateBits);
     if ~isKey(rateMap, rateKey)
-        mcs = [];
-        psduLen = 0;
+        mcs = []; psduLen = 0;
         return;
     end
     mcs = rateMap(rateKey);
 
-    lenBits = bits(6:17);   % LSBが先頭 (bits(6)=LSB)
+    lenBits = bits(6:17);   % LENGTH は LSB 先頭
     psduLen = sum(lenBits .* 2.^(0:11));
 end
 
 function out = parseVHTSIGABits(bits)
     % VHT-SIG-A (48bit = SIG-A1(24) + SIG-A2(24)) を解釈する。
-    % IEEE Std 802.11ac-2013, Table 22-12 に基づく実装。
-    % 注意: MCSフィールドのビット順(LSB/MSB)は実機未検証。デコード結果の
-    % MCS値が明らかにおかしい場合はここを最初に疑うこと。
+    % IEEE Std 802.11ac-2013, Table 22-12 に基づく。多ビットフィールドは
+    % LSB 先頭で送信される。
+    %   bits(1:2)   BW (00=20MHz)          bits(4)     STBC
+    %   bits(5:10)  Group ID               bits(11:13) NSTS-1
+    %   bits(25)    Short GI               bits(27)    Coding (0=BCC,1=LDPC)
+    %   bits(29:32) SU VHT-MCS
     bits = double(bits(:)).';
     out = struct('isValid', false, 'is20MHz', false, 'isSU', false, ...
-        'nsts', 0, 'stbc', false, 'groupId', 0, 'gi', 0, 'coding', 0, ...
-        'mcs', 0, 'beamformed', false);
+        'nsts', 0, 'stbc', false, 'groupId', 0, 'gi', 0, 'coding', 0, 'mcs', 0);
 
-    if numel(bits) < 48
+    if numel(bits) < 32
         return;
     end
 
-    bw       = bits(1:2);       % 00=20MHz,01=40,10=80,11=160/80+80
+    bw       = bits(1:2);
     stbcBit  = bits(4);
-    groupId  = bits(5:10);      % 6bit
-    nstsBits = bits(11:13);     % 3bit (SU: value+1 = NSTS)
-    giBit    = bits(25);        % 0=Long,1=Short
-    codingBit= bits(27);        % 0=BCC,1=LDPC
-    mcsBits  = bits(29:32);     % 4bit (LSB-first と仮定)
+    groupId  = bits(5:10);
+    nstsBits = bits(11:13);
 
-    out.is20MHz = all(bw == 0);                 % 00 = 20MHz (順序非依存)
-    out.isSU    = all(groupId == 0) || all(groupId == 1);  % GroupID=0 or 63
+    out.is20MHz = all(bw == 0);
+    % SU-VHT は Group ID = 0 または 63 (全ビット0 または 全ビット1)
+    out.isSU    = all(groupId == 0) || all(groupId == 1);
     if all(nstsBits == 0)
-        out.nsts = 1;   % 全ビット0であれば、ビット順によらずNSTS=1と確定できる
+        out.nsts = 1;   % 全ビット0ならビット順によらず NSTS=1 と確定できる
     else
-        out.nsts = 1 + sum(nstsBits .* 2.^(0:2));  % 参考値 (ビット順未検証)
+        out.nsts = 1 + sum(nstsBits .* 2.^(0:2));
     end
     out.stbc    = stbcBit == 1;
     out.groupId = sum(groupId .* 2.^(0:5));
-    out.gi      = giBit;
-    out.coding  = codingBit;
-    out.mcs     = sum(mcsBits .* 2.^(0:3));
+    out.gi      = bits(25);
+    out.coding  = bits(27);
+    out.mcs     = sum(bits(29:32) .* 2.^(0:3));
     out.isValid = true;
 end
 
-function psduLen = decodeVHTSIGBLength(bits)
-    % VHT-SIG-B (20MHz, SU) の Length フィールド(17bit, LSB先頭と仮定)を
-    % 解釈し、PSDU長 [byte] を返す。20MHzでは4byte単位とされているため
-    % 4倍する。この換算の正確性は実機未検証 (最も不確実性が高い箇所)。
+function apepLen = decodeVHTSIGBLength(bits)
+    % VHT-SIG-B (20MHz, SU) の Length フィールド(17bit, LSB先頭)を解釈し、
+    % APEP長 [byte] を返す。20MHz では 4 オクテット単位で符号化されるため
+    % 4 倍する。※この換算は実機未検証で、VHT が復号できない場合に
+    %   最初に見直すべき箇所。
     bits = double(bits(:)).';
     if numel(bits) < 17
-        psduLen = [];
+        apepLen = [];
         return;
     end
-    lengthVal = sum(bits(1:17) .* 2.^(0:16));
-    psduLen = lengthVal * 4;
+    apepLen = sum(bits(1:17) .* 2.^(0:16)) * 4;
 end
 
 function ssidStr = parseSSIDFromMgmtFrame(payload)
-    % Beacon/Probe Response のフレームボディ(payload, uint8)から
-    % 先頭 Information Element (SSID, Element ID = 0) を抽出する。
+    % Beacon/Probe Response のフレームボディから先頭の
+    % Information Element (SSID, Element ID = 0) を抽出する。
     % 固定フィールド: Timestamp(8) + BeaconInterval(2) + CapabilityInfo(2) = 12byte
     ssidStr = '';
-    payload = uint8(payload(:)).';
+    if isempty(payload)
+        return;
+    end
+    if iscell(payload)
+        payload = payload{1};
+    end
+    payload = double(payload(:)).';
+    if isempty(payload)
+        return;
+    end
+
+    % wlanMPDUDecode に 'DataFormat','bits' を渡しているため payload は
+    % ビット列で返る。オクテット列 (MACはオクテット内 LSB 先頭) に戻す。
+    if max(payload) <= 1 && mod(numel(payload), 8) == 0
+        payload = bitsToOctets(payload);
+    end
+    payload = uint8(payload);
+
     if numel(payload) < 14
         return;
     end
-    ieOffset = 12;   % 0-indexed: 固定フィールドの直後
+    ieOffset = 12;
     elemId  = payload(ieOffset + 1);
     elemLen = payload(ieOffset + 2);
     if elemId ~= 0
-        return;   % 先頭IEがSSIDでない (仕様上は通常SSIDが最初)
+        return;   % 先頭 IE が SSID でない
     end
-    if numel(payload) < ieOffset + 2 + elemLen
+    if numel(payload) < ieOffset + 2 + elemLen || elemLen == 0
         return;
     end
-    ssidBytes = payload(ieOffset + 3 : ieOffset + 2 + elemLen);
-    ssidStr = char(ssidBytes);
+    ssidStr = char(payload(ieOffset + 3 : ieOffset + 2 + elemLen));
+end
+
+function bytes = bitsToOctets(bits)
+    % ビット列をオクテット列へ変換する (各オクテット内は LSB 先頭)
+    bits = double(bits(:));
+    n = floor(numel(bits) / 8) * 8;
+    if n == 0
+        bytes = [];
+        return;
+    end
+    b = reshape(bits(1:n), 8, []);
+    bytes = (2.^(0:7)) * b;   % 1 x (n/8)
 end
 
 function out = ternary(cond, a, b)
