@@ -218,8 +218,11 @@ bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
 
 % 復号統計 (診断用)
 stats = struct('detected', 0, 'timingSkip', 0, 'nonHT', 0, 'vht', 0, ...
-    'ht', 0, 'other', 0, 'vhtUnsupported', 0, 'decodeOK', 0, 'errors', 0);
-errMsgs = containers.Map('KeyType', 'char', 'ValueType', 'double');
+    'ht', 0, 'other', 0, 'vhtUnsupported', 0, 'decodeOK', 0, ...
+    'noAddr2', 0, 'errors', 0);
+errMsgs      = containers.Map('KeyType', 'char', 'ValueType', 'double');
+vhtRejects   = containers.Map('KeyType', 'char', 'ValueType', 'double');
+vhtBWCounts  = containers.Map('KeyType', 'double', 'ValueType', 'double');
 
 minPreambleLen = 560;   % L-STF..L-SIG + 2シンボル (フォーマット検出まで)
 searchOffset = 0;
@@ -274,7 +277,10 @@ while searchOffset + minPreambleLen <= numel(iq)
         noiseEst    = wlanLLTFNoiseEstimate(lltfDemod);
 
         % --- フォーマット検出 (L-SIG + 後続2シンボル) ---
+        %     内部の L-SIG チェック失敗警告は独自サマリで集計するため抑止する
+        wState = warning('off', 'all');
         fmt = wlanFormatDetect(pkt(321:560), lltfChanEst, noiseEst, chanBW);
+        warning(wState);
         fmtStr = upper(string(fmt));
 
         switch true
@@ -284,9 +290,22 @@ while searchOffset + minPreambleLen <= numel(iq)
 
             case fmtStr == "VHT"
                 stats.vht = stats.vht + 1;
-                [st, consumed, entry] = processVHT(pkt, lltfChanEst, noiseEst, chanBW);
-                if st == 0 && isempty(entry)
+                [st, consumed, entry, vhtInfo] = processVHT(pkt, lltfChanEst, noiseEst, chanBW);
+
+                if vhtInfo.bwMHz > 0
+                    if isKey(vhtBWCounts, vhtInfo.bwMHz)
+                        vhtBWCounts(vhtInfo.bwMHz) = vhtBWCounts(vhtInfo.bwMHz) + 1;
+                    else
+                        vhtBWCounts(vhtInfo.bwMHz) = 1;
+                    end
+                end
+                if ~isempty(vhtInfo.reason)
                     stats.vhtUnsupported = stats.vhtUnsupported + 1;
+                    if isKey(vhtRejects, vhtInfo.reason)
+                        vhtRejects(vhtInfo.reason) = vhtRejects(vhtInfo.reason) + 1;
+                    else
+                        vhtRejects(vhtInfo.reason) = 1;
+                    end
                 end
 
             case startsWith(fmtStr, "HT")
@@ -304,18 +323,24 @@ while searchOffset + minPreambleLen <= numel(iq)
             continue;
         end
 
-        if st > 0 && ~isempty(entry)
-            entry.timeSec = pktStart / sampleRate;
-            pktLog(end+1) = entry; %#ok<SAGROW>
+        if st > 0
             stats.decodeOK = stats.decodeOK + 1;
 
-            if any(strcmpi(entry.frameType, {'Beacon', 'Probe Response'})) && ~isempty(entry.ssid)
-                bssidToSSID(entry.bssid) = entry.ssid;
-            end
+            if isempty(entry)
+                % ACK/CTS など Address2 を持たないフレーム (BSSID 判定に使えない)
+                stats.noAddr2 = stats.noAddr2 + 1;
+            else
+                entry.timeSec = pktStart / sampleRate;
+                pktLog(end+1) = entry; %#ok<SAGROW>
 
-            fprintf('  [%7.4fs] %-6s %-16s BSSID=%s%s\n', entry.timeSec, ...
-                entry.phyFormat, entry.frameType, entry.bssid, ...
-                ternary(~isempty(entry.ssid), sprintf('  SSID="%s"', entry.ssid), ''));
+                if any(strcmpi(entry.frameType, {'Beacon', 'Probe Response'})) && ~isempty(entry.ssid)
+                    bssidToSSID(entry.bssid) = entry.ssid;
+                end
+
+                fprintf('  [%7.4fs] %-6s %-16s BSSID=%s%s\n', entry.timeSec, ...
+                    entry.phyFormat, entry.frameType, entry.bssid, ...
+                    ternary(~isempty(entry.ssid), sprintf('  SSID="%s"', entry.ssid), ''));
+            end
         end
 
         searchOffset = pktStart + max(consumed, 160);
@@ -347,7 +372,27 @@ fprintf('    Non-HT として検出       : %d\n', stats.nonHT);
 fprintf('    VHT    として検出       : %d  (うち非対応構成 %d)\n', stats.vht, stats.vhtUnsupported);
 fprintf('    HT     として検出       : %d  (非対応)\n', stats.ht);
 fprintf('    その他フォーマット      : %d  (非対応)\n', stats.other);
+if stats.vht > 0
+    fprintf('  [VHT 詳細]\n');
+    if vhtBWCounts.Count > 0
+        bwKeys = cell2mat(keys(vhtBWCounts));
+        fprintf('    送信帯域幅の内訳: ');
+        for k = 1:numel(bwKeys)
+            fprintf('%dMHz=%d回  ', bwKeys(k), vhtBWCounts(bwKeys(k)));
+        end
+        fprintf('\n');
+    end
+    if vhtRejects.Count > 0
+        rKeys = keys(vhtRejects);
+        fprintf('    非対応の理由    : ');
+        for k = 1:numel(rKeys)
+            fprintf('%s=%d回  ', rKeys{k}, vhtRejects(rKeys{k}));
+        end
+        fprintf('\n');
+    end
+end
 fprintf('  MAC まで復号成功          : %d\n', stats.decodeOK);
+fprintf('    うち Address2 無し(ACK/CTS等、BSSID判定不可): %d\n', stats.noAddr2);
 fprintf('  復号エラー                : %d\n', stats.errors);
 
 if stats.errors > 0
@@ -508,24 +553,43 @@ function [status, consumed, entry] = processNonHT(pkt, chanEst, noiseEst, chanBW
     status = 1;
 end
 
-function [status, consumed, entry] = processVHT(pkt, lltfChanEst, noiseEst, chanBW)
+function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst, chanBW)
     % SU-VHT (802.11ac, NSTS=1, 20MHz) パケットを復号する。
-    %   status: 1=成功(entryあり), 0=失敗/非対応, -1=サンプル不足
+    %   status: 1=成功, 0=失敗/非対応, -1=サンプル不足
+    %   info:   診断用 (棄却理由・観測された帯域幅/NSTS/MCS)
     entry = [];
     consumed = 560;   % L-STF..VHT-SIG-A
+    info = struct('reason', '', 'bwMHz', 0, 'nsts', 0, 'mcs', 0);
 
     % --- VHT-SIG-A 復号 (2シンボル) ---
     [sigaBits, sigaFail] = wlanVHTSIGARecover(pkt(401:560), lltfChanEst, noiseEst, chanBW);
     if sigaFail
+        info.reason = 'SIG-A CRC失敗';
         status = 0;
         return;
     end
 
     vhtA = parseVHTSIGABits(sigaBits);
-    if ~vhtA.isValid || ~vhtA.is20MHz || ~vhtA.isSU || vhtA.nsts ~= 1 || vhtA.stbc
-        % NSTS>=2 (SISOでは復号不可) / MU-MIMO / STBC / 非20MHz は非対応
-        status = 0;
-        return;
+    info.bwMHz = vhtA.bwMHz;
+    info.nsts  = vhtA.nsts;
+    info.mcs   = vhtA.mcs;
+
+    % 以下はいずれも SISO(受信1本)/20MHz 受信では扱えない構成
+    if ~vhtA.isValid
+        info.reason = 'SIG-A解釈不能';
+        status = 0; return;
+    elseif ~vhtA.is20MHz
+        info.reason = sprintf('帯域幅%dMHz(20MHz受信では復号不可)', vhtA.bwMHz);
+        status = 0; return;
+    elseif ~vhtA.isSU
+        info.reason = 'MU-MIMO';
+        status = 0; return;
+    elseif vhtA.nsts ~= 1
+        info.reason = sprintf('NSTS=%d(アンテナ1本では復号不可)', vhtA.nsts);
+        status = 0; return;
+    elseif vhtA.stbc
+        info.reason = 'STBC';
+        status = 0; return;
     end
 
     codingStr = ternary(vhtA.coding == 1, 'LDPC', 'BCC');
@@ -541,6 +605,7 @@ function [status, consumed, entry] = processVHT(pkt, lltfChanEst, noiseEst, chan
             'ChannelCoding', codingStr, 'GuardInterval', giStr);
         indProbe = wlanFieldIndices(cfgProbe);
     catch
+        info.reason = 'VHTコンフィグ生成失敗';
         status = 0;
         return;
     end
@@ -559,6 +624,7 @@ function [status, consumed, entry] = processVHT(pkt, lltfChanEst, noiseEst, chan
         vhtChanEst, noiseEst, chanBW);
     apepLen = decodeVHTSIGBLength(sigbBits);
     if isempty(apepLen) || apepLen <= 0
+        info.reason = 'SIG-B長不正';
         status = 0;
         return;
     end
@@ -571,6 +637,7 @@ function [status, consumed, entry] = processVHT(pkt, lltfChanEst, noiseEst, chan
         ind = wlanFieldIndices(cfgVHT);
     catch
         % APEPLength が不正 (VHT-SIG-B のビット解釈ミスの可能性)
+        info.reason = sprintf('APEPLength不正(%d)', apepLen);
         status = 0;
         return;
     end
@@ -587,6 +654,7 @@ function [status, consumed, entry] = processVHT(pkt, lltfChanEst, noiseEst, chan
     % --- VHT の PSDU は A-MPDU なので分解してから MPDU を復号 ---
     [cfgMAC, payload, ok] = decodeVHTPSDU(rxPSDU, cfgVHT);
     if ~ok
+        info.reason = 'MPDU復号失敗';
         status = 0;
         return;
     end
@@ -634,20 +702,52 @@ function [cfgMAC, payload, ok] = decodeVHTPSDU(rxPSDU, cfgVHT)
 end
 
 function entry = buildEntry(cfgMAC, payload, phyFormat, chanEst)
-    % 復号済み MAC 情報と CSI から記録用の構造体を作る
-    frameType = char(cfgMAC.FrameType);
+    % 復号済み MAC 情報と CSI から記録用の構造体を作る。
+    % Address2 (送信元アドレス) を持たないフレームは BSSID 判定に使えない
+    % ため空を返す。
+    entry = [];
+    frameType = char(string(cfgMAC.FrameType));
+
+    % ACK と CTS は Address1 のみを持ち Address2 が無い。
+    % (この場合 cfgMAC.Address2 には既定値が残るため BSSID として使えない)
+    if any(strcmpi(frameType, {'ACK', 'CTS'}))
+        return;
+    end
+
     ssidStr = '';
     if any(strcmpi(frameType, {'Beacon', 'Probe Response'}))
-        ssidStr = parseSSIDFromMgmtFrame(payload);
+        ssidStr = extractSSID(cfgMAC, payload);
     end
 
     entry = struct( ...
         'timeSec',   0, ...            % 呼び出し側で設定
-        'bssid',     char(cfgMAC.Address2), ...
+        'bssid',     char(string(cfgMAC.Address2)), ...
         'frameType', frameType, ...
         'ssid',      ssidStr, ...
         'phyFormat', phyFormat, ...
         'csi',       chanEst(:).');
+end
+
+function ssidStr = extractSSID(cfgMAC, payload)
+    % Beacon/Probe Response から SSID を取得する。
+    % wlanMPDUDecode は管理フレームの内容を cfgMAC.ManagementConfig
+    % (wlanMACManagementConfig) に格納するため、まずそこから読む。
+    ssidStr = '';
+    try
+        mgmt = cfgMAC.ManagementConfig;
+        if ~isempty(mgmt)
+            s = char(string(mgmt.SSID));
+            if ~isempty(s)
+                ssidStr = s;
+                return;
+            end
+        end
+    catch
+        % ManagementConfig を持たない/参照できない場合は下のフォールバックへ
+    end
+
+    % フォールバック: フレームボディを自前で解析する
+    ssidStr = parseSSIDFromMgmtFrame(payload);
 end
 
 function [mcs, psduLen] = decodeLSIGBits(bits)
@@ -684,7 +784,8 @@ function out = parseVHTSIGABits(bits)
     %   bits(29:32) SU VHT-MCS
     bits = double(bits(:)).';
     out = struct('isValid', false, 'is20MHz', false, 'isSU', false, ...
-        'nsts', 0, 'stbc', false, 'groupId', 0, 'gi', 0, 'coding', 0, 'mcs', 0);
+        'nsts', 0, 'stbc', false, 'groupId', 0, 'gi', 0, 'coding', 0, ...
+        'mcs', 0, 'bwMHz', 0);
 
     if numel(bits) < 32
         return;
@@ -695,6 +796,8 @@ function out = parseVHTSIGABits(bits)
     groupId  = bits(5:10);
     nstsBits = bits(11:13);
 
+    bwTable     = [20 40 80 160];
+    out.bwMHz   = bwTable(sum(bw .* 2.^(0:1)) + 1);
     out.is20MHz = all(bw == 0);
     % SU-VHT は Group ID = 0 または 63 (全ビット0 または 全ビット1)
     out.isSU    = all(groupId == 0) || all(groupId == 1);
