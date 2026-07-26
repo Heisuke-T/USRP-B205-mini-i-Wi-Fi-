@@ -63,6 +63,18 @@
 %    自身が管理する機器・許可された環境でのみ実施してください。
 % =========================================================================
 
+%% ------------------------------------------------------------------------
+%  0. 直前の実行で残っている USRP オブジェクトの解放
+%  ------------------------------------------------------------------------
+% スクリプトの変数はベースワークスペースに残るため、前回がエラーで終了して
+% いると受信機オブジェクトが USRP を掴んだままになり、次回実行時に
+% "radio is busy" となる。clear より先に明示的に release する。
+if exist('rx', 'var')
+    try
+        release(rx);
+    catch
+    end
+end
 clear; clc;
 
 %% ------------------------------------------------------------------------
@@ -172,24 +184,33 @@ totalSamplesCaptured = 0;
 overrunCount = 0;
 
 fprintf('\n[第1段] IQ キャプチャを開始します...\n');
-cleanupObj = onCleanup(@() cleanupResources(rx));
 captureTic = tic;
 
-while totalSamplesCaptured < totalSamplesTarget
-    [iqData, dataLen, overrun] = rx();
-    if dataLen == 0
-        continue;
+% エラーや中断が起きても USRP を必ず解放する
+% (スクリプトの onCleanup はベースワークスペースに残り発火しないため、
+%  try/catch で明示的に解放する)
+try
+    while totalSamplesCaptured < totalSamplesTarget
+        [iqData, dataLen, overrun] = rx();
+        if dataLen == 0
+            continue;
+        end
+        if overrun
+            overrunCount = overrunCount + 1;
+        end
+        iqBuffer(totalSamplesCaptured + (1:dataLen)) = iqData(1:dataLen);
+        totalSamplesCaptured = totalSamplesCaptured + dataLen;
     end
-    if overrun
-        overrunCount = overrunCount + 1;
+catch captureErr
+    try
+        release(rx);
+    catch
     end
-    iqBuffer(totalSamplesCaptured + (1:dataLen)) = iqData(1:dataLen);
-    totalSamplesCaptured = totalSamplesCaptured + dataLen;
+    rethrow(captureErr);
 end
 
 elapsedCapture = toc(captureTic);
 release(rx);
-clear cleanupObj;
 
 iq = iqBuffer(1:totalSamplesCaptured);
 clear iqBuffer;
@@ -517,15 +538,6 @@ fprintf('すべての処理が完了しました。\n');
 %% ------------------------------------------------------------------------
 %  ローカル関数
 %  ------------------------------------------------------------------------
-function cleanupResources(rx)
-    try
-        if ~isempty(rx) && isvalid(rx)
-            release(rx);
-        end
-    catch
-    end
-end
-
 function y = applyCFO(x, fs, cfoHz)
     % x に周波数オフセット cfoHz [Hz] 分の位相回転を与える (補正には -cfo を渡す)
     n = (0:numel(x)-1).';
