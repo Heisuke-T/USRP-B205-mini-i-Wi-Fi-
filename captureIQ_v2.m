@@ -234,7 +234,7 @@ subcarrierIndicesNonHT = [-26:-1, 1:26];    % Non-HT CBW20 (52本)
 subcarrierIndicesVHT20 = [-28:-1, 1:28];    % VHT CBW20 (56本)
 
 pktLog = struct('timeSec', {}, 'bssid', {}, 'frameType', {}, 'ssid', {}, ...
-    'phyFormat', {}, 'csi', {});
+    'phyFormat', {}, 'fcsVerified', {}, 'csi', {});
 bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
 
 % 復号統計 (診断用)
@@ -255,11 +255,21 @@ searchOffset = 0;
 fprintf('\n[第2段] オフライン復号を開始します...\n');
 decodeTic = tic;
 
+% 検出は窓に区切って行う (毎回バッファ全体を走査すると非常に遅くなるため)。
+% 窓の境界にまたがるプリアンブルを取りこぼさないよう少し重ねて進める。
+detectWindow  = 400000;   % 20 ms 分
+detectOverlap = 512;      % プリアンブル検出に必要な重なり
+
 while searchOffset + minPreambleLen <= numel(iq)
-    % --- パケット検出 (wlanPacketDetect は searchOffset からの相対位置を返す) ---
-    relOffset = wlanPacketDetect(iq, chanBW, searchOffset, pktDetThreshold);
+    % --- パケット検出 (窓内の相対位置が返る) ---
+    winEnd    = min(numel(iq), searchOffset + detectWindow);
+    relOffset = wlanPacketDetect(iq(searchOffset+1 : winEnd), chanBW, 0, pktDetThreshold);
     if isempty(relOffset)
-        break;   % これ以上パケットは見つからない
+        if winEnd >= numel(iq)
+            break;   % 末尾まで探索済み
+        end
+        searchOffset = winEnd - detectOverlap;
+        continue;
     end
     pktOffset = searchOffset + relOffset;   % 0-based の絶対位置
 
@@ -497,6 +507,7 @@ csi = {};
 phyFormat = {};
 timeSec = [];
 frameType = {};
+fcsVerified = logical([]);
 
 if isempty(targetBSSID)
     warning('captureIQ_v2:ssidNotFound', ...
@@ -507,16 +518,23 @@ else
     isMatch = strcmp({pktLog.bssid}, targetBSSID);
     matched = pktLog(isMatch);
     if ~isempty(matched)
-        csi       = {matched.csi}.';
-        phyFormat = {matched.phyFormat}.';
-        timeSec   = [matched.timeSec].';
-        frameType = {matched.frameType}.';
+        csi         = {matched.csi}.';
+        phyFormat   = {matched.phyFormat}.';
+        timeSec     = [matched.timeSec].';
+        frameType   = {matched.frameType}.';
+        fcsVerified = logical([matched.fcsVerified]).';
     end
     fprintf('\n対象 SSID "%s" (BSSID=%s) のパケット数: %d\n', ...
         targetSSID, targetBSSID, numel(matched));
     if ~isempty(matched)
         fprintf('  内訳: Non-HT=%d, VHT=%d\n', ...
             sum(strcmpi(phyFormat, 'Non-HT')), sum(strcmpi(phyFormat, 'VHT')));
+        nUnverified = sum(~fcsVerified);
+        if nUnverified > 0
+            fprintf(['  ※うち %d 件は FCS 未検証 (ペイロードにビット誤りがあり、\n', ...
+                     '    MAC ヘッダのみから送信元を判定したもの)。CSI 自体は\n', ...
+                     '    VHT-LTF から算出しており影響を受けません。\n'], nUnverified);
+        end
     end
 end
 
@@ -541,7 +559,7 @@ resultMeta.matlabVersion    = version;
 targetSSIDOut  = targetSSID;  %#ok<NASGU>
 targetBSSIDOut = targetBSSID; %#ok<NASGU>
 
-save(outMatFile, 'csi', 'phyFormat', 'subcarrierIndicesNonHT', ...
+save(outMatFile, 'csi', 'phyFormat', 'fcsVerified', 'subcarrierIndicesNonHT', ...
     'subcarrierIndicesVHT20', 'timeSec', 'frameType', 'targetSSIDOut', ...
     'targetBSSIDOut', 'seenNetworks', 'resultMeta', '-v7.3');
 
@@ -766,6 +784,9 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     end
 
     entry = buildEntry(cfgMAC, payload, 'VHT', vhtChanEst);
+    if ~isempty(entry)
+        entry.fcsVerified = ~deagInfo.headerOnly;
+    end
     status = 1;
 end
 
@@ -774,7 +795,7 @@ function [cfgMAC, payload, ok, deagInfo] = decodeVHTPSDU(rxPSDU, cfgVHT)
     cfgMAC = [];
     payload = [];
     ok = false;
-    deagInfo = struct('status', 'N/A', 'mpduCount', 0);
+    deagInfo = struct('status', 'N/A', 'mpduCount', 0, 'headerOnly', false);
 
     mpduList = {};
     try
@@ -787,10 +808,12 @@ function [cfgMAC, payload, ok, deagInfo] = decodeVHTPSDU(rxPSDU, cfgVHT)
 
     % 全体の status が Success でなくても、取り出せた MPDU は個別に試す
     % (一部のサブフレームだけ壊れている場合でも残りは復号できるため)
+    wState = warning('off', 'all');
     for m = 1:numel(mpduList)
         try
             [c, p, st] = wlanMPDUDecode(mpduList{m}, cfgVHT, 'DataFormat', 'bits');
             if strcmpi(string(st), "Success")
+                warning(wState);
                 cfgMAC = c; payload = p; ok = true;
                 return;
             end
@@ -798,17 +821,90 @@ function [cfgMAC, payload, ok, deagInfo] = decodeVHTPSDU(rxPSDU, cfgVHT)
             % この MPDU は読み飛ばす
         end
     end
+    warning(wState);
 
     % A-MPDU として分解できなかった場合は単一 MPDU として試す
     if isempty(mpduList)
         try
+            wState = warning('off', 'all');
             [c, p, st] = wlanMPDUDecode(rxPSDU, cfgVHT, 'DataFormat', 'bits');
+            warning(wState);
             if strcmpi(string(st), "Success")
                 cfgMAC = c; payload = p; ok = true;
+                return;
             end
         catch
         end
     end
+
+    % --- フォールバック: FCS 検証に失敗しても MAC ヘッダから送信元を読む ---
+    % FCS は MPDU 全体 (最大 1500B 超) を検証するため、末尾の 1 ビット誤りでも
+    % 失敗する。一方 CSI の帰属に必要なのは先頭 24 バイトのヘッダだけであり、
+    % ここが無傷である確率は高い。
+    candidates = mpduList;
+    if isempty(candidates)
+        candidates = {rxPSDU};
+    end
+    for m = 1:numel(candidates)
+        hdr = parseMACHeaderFromBits(candidates{m});
+        if hdr.valid
+            cfgMAC  = hdr;      % wlanMACFrameConfig ではなく自前の構造体
+            payload = [];
+            ok = true;
+            deagInfo.headerOnly = true;
+            return;
+        end
+    end
+end
+
+function hdr = parseMACHeaderFromBits(mpduBits)
+    % MPDU のビット列から MAC ヘッダ (Frame Control / Address1-3) を直接読む。
+    % FCS を検証しないため、ヘッダ内容が正しい保証は無い点に注意。
+    hdr = struct('valid', false, 'FrameType', '', 'Address2', '', ...
+        'ManagementConfig', [], 'headerOnly', true);
+
+    if isempty(mpduBits)
+        return;
+    end
+    oct = bitsToOctets(mpduBits);
+    if numel(oct) < 24
+        return;   % Address2 まで読めない
+    end
+
+    fc0     = oct(1);
+    version = bitand(fc0, 3);
+    type    = bitand(bitshift(fc0, -2), 3);
+    subtype = bitand(bitshift(fc0, -4), 15);
+
+    if version ~= 0
+        return;   % プロトコルバージョンは 0 のはず。違えば復号が壊れている
+    end
+
+    % Address2 を持たないフレーム (ACK=1101, CTS=1100 の制御フレーム) は対象外
+    if type == 1 && any(subtype == [12 13])
+        return;
+    end
+
+    switch type
+        case 0
+            typeName = 'Management';
+            if subtype == 8
+                typeName = 'Beacon';
+            elseif subtype == 5
+                typeName = 'Probe Response';
+            end
+        case 1
+            typeName = 'Control';
+        case 2
+            typeName = 'Data';
+        otherwise
+            return;   % type=3 は予約値
+    end
+
+    addr2 = oct(11:16);
+    hdr.valid     = true;
+    hdr.FrameType = typeName;
+    hdr.Address2  = upper(sprintf('%02X', addr2));
 end
 
 function ndbps = vhtNDBPS20MHz(mcs)
@@ -841,12 +937,13 @@ function entry = buildEntry(cfgMAC, payload, phyFormat, chanEst)
     end
 
     entry = struct( ...
-        'timeSec',   0, ...            % 呼び出し側で設定
-        'bssid',     char(string(cfgMAC.Address2)), ...
-        'frameType', frameType, ...
-        'ssid',      ssidStr, ...
-        'phyFormat', phyFormat, ...
-        'csi',       chanEst(:).');
+        'timeSec',     0, ...            % 呼び出し側で設定
+        'bssid',       char(string(cfgMAC.Address2)), ...
+        'frameType',   frameType, ...
+        'ssid',        ssidStr, ...
+        'phyFormat',   phyFormat, ...
+        'fcsVerified', true, ...         % VHT のヘッダのみ復号時は呼び出し側で false
+        'csi',         chanEst(:).');
 end
 
 function ssidStr = extractSSID(cfgMAC, payload)
