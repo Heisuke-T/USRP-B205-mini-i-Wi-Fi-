@@ -72,6 +72,10 @@
 %      targetSSIDOut / targetBSSIDOut … 指定SSIDと学習されたBSSID
 %      seenNetworks … 検出できた全 BSSID/SSID の一覧 (診断用)
 %
+%    ※ 対象 SSID への帰属判定は、送信元(Address2)・宛先(Address1)の
+%      どちらかが対象 BSSID と一致するかで行う (ダウンリンクは Address2、
+%      アップリンクは Address1 が BSSID になるため)。
+%
 %  注意:
 %    電波の受信・記録は、利用地域の電波法および関連法令を遵守し、
 %    自身が管理する機器・許可された環境でのみ実施してください。
@@ -248,7 +252,7 @@ subcarrierIndicesNonHT = [-26:-1, 1:26];    % Non-HT CBW20 (52本)
 subcarrierIndicesHT20  = [-26:-1, 1:26];    % HT     CBW20 (52本, Non-HTと同じ配置)
 subcarrierIndicesVHT20 = [-28:-1, 1:28];    % VHT    CBW20 (56本)
 
-pktLog = struct('timeSec', {}, 'bssid', {}, 'frameType', {}, 'ssid', {}, ...
+pktLog = struct('timeSec', {}, 'bssid', {}, 'addr1', {}, 'frameType', {}, 'ssid', {}, ...
     'phyFormat', {}, 'fcsVerified', {}, 'csi', {});
 bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
 
@@ -562,6 +566,15 @@ for k = 1:numel(bssidKeys)
         'ssid', bssidToSSID(bssidKeys{k})); %#ok<SAGROW>
 end
 
+% パケットが「その BSSID のネットワークに属する」かどうかは、送信元(Address2)
+% と宛先(Address1)のどちらか一方が BSSID と一致すれば判定できる。
+%   ダウンリンク (AP→クライアント): Address2(送信元) = BSSID
+%   アップリンク (クライアント→AP): Address1(宛先)   = BSSID
+% 送信元だけを見ると、クライアントが送るアップリンクの実データ(iperf3等)を
+% 取りこぼすので注意。
+allBssid = {pktLog.bssid};
+allAddr1 = {pktLog.addr1};
+
 fprintf('\n検出できたネットワーク一覧 (BSSID別の内訳):\n');
 if isempty(seenNetworks)
     fprintf('  (なし)\n');
@@ -570,15 +583,47 @@ else
     isVHTPkt = strcmpi({pktLog.phyFormat}, 'VHT');
     for k = 1:numel(seenNetworks)
         bssid = seenNetworks(k).bssid;
-        nAll  = sum(strcmp({pktLog.bssid}, bssid));
-        nHT   = sum(isHTPkt  & strcmp({pktLog.bssid}, bssid));
-        nVHT  = sum(isVHTPkt & strcmp({pktLog.bssid}, bssid));
+        belongs = strcmp(allBssid, bssid) | strcmp(allAddr1, bssid);
+        nAll  = sum(belongs);
+        nHT   = sum(isHTPkt  & belongs);
+        nVHT  = sum(isVHTPkt & belongs);
         fprintf('  BSSID=%s  SSID="%s"  (全%d件, うちHT=%d件, VHT=%d件)\n', ...
             bssid, seenNetworks(k).ssid, nAll, nHT, nVHT);
     end
     fprintf(['  ※ここでの件数は MAC ヘッダまで読めた(=BSSID が判明した)パケットのみ。\n', ...
              '    複数空間ストリームのパケットは SISO 受信ではヘッダも含めて\n', ...
              '    全く復号できないため、この一覧には出てきません。\n']);
+end
+
+% --- 診断: 既知の BSSID を宛先(Address1)とする「見慣れない送信元」を列挙 ---
+% これはその BSSID に接続しているクライアント端末の MAC アドレス候補
+% (=アップリンク送信元) であり、Beacon を送らないため上の一覧には出てこない。
+knownBssidSet = {seenNetworks.bssid};
+uplinkSenders = containers.Map('KeyType', 'char', 'ValueType', 'double');
+for k = 1:numel(pktLog)
+    if any(strcmp(knownBssidSet, pktLog(k).addr1)) && ~any(strcmp(knownBssidSet, pktLog(k).bssid))
+        s = pktLog(k).bssid;
+        if isKey(uplinkSenders, s)
+            uplinkSenders(s) = uplinkSenders(s) + 1;
+        else
+            uplinkSenders(s) = 1;
+        end
+    end
+end
+if uplinkSenders.Count > 0
+    fprintf('  クライアント(アップリンク送信元)と思われる MAC アドレス:\n');
+    ukeys = keys(uplinkSenders);
+    for k = 1:numel(ukeys)
+        % どの BSSID 宛てのアップリンクだったかも添える
+        destBssid = '';
+        for j = 1:numel(pktLog)
+            if strcmp(pktLog(j).bssid, ukeys{k}) && any(strcmp(knownBssidSet, pktLog(j).addr1))
+                destBssid = pktLog(j).addr1;
+                break;
+            end
+        end
+        fprintf('    %s -> BSSID=%s  (%d件)\n', ukeys{k}, destBssid, uplinkSenders(ukeys{k}));
+    end
 end
 
 targetBSSID = '';
@@ -597,9 +642,9 @@ if isempty(targetBSSID)
          'captureDuration を長くする、pktDetThreshold を下げる (例 0.3)、', ...
          'SSID の綴り・電波状況を確認する、などをお試しください。'], targetSSID);
 else
-    isMatch = strcmp({pktLog.bssid}, targetBSSID);
+    isMatch = strcmp(allBssid, targetBSSID) | strcmp(allAddr1, targetBSSID);
     matched = pktLog(isMatch);
-    fprintf('\n対象 SSID "%s" (BSSID=%s) のパケット数: %d\n', ...
+    fprintf('\n対象 SSID "%s" (BSSID=%s) のパケット数: %d (アップリンク+ダウンリンク)\n', ...
         targetSSID, targetBSSID, numel(matched));
 end
 
@@ -1143,7 +1188,7 @@ end
 function hdr = parseMACHeaderFromBits(mpduBits)
     % MPDU のビット列から MAC ヘッダ (Frame Control / Address1-3) を直接読む。
     % FCS を検証しないため、ヘッダ内容が正しい保証は無い点に注意。
-    hdr = struct('valid', false, 'FrameType', '', 'Address2', '', ...
+    hdr = struct('valid', false, 'FrameType', '', 'Address1', '', 'Address2', '', ...
         'ManagementConfig', [], 'headerOnly', true);
 
     if isempty(mpduBits)
@@ -1184,9 +1229,11 @@ function hdr = parseMACHeaderFromBits(mpduBits)
             return;   % type=3 は予約値
     end
 
+    addr1 = oct(5:10);
     addr2 = oct(11:16);
     hdr.valid     = true;
     hdr.FrameType = typeName;
+    hdr.Address1  = upper(sprintf('%02X', addr1));
     hdr.Address2  = upper(sprintf('%02X', addr2));
 end
 
@@ -1205,6 +1252,11 @@ function entry = buildEntry(cfgMAC, payload, phyFormat, chanEst)
     % 復号済み MAC 情報と CSI から記録用の構造体を作る。
     % Address2 (送信元アドレス) を持たないフレームは BSSID 判定に使えない
     % ため空を返す。
+    %
+    % 'bssid' には Address2 (送信元/TA) を入れる。ダウンリンク (AP→クライアント)
+    % では Address2=APのBSSIDだが、アップリンク (クライアント→AP) では
+    % Address2=クライアントのMACになり、代わりに Address1(宛先/RA)=APのBSSID
+    % となる。どちらの向きも取りこぼさないよう 'addr1' も別途保持する。
     entry = [];
     frameType = char(string(cfgMAC.FrameType));
 
@@ -1219,9 +1271,17 @@ function entry = buildEntry(cfgMAC, payload, phyFormat, chanEst)
         ssidStr = extractSSID(cfgMAC, payload);
     end
 
+    addr1Str = '';
+    try
+        addr1Str = char(string(cfgMAC.Address1));
+    catch
+        % Address1 を持たないオブジェクトの場合は空のままにする
+    end
+
     entry = struct( ...
         'timeSec',     0, ...            % 呼び出し側で設定
         'bssid',       char(string(cfgMAC.Address2)), ...
+        'addr1',       addr1Str, ...
         'frameType',   frameType, ...
         'ssid',        ssidStr, ...
         'phyFormat',   phyFormat, ...
