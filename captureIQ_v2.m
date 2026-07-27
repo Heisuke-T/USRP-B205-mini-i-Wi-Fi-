@@ -46,17 +46,30 @@
 %
 %  出力ファイル:
 %    <保存先>/<yyyymmddHHMM>_<SSID>_CSI.mat
-%      csi          … {numPackets x 1} セル配列。各セルは1パケット分の
-%                      CSI (H(k)) の行ベクトル (Non-HTは52本、VHT-20は56本と
-%                      フォーマットにより長さが異なるためセル配列)
-%      phyFormat    … {numPackets x 1} 'Non-HT' または 'VHT'
-%      subcarrierIndicesNonHT … [1 x 52] Non-HT の使用サブキャリア番号
-%      subcarrierIndicesVHT20 … [1 x 56] VHT-20MHz の使用サブキャリア番号
-%      timeSec      … [numPackets x 1] キャプチャ開始からの相対時刻 [s]
-%      frameType    … [numPackets x 1] 各パケットのフレーム種別
+%
+%    [主データ] ResultCSI.m がそのまま読める形式 (calculateCSI.m と同じ変数名)
+%      csi               … [パケット数 x サブキャリア数] complex の行列
+%      subcarrierIndices … [1 x サブキャリア数] 使用サブキャリア番号 k
+%      packetStartIndex  … [パケット数 x 1] 各パケットのサンプル位置
+%      csiMeta           … 処理条件・復号統計 (sampleRate 等を含む)
+%      ※ Non-HT は 52 本、VHT(20MHz) は 56 本とサブキャリア数が異なるため
+%         1 つの行列には混在させられない。パケット数が多い方を主データとし、
+%         どちらを採用したかは csiMeta.primaryFormat に記録する。
+%
+%    [フォーマット別] 両方が必要な場合はこちらを使う
+%      csiNonHT / timeSecNonHT / frameTypeNonHT / fcsNonHT
+%      csiVHT   / timeSecVHT   / frameTypeVHT   / fcsVHT
+%      subcarrierIndicesNonHT … [1 x 52]   Non-HT の使用サブキャリア番号
+%      subcarrierIndicesVHT20 … [1 x 56]   VHT-20MHz の使用サブキャリア番号
+%
+%    [補助]
+%      timeSec      … [パケット数 x 1] キャプチャ開始からの相対時刻 [s]
+%      frameType    … [パケット数 x 1] 各パケットのフレーム種別
+%      phyFormat    … [パケット数 x 1] 'Non-HT' または 'VHT'
+%      fcsVerified  … [パケット数 x 1] false は FCS 未検証 (MAC ヘッダのみ
+%                      から送信元を判定したもの)。CSI 自体には影響しない。
 %      targetSSIDOut / targetBSSIDOut … 指定SSIDと学習されたBSSID
 %      seenNetworks … 検出できた全 BSSID/SSID の一覧 (診断用)
-%      resultMeta   … 処理条件・復号統計
 %
 %  注意:
 %    電波の受信・記録は、利用地域の電波法および関連法令を遵守し、
@@ -503,11 +516,7 @@ for k = 1:numel(seenNetworks)
     end
 end
 
-csi = {};
-phyFormat = {};
-timeSec = [];
-frameType = {};
-fcsVerified = logical([]);
+matched = pktLog([]);   % 空の構造体配列
 
 if isempty(targetBSSID)
     warning('captureIQ_v2:ssidNotFound', ...
@@ -517,51 +526,107 @@ if isempty(targetBSSID)
 else
     isMatch = strcmp({pktLog.bssid}, targetBSSID);
     matched = pktLog(isMatch);
-    if ~isempty(matched)
-        csi         = {matched.csi}.';
-        phyFormat   = {matched.phyFormat}.';
-        timeSec     = [matched.timeSec].';
-        frameType   = {matched.frameType}.';
-        fcsVerified = logical([matched.fcsVerified]).';
-    end
     fprintf('\n対象 SSID "%s" (BSSID=%s) のパケット数: %d\n', ...
         targetSSID, targetBSSID, numel(matched));
-    if ~isempty(matched)
-        fprintf('  内訳: Non-HT=%d, VHT=%d\n', ...
-            sum(strcmpi(phyFormat, 'Non-HT')), sum(strcmpi(phyFormat, 'VHT')));
-        nUnverified = sum(~fcsVerified);
-        if nUnverified > 0
-            fprintf(['  ※うち %d 件は FCS 未検証 (ペイロードにビット誤りがあり、\n', ...
-                     '    MAC ヘッダのみから送信元を判定したもの)。CSI 自体は\n', ...
-                     '    VHT-LTF から算出しており影響を受けません。\n'], nUnverified);
-        end
+end
+
+% --- フォーマット別に [パケット数 x サブキャリア数] の行列へまとめる ---
+% Non-HT は 52 本、VHT(20MHz) は 56 本とサブキャリア数が異なるため、
+% 1 つの行列には混ぜられない。フォーマットごとに分けて保存する。
+if isempty(matched)
+    allFormats   = {};
+    allTimeSec   = [];
+    allFrameType = {};
+    allFcs       = logical([]);
+else
+    allFormats   = {matched.phyFormat}.';
+    allTimeSec   = [matched.timeSec].';
+    allFrameType = {matched.frameType}.';
+    allFcs       = logical([matched.fcsVerified]).';
+end
+
+isNonHT = strcmpi(allFormats, 'Non-HT');
+isVHT   = strcmpi(allFormats, 'VHT');
+
+csiNonHT       = stackCSI(matched(isNonHT));
+timeSecNonHT   = allTimeSec(isNonHT);
+frameTypeNonHT = allFrameType(isNonHT);
+fcsNonHT       = allFcs(isNonHT);
+
+csiVHT       = stackCSI(matched(isVHT));
+timeSecVHT   = allTimeSec(isVHT);
+frameTypeVHT = allFrameType(isVHT);
+fcsVHT       = allFcs(isVHT);
+
+if ~isempty(matched)
+    fprintf('  内訳: Non-HT=%d, VHT=%d\n', size(csiNonHT, 1), size(csiVHT, 1));
+    nUnverified = sum(~allFcs);
+    if nUnverified > 0
+        fprintf(['  ※うち %d 件は FCS 未検証 (ペイロードにビット誤りがあり、\n', ...
+                 '    MAC ヘッダのみから送信元を判定したもの)。CSI 自体は\n', ...
+                 '    プリアンブルから算出しており影響を受けません。\n'], nUnverified);
     end
+end
+
+% --- ResultCSI.m 互換の「主」データを決める ---
+% ResultCSI.m は csi (行列) / subcarrierIndices / packetStartIndex /
+% csiMeta という変数名を前提とするため、パケット数が多い方を主として
+% その名前でも保存する。
+if size(csiVHT, 1) >= size(csiNonHT, 1) && ~isempty(csiVHT)
+    csi               = csiVHT;
+    subcarrierIndices = subcarrierIndicesVHT20;
+    timeSec           = timeSecVHT;
+    frameType         = frameTypeVHT;
+    fcsVerified       = fcsVHT;
+    primaryFormat     = 'VHT';
+else
+    csi               = csiNonHT;
+    subcarrierIndices = subcarrierIndicesNonHT;
+    timeSec           = timeSecNonHT;
+    frameType         = frameTypeNonHT;
+    fcsVerified       = fcsNonHT;
+    primaryFormat     = 'Non-HT';
+end
+phyFormat = repmat({primaryFormat}, size(csi, 1), 1);
+
+% ResultCSI.m は packetStartIndex と sampleRate から時間軸を作る
+packetStartIndex = round(timeSec(:) * sampleRate);
+
+if ~isempty(csi)
+    fprintf('  主データ(変数 csi): %s フォーマット, %d パケット x %d サブキャリア\n', ...
+        primaryFormat, size(csi, 1), size(csi, 2));
 end
 
 %% ------------------------------------------------------------------------
 %  8. 保存 (.mat)
 %  ------------------------------------------------------------------------
-resultMeta = struct();
-resultMeta.description      = 'CSI filtered by target SSID (Non-HT and SU-VHT/NSTS=1/20MHz)';
-resultMeta.centerFrequency  = centerFrequency;
-resultMeta.sampleRate       = sampleRate;
-resultMeta.gain             = gain;
-resultMeta.captureDuration  = captureDuration;
-resultMeta.wifiChannel      = 36;
-resultMeta.platform         = usrpPlatform;
-resultMeta.serialNum        = usrpSerialNum;
-resultMeta.pktDetThreshold  = pktDetThreshold;
-resultMeta.overrunCount     = overrunCount;
-resultMeta.decodeStats      = stats;
-resultMeta.captureDatetime  = timestamp;
-resultMeta.matlabVersion    = version;
+% 変数名は calculateCSI.m / ResultCSI.m と揃えて csiMeta とする
+csiMeta = struct();
+csiMeta.description      = 'CSI filtered by target SSID (Non-HT and SU-VHT/NSTS=1/20MHz)';
+csiMeta.primaryFormat    = primaryFormat;   % 変数 csi がどちらの形式か
+csiMeta.centerFrequency  = centerFrequency;
+csiMeta.sampleRate       = sampleRate;
+csiMeta.gain             = gain;
+csiMeta.captureDuration  = captureDuration;
+csiMeta.wifiChannel      = 36;
+csiMeta.platform         = usrpPlatform;
+csiMeta.serialNum        = usrpSerialNum;
+csiMeta.pktDetThreshold  = pktDetThreshold;
+csiMeta.overrunCount     = overrunCount;
+csiMeta.decodeStats      = stats;
+csiMeta.captureDatetime  = timestamp;
+csiMeta.matlabVersion    = version;
 
 targetSSIDOut  = targetSSID;  %#ok<NASGU>
 targetBSSIDOut = targetBSSID; %#ok<NASGU>
 
-save(outMatFile, 'csi', 'phyFormat', 'fcsVerified', 'subcarrierIndicesNonHT', ...
-    'subcarrierIndicesVHT20', 'timeSec', 'frameType', 'targetSSIDOut', ...
-    'targetBSSIDOut', 'seenNetworks', 'resultMeta', '-v7.3');
+save(outMatFile, ...
+    'csi', 'subcarrierIndices', 'packetStartIndex', 'csiMeta', ...
+    'phyFormat', 'fcsVerified', 'timeSec', 'frameType', ...
+    'csiNonHT', 'timeSecNonHT', 'frameTypeNonHT', 'fcsNonHT', ...
+    'csiVHT', 'timeSecVHT', 'frameTypeVHT', 'fcsVHT', ...
+    'subcarrierIndicesNonHT', 'subcarrierIndicesVHT20', ...
+    'targetSSIDOut', 'targetBSSIDOut', 'seenNetworks', '-v7.3');
 
 fprintf('\n結果を保存しました: %s\n', outMatFile);
 fprintf('すべての処理が完了しました。\n');
@@ -569,6 +634,19 @@ fprintf('すべての処理が完了しました。\n');
 %% ------------------------------------------------------------------------
 %  ローカル関数
 %  ------------------------------------------------------------------------
+function M = stackCSI(entries)
+    % パケットごとの CSI 行ベクトルを [パケット数 x サブキャリア数] の行列に積む。
+    % サブキャリア数が揃わないものが混ざっていた場合は最頻の長さに合わせる。
+    if isempty(entries)
+        M = [];
+        return;
+    end
+    lens = cellfun(@numel, {entries.csi});
+    n = mode(lens);
+    keep = (lens == n);
+    M = cat(1, entries(keep).csi);
+end
+
 function y = applyCFO(x, fs, cfoHz)
     % x に周波数オフセット cfoHz [Hz] 分の位相回転を与える (補正には -cfo を渡す)
     n = (0:numel(x)-1).';

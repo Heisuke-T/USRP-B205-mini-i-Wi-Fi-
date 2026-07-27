@@ -63,28 +63,42 @@ S = load(inputCsiFile);
 
 if ~isfield(S, 'csi') || ~isfield(S, 'subcarrierIndices')
     error('ResultCSI:invalidInput', ...
-        '変数 csi / subcarrierIndices が見つかりません。calculateCSI.m の出力を指定してください: %s', ...
-        inputCsiFile);
+        ['変数 csi / subcarrierIndices が見つかりません。calculateCSI.m または ', ...
+         'captureIQ_v2.m の出力を指定してください: %s\n', ...
+         'ファイル内の変数: %s'], ...
+        inputCsiFile, strjoin(fieldnames(S).', ', '));
 end
 
 csi               = S.csi;                     % [numPackets x numSubcarrier] complex
 subcarrierIndices = S.subcarrierIndices;        % [1 x numSubcarrier]
+
+% captureIQ_v2.m は互換性のため行列で保存するが、古い形式 (パケットごとの
+% セル配列) を読み込んだ場合はここで行列に変換する。
+if iscell(csi)
+    lens = cellfun(@numel, csi);
+    keep = (lens == mode(lens));
+    csi  = cat(1, csi{keep});
+end
 
 [numPackets, numSubcarrier] = size(csi);
 fprintf('  パケット数: %d, サブキャリア数: %d\n', numPackets, numSubcarrier);
 
 if numPackets == 0
     error('ResultCSI:emptyCSI', ...
-        'CSI が空です (パケットが検出できていません)。calculateCSI.m の検出条件を見直してください。');
+        'CSI が空です (パケットが検出できていません)。検出条件を見直してください。');
 end
 
-% 時間軸 (取得開始からの相対時間 [s])。packetStartIndex / sampleRate から算出。
+% 時間軸 (取得開始からの相対時間 [s])
 sampleRate = NaN;
 if isfield(S, 'csiMeta') && isfield(S.csiMeta, 'sampleRate')
     sampleRate = S.csiMeta.sampleRate;
 end
 
-if isfield(S, 'packetStartIndex') && ~isnan(sampleRate) && sampleRate > 0
+if isfield(S, 'timeSec') && numel(S.timeSec) == numPackets
+    % captureIQ_v2.m は秒単位の時刻を直接保存している
+    timeAxis = S.timeSec(:) - S.timeSec(1);
+elseif isfield(S, 'packetStartIndex') && ~isnan(sampleRate) && sampleRate > 0 ...
+        && numel(S.packetStartIndex) == numPackets
     timeAxis = (S.packetStartIndex(:) - S.packetStartIndex(1)) / sampleRate;  % [s]
 else
     timeAxis = (0:numPackets-1).';   % フォールバック: パケット番号を使用
