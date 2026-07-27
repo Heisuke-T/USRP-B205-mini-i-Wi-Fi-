@@ -253,7 +253,7 @@ subcarrierIndicesHT20  = [-26:-1, 1:26];    % HT     CBW20 (52本, Non-HTと同�
 subcarrierIndicesVHT20 = [-28:-1, 1:28];    % VHT    CBW20 (56本)
 
 pktLog = struct('timeSec', {}, 'bssid', {}, 'addr1', {}, 'frameType', {}, 'ssid', {}, ...
-    'phyFormat', {}, 'fcsVerified', {}, 'csi', {});
+    'phyFormat', {}, 'fcsVerified', {}, 'mpduCount', {}, 'csi', {});
 bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
 
 % 復号統計 (診断用)
@@ -439,9 +439,10 @@ while searchOffset + minPreambleLen <= numel(iq)
                     bssidToSSID(entry.bssid) = entry.ssid;
                 end
 
-                fprintf('  [%7.4fs] %-6s %-16s BSSID=%s%s\n', entry.timeSec, ...
+                fprintf('  [%7.4fs] %-6s %-16s BSSID=%s%s%s\n', entry.timeSec, ...
                     entry.phyFormat, entry.frameType, entry.bssid, ...
-                    ternary(~isempty(entry.ssid), sprintf('  SSID="%s"', entry.ssid), ''));
+                    ternary(~isempty(entry.ssid), sprintf('  SSID="%s"', entry.ssid), ''), ...
+                    ternary(entry.mpduCount > 1, sprintf('  (MPDU集約x%d)', entry.mpduCount), ''));
             end
         end
 
@@ -685,6 +686,9 @@ fcsVHT       = allFcs(isVHT);
 if ~isempty(matched)
     fprintf('  内訳: Non-HT=%d, HT=%d, VHT=%d\n', ...
         size(csiNonHT, 1), size(csiHT, 1), size(csiVHT, 1));
+    totalMPDU = sum([matched.mpduCount]);
+    fprintf('  PPDU(電波上の送信単位)数=%d に対し、集約されたMPDU(データ単位)の合計=%d\n', ...
+        numel(matched), totalMPDU);
     nUnverified = sum(~allFcs);
     if nUnverified > 0
         fprintf(['  ※うち %d 件は FCS 未検証 (ペイロードにビット誤りがあり、\n', ...
@@ -914,6 +918,7 @@ function [status, consumed, entry, info] = processHT(pkt, lltfChanEst, noiseEst,
     entry = buildEntry(cfgMAC, payload, 'HT', htChanEst);
     if ~isempty(entry)
         entry.fcsVerified = ~deagInfo.headerOnly;
+        entry.mpduCount   = max(deagInfo.mpduCount, 1);
     end
     status = 1;
 end
@@ -1113,6 +1118,7 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     entry = buildEntry(cfgMAC, payload, 'VHT', vhtChanEst);
     if ~isempty(entry)
         entry.fcsVerified = ~deagInfo.headerOnly;
+        entry.mpduCount   = max(deagInfo.mpduCount, 1);
     end
     status = 1;
 end
@@ -1286,6 +1292,7 @@ function entry = buildEntry(cfgMAC, payload, phyFormat, chanEst)
         'ssid',        ssidStr, ...
         'phyFormat',   phyFormat, ...
         'fcsVerified', true, ...         % HT/VHT のヘッダのみ復号時は呼び出し側で false
+        'mpduCount',   1, ...            % 集約されている場合は呼び出し側で上書き
         'csi',         chanEst(:).');
 end
 
