@@ -457,7 +457,13 @@ if stats.vht > 0
         for k = 1:numel(nKeys)
             fprintf('NSTS=%d が %d回  ', nKeys(k), vhtNSTSCounts(nKeys(k)));
         end
+        multiKeys = nKeys(nKeys >= 2);
+        nMultiStream = sum(cellfun(@(k) vhtNSTSCounts(k), num2cell(multiKeys)));
         fprintf('\n');
+        if any(nKeys >= 2)
+            fprintf(['    ※NSTS>=2 の分 (計%d件) は送信元 BSSID が分からず、\n', ...
+                     '      特定のSSIDに帰属させることができません。\n'], nMultiStream);
+        end
     end
     if vhtRejects.Count > 0
         rKeys = keys(vhtRejects);
@@ -499,13 +505,23 @@ for k = 1:numel(bssidKeys)
         'ssid', bssidToSSID(bssidKeys{k})); %#ok<SAGROW>
 end
 
-fprintf('\n検出できたネットワーク一覧:\n');
+fprintf('\n検出できたネットワーク一覧 (BSSID別の内訳):\n');
 if isempty(seenNetworks)
     fprintf('  (なし)\n');
 else
+    isVHTPkt = strcmpi({pktLog.phyFormat}, 'VHT');
     for k = 1:numel(seenNetworks)
-        fprintf('  BSSID=%s  SSID="%s"\n', seenNetworks(k).bssid, seenNetworks(k).ssid);
+        bssid = seenNetworks(k).bssid;
+        nAll  = sum(strcmp({pktLog.bssid}, bssid));
+        nVHT  = sum(isVHTPkt & strcmp({pktLog.bssid}, bssid));
+        fprintf('  BSSID=%s  SSID="%s"  (全%d件, うちVHT=%d件)\n', ...
+            bssid, seenNetworks(k).ssid, nAll, nVHT);
     end
+    fprintf(['  ※ここでの件数は MAC ヘッダまで読めた(=BSSID が判明した)パケットのみ。\n', ...
+             '    NSTS>=2 (複数空間ストリーム) の VHT パケットは SISO 受信では\n', ...
+             '    ヘッダも含めて全く復号できないため、この一覧には出てきません。\n', ...
+             '    対象 SSID の VHT が 0 件の場合、(a) 捕捉時間内に実データ通信が\n', ...
+             '    無かった (b) NSTS>=2 で送信されている、のいずれかが考えられます。\n']);
 end
 
 targetBSSID = '';
