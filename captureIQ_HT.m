@@ -261,6 +261,8 @@ stats = struct('detected', 0, 'timingSkip', 0, 'nonHT', 0, 'ht', 0, 'vht', 0, ..
     'htGF', 0, 'other', 0, 'htUnsupported', 0, 'vhtUnsupported', 0, ...
     'decodeOK', 0, 'noAddr2', 0, 'errors', 0);
 errMsgs       = containers.Map('KeyType', 'char', 'ValueType', 'double');
+deagStatusCnt = containers.Map('KeyType', 'char', 'ValueType', 'double');
+nonBinaryShown = false;  % 非0/1データを検出した旨を一度だけ表示するためのフラグ
 htRejects     = containers.Map('KeyType', 'char', 'ValueType', 'double');
 htMCSCounts   = containers.Map('KeyType', 'double', 'ValueType', 'double');
 htReservedOK  = 0;   % HT-SIG の予約ビットが仕様どおりだった件数
@@ -359,6 +361,8 @@ while searchOffset + minPreambleLen <= numel(iq)
                 if htInfo.reservedOK
                     htReservedOK = htReservedOK + 1;
                 end
+                [deagStatusCnt, nonBinaryShown] = ...
+                    recordDeag(deagStatusCnt, nonBinaryShown, 'HT', htInfo);
                 if ~isempty(htInfo.reason)
                     stats.htUnsupported = stats.htUnsupported + 1;
                     if isKey(htRejects, htInfo.reason)
@@ -389,6 +393,8 @@ while searchOffset + minPreambleLen <= numel(iq)
                 if vhtInfo.reservedOK
                     vhtReservedOK = vhtReservedOK + 1;
                 end
+                [deagStatusCnt, nonBinaryShown] = ...
+                    recordDeag(deagStatusCnt, nonBinaryShown, 'VHT', vhtInfo);
                 % 最初の数件だけ内訳を表示 (パケット長算出が妥当か確認するため)
                 if vhtDetailShown < vhtDetailMax && vhtInfo.nsts == 1 && vhtInfo.bwMHz == 20
                     vhtDetailShown = vhtDetailShown + 1;
@@ -546,6 +552,34 @@ end
 fprintf('  MAC まで復号成功          : %d\n', stats.decodeOK);
 fprintf('    うち Address2 無し(ACK/CTS等、BSSID判定不可): %d\n', stats.noAddr2);
 fprintf('  復号エラー                : %d\n', stats.errors);
+
+% --- A-MPDU 分解の結果 (データ復号が機能しているかの判断材料) ---
+if deagStatusCnt.Count > 0
+    fprintf('  [A-MPDU 分解結果]\n');
+    dKeys = keys(deagStatusCnt);
+    for k = 1:numel(dKeys)
+        fprintf('    %-40s : %d回\n', dKeys{k}, deagStatusCnt(dKeys{k}));
+    end
+end
+
+% --- FCS 検証の内訳 (全BSSID) ---
+% FCS検証OK が 0 のフォーマットは、そのフォーマットのデータ復号が
+% 成立していない (SNR不足かパラメータ推定ミス) ことを意味する。
+if ~isempty(pktLog)
+    fprintf('  [FCS 検証の内訳 (全BSSID)]\n');
+    allFmt  = {pktLog.phyFormat};
+    allFcsV = logical([pktLog.fcsVerified]);
+    for f = {'Non-HT', 'HT', 'VHT'}
+        sel = strcmpi(allFmt, f{1});
+        if any(sel)
+            fprintf('    %-6s : 記録%d件 (FCS検証OK=%d, ヘッダのみ推定=%d)\n', ...
+                f{1}, sum(sel), sum(sel & allFcsV), sum(sel & ~allFcsV));
+        end
+    end
+    fprintf(['    ※あるフォーマットで FCS検証OK が 0 件の場合、そのフォーマットの\n', ...
+             '      データ復号が成立していない (受信SNR不足、または変調パラメータの\n', ...
+             '      推定ミス) ことを示す。\n']);
+end
 
 if stats.errors > 0
     fprintf('  エラー内訳 (上位):\n');
@@ -777,6 +811,29 @@ function M = stackCSI(entries)
     M = cat(1, entries(keep).csi);
 end
 
+function [cnt, shown] = recordDeag(cnt, shown, fmtName, info)
+    % A-MPDU 分解の結果を集計する。ここが失敗しているか成功しているかで、
+    % 「データ復号自体が壊れている」のか「FCS だけ通らない」のかを切り分ける。
+    % deagStatus が空 = 分解まで到達せず (SIG段階で棄却) なので集計しない
+    if ~isempty(info.deagStatus)
+        key = sprintf('%s: %s', fmtName, info.deagStatus);
+        if isKey(cnt, key)
+            cnt(key) = cnt(key) + 1;
+        else
+            cnt(key) = 1;
+        end
+    end
+
+    % 想定外のデータ形式は一度だけ警告する (原因究明の手掛かりになるため)
+    if info.nonBinary && ~shown
+        shown = true;
+        fprintf(['    <警告> 分解した MPDU が 0/1 のビット列ではありません。\n', ...
+                 '            class=%s, 値域=[%g %g]\n', ...
+                 '            この形式は MAC ヘッダとして解釈できないため除外します。\n'], ...
+            info.dataClass, info.dataRange(1), info.dataRange(2));
+    end
+end
+
 function y = applyCFO(x, fs, cfoHz)
     % x に周波数オフセット cfoHz [Hz] 分の位相回転を与える (補正には -cfo を渡す)
     n = (0:numel(x)-1).';
@@ -843,7 +900,8 @@ function [status, consumed, entry, info] = processHT(pkt, lltfChanEst, noiseEst,
     consumed = 560;   % L-STF..HT-SIG
     info = struct('reason', '', 'mcs', -1, 'nss', 0, 'cbw40', false, ...
         'coding', 0, 'gi', 0, 'aggregated', false, 'reservedOK', false, ...
-        'mpduCount', 0, 'deagStatus', '');
+        'mpduCount', 0, 'deagStatus', '', ...
+        'nonBinary', false, 'dataClass', '', 'dataRange', [0 0]);
 
     % --- HT-SIG 復号 (2シンボル, pkt(401:560)) ---
     [htsigBits, htsigFail] = wlanHTSIGRecover(pkt(401:560), lltfChanEst, noiseEst, chanBW);
@@ -908,6 +966,9 @@ function [status, consumed, entry, info] = processHT(pkt, lltfChanEst, noiseEst,
     [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgHT);
     info.mpduCount  = deagInfo.mpduCount;
     info.deagStatus = deagInfo.status;
+    info.nonBinary  = deagInfo.nonBinary;
+    info.dataClass  = deagInfo.dataClass;
+    info.dataRange  = deagInfo.dataRange;
     if ~ok
         info.reason = sprintf('MPDU復号失敗(分解=%s,MPDU数=%d)', ...
             deagInfo.status, deagInfo.mpduCount);
@@ -918,7 +979,7 @@ function [status, consumed, entry, info] = processHT(pkt, lltfChanEst, noiseEst,
     entry = buildEntry(cfgMAC, payload, 'HT', htChanEst);
     if ~isempty(entry)
         entry.fcsVerified = ~deagInfo.headerOnly;
-        entry.mpduCount   = max(deagInfo.mpduCount, 1);
+        entry.mpduCount   = deagInfo.mpduCount;   % 0 = A-MPDU分解失敗
     end
     status = 1;
 end
@@ -968,7 +1029,8 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     info = struct('reason', '', 'bwMHz', 0, 'nsts', 0, 'mcs', 0, ...
         'reservedOK', false, 'gi', 0, 'coding', 0, 'lsigLen', 0, 'nsym', 0, ...
         'apepFromLSIG', 0, 'apepFromSIGB', 0, 'apepUsed', 0, ...
-        'mpduCount', 0, 'deagStatus', '');
+        'mpduCount', 0, 'deagStatus', '', ...
+        'nonBinary', false, 'dataClass', '', 'dataRange', [0 0]);
 
     % --- VHT-SIG-A 復号 (2シンボル) ---
     [sigaBits, sigaFail] = wlanVHTSIGARecover(pkt(401:560), lltfChanEst, noiseEst, chanBW);
@@ -1042,14 +1104,38 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     % VHT PPDU の受信時間 [us] (IEEE 802.11ac の L-SIG LENGTH との関係)
     %   RXTIME = 4*ceil((L_LENGTH+3)/3) + 20
     ndbps  = vhtNDBPS20MHz(vhtA.mcs);
-    symLen = ternary(vhtA.gi == 1, 72, 80);   % Short GI: 3.6us, Long GI: 4us
     if info.lsigLen > 0 && ~isempty(ndbps)
-        totalSamples    = (4 * ceil((info.lsigLen + 3) / 3) + 20) * 20;  % 20 samples/us
-        dataSamples     = totalSamples - indProbe.VHTSIGB(2);   % プリアンブル分を除く
-        info.nsym       = floor(dataSamples / symLen);
+        % RXTIME [us] からプリアンブル (L-STF..VHT-SIG-B) を引いてデータ部の
+        % 継続時間を求める。20MHz/NSTS=1 のプリアンブルは 40us。
+        rxTimeUs   = 4 * ceil((info.lsigLen + 3) / 3) + 20;
+        dataTimeUs = rxTimeUs - indProbe.VHTSIGB(2) / 20;   % 20 samples/us
+
+        if vhtA.gi == 1
+            % Short GI (3.6us/シンボル)。データ部は 4us 境界までパディング
+            % されるため、パディングが 3.6us 以上になる NSYM ≡ 9 (mod 10) の
+            % ときだけ floor が 1 多くなる。この曖昧性を VHT-SIG-A2 B1
+            % (Short GI NSYM Disambiguation) が示すので、それで補正する。
+            info.nsym = floor(dataTimeUs / 3.6);
+            if vhtA.sgiDisamb == 1
+                info.nsym = info.nsym - 1;
+            end
+        else
+            info.nsym = round(dataTimeUs / 4);
+        end
+
         if info.nsym > 0
-            % NSYM = ceil((8*APEP + 22)/NDBPS) を満たす最大の APEP
-            info.apepFromLSIG = floor((info.nsym * ndbps - 22) / 8);
+            if vhtA.coding == 1
+                % LDPC: NSYM = ceil((8*APEP + 16)/NDBPS) + (追加シンボル)
+                %       末尾ビット(6bit)が無く、LDPC Extra OFDM Symbol
+                %       (VHT-SIG-A2 B3) の分は APEP に寄与しない。
+                nsymData = info.nsym - vhtA.ldpcExtra;
+                if nsymData > 0
+                    info.apepFromLSIG = floor((nsymData * ndbps - 16) / 8);
+                end
+            else
+                % BCC: NSYM = ceil((8*APEP + 16 + 6*NES)/NDBPS), 20MHz は NES=1
+                info.apepFromLSIG = floor((info.nsym * ndbps - 22) / 8);
+            end
         end
     end
 
@@ -1108,6 +1194,9 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgVHT);
     info.mpduCount  = deagInfo.mpduCount;
     info.deagStatus = deagInfo.status;
+    info.nonBinary  = deagInfo.nonBinary;
+    info.dataClass  = deagInfo.dataClass;
+    info.dataRange  = deagInfo.dataRange;
     if ~ok
         info.reason = sprintf('MPDU復号失敗(分解=%s,MPDU数=%d)', ...
             deagInfo.status, deagInfo.mpduCount);
@@ -1118,7 +1207,7 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     entry = buildEntry(cfgMAC, payload, 'VHT', vhtChanEst);
     if ~isempty(entry)
         entry.fcsVerified = ~deagInfo.headerOnly;
-        entry.mpduCount   = max(deagInfo.mpduCount, 1);
+        entry.mpduCount   = deagInfo.mpduCount;   % 0 = A-MPDU分解失敗
     end
     status = 1;
 end
@@ -1129,7 +1218,8 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
     cfgMAC = [];
     payload = [];
     ok = false;
-    deagInfo = struct('status', 'N/A', 'mpduCount', 0, 'headerOnly', false);
+    deagInfo = struct('status', 'N/A', 'mpduCount', 0, 'headerOnly', false, ...
+        'nonBinary', false, 'dataClass', '', 'dataRange', [0 0]);
 
     mpduList = {};
     try
@@ -1175,12 +1265,22 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
     % FCS は MPDU 全体 (最大 1500B 超) を検証するため、末尾の 1 ビット誤りでも
     % 失敗する。一方 CSI の帰属に必要なのは先頭 24 バイトのヘッダだけであり、
     % ここが無傷である確率は高い。
-    candidates = mpduList;
-    if isempty(candidates)
-        candidates = {rxPSDU};
-    end
-    for m = 1:numel(candidates)
-        hdr = parseMACHeaderFromBits(candidates{m});
+    %
+    % ただし対象は A-MPDU 分解に成功した MPDU に限る。分解に失敗した PSDU
+    % 全体をヘッダとみなす処理は、デリミタで区切れていない = 復号が壊れて
+    % いる証拠があるにもかかわらず、緩い妥当性検査を偶然通ったランダムな
+    % ビット列を「送信元アドレス」として大量に生んでしまうため行わない。
+    for m = 1:numel(mpduList)
+        raw = double(mpduList{m}(:));
+        if ~isempty(raw) && ~all(raw == 0 | raw == 1)
+            % 0/1 でないデータが来ている = 想定と異なるデータ形式。
+            % 静かに壊れた結果を出さないよう記録して弾く。
+            deagInfo.nonBinary = true;
+            deagInfo.dataClass = class(mpduList{m});
+            deagInfo.dataRange = [min(raw) max(raw)];
+            continue;
+        end
+        hdr = parseMACHeaderFromBits(mpduList{m});
         if hdr.valid
             cfgMAC  = hdr;      % wlanMACFrameConfig ではなく自前の構造体
             payload = [];
@@ -1202,16 +1302,32 @@ function hdr = parseMACHeaderFromBits(mpduBits)
     end
     oct = bitsToOctets(mpduBits);
     if numel(oct) < 24
-        return;   % Address2 まで読めない
+        return;   % Address2 まで読めない (2値でなかった場合もここで空になる)
+    end
+    if any(oct < 0 | oct > 255 | mod(oct, 1) ~= 0)
+        return;   % オクテットとして解釈できない値が混じっている
     end
 
     fc0     = oct(1);
+    fc1     = oct(2);
     version = bitand(fc0, 3);
     type    = bitand(bitshift(fc0, -2), 3);
     subtype = bitand(bitshift(fc0, -4), 15);
 
     if version ~= 0
         return;   % プロトコルバージョンは 0 のはず。違えば復号が壊れている
+    end
+
+    % ToDS/FromDS の組み合わせ検査。ToDS=1&FromDS=1 は 4アドレス形式
+    % (WDS) で、通常のインフラストラクチャ BSS では使われない。
+    % また管理フレームでは両方 0 でなければならない。
+    toDS   = bitand(fc1, 1);
+    fromDS = bitand(bitshift(fc1, -1), 1);
+    if toDS == 1 && fromDS == 1
+        return;
+    end
+    if type == 0 && (toDS ~= 0 || fromDS ~= 0)
+        return;
     end
 
     % Address2 を持たないフレーム (ACK=1101, CTS=1100 の制御フレーム) は対象外
@@ -1237,6 +1353,14 @@ function hdr = parseMACHeaderFromBits(mpduBits)
 
     addr1 = oct(5:10);
     addr2 = oct(11:16);
+
+    % 送信元 (Address2) が全0 / ブロードキャストのものは復号が壊れている。
+    % また Address2 のグループビット (先頭オクテットの bit0) は送信元
+    % アドレスでは必ず 0 になる。
+    if all(addr2 == 0) || all(addr2 == 255) || bitand(addr2(1), 1) == 1
+        return;
+    end
+
     hdr.valid     = true;
     hdr.FrameType = typeName;
     hdr.Address1  = upper(sprintf('%02X', addr1));
@@ -1348,12 +1472,14 @@ function out = parseVHTSIGABits(bits)
     % LSB 先頭で送信される。
     %   bits(1:2)   BW (00=20MHz)          bits(4)     STBC
     %   bits(5:10)  Group ID               bits(11:13) NSTS-1
-    %   bits(25)    Short GI               bits(27)    Coding (0=BCC,1=LDPC)
+    %   bits(25)    Short GI               bits(26)    Short GI NSYM 曖昧性解消
+    %   bits(27)    Coding (0=BCC,1=LDPC)  bits(28)    LDPC Extra OFDM Symbol
     %   bits(29:32) SU VHT-MCS
     bits = double(bits(:)).';
     out = struct('isValid', false, 'is20MHz', false, 'isSU', false, ...
         'nsts', 0, 'stbc', false, 'groupId', 0, 'gi', 0, 'coding', 0, ...
-        'mcs', 0, 'bwMHz', 0, 'reservedOK', false);
+        'mcs', 0, 'bwMHz', 0, 'reservedOK', false, ...
+        'sgiDisamb', 0, 'ldpcExtra', 0);
 
     if numel(bits) < 34
         return;
@@ -1381,10 +1507,12 @@ function out = parseVHTSIGABits(bits)
     end
     out.stbc    = stbcBit == 1;
     out.groupId = sum(groupId .* 2.^(0:5));
-    out.gi      = bits(25);
-    out.coding  = bits(27);
-    out.mcs     = sum(bits(29:32) .* 2.^(0:3));
-    out.isValid = true;
+    out.gi        = bits(25);
+    out.sgiDisamb = bits(26);
+    out.coding    = bits(27);
+    out.ldpcExtra = bits(28);
+    out.mcs       = sum(bits(29:32) .* 2.^(0:3));
+    out.isValid   = true;
 end
 
 function apepLen = decodeVHTSIGBLength(bits)
@@ -1439,15 +1567,24 @@ function ssidStr = parseSSIDFromMgmtFrame(payload)
 end
 
 function bytes = bitsToOctets(bits)
-    % ビット列をオクテット列へ変換する (各オクテット内は LSB 先頭)
+    % ビット列をオクテット列へ変換する (各オクテット内は LSB 先頭)。
+    %
+    % 入力が 0/1 でない場合 (軟判定値・オクテット列など) は変換結果が
+    % 0..255 の範囲を外れ、MAC アドレスとして解釈すると 6バイトのはずが
+    % 12バイト分の文字列になるなど、静かに壊れたデータを生む。そのため
+    % ここで明示的に検査し、2値でなければ空を返して呼び出し側で弾く。
     bits = double(bits(:));
+    if isempty(bits) || ~all(bits == 0 | bits == 1)
+        bytes = [];
+        return;
+    end
     n = floor(numel(bits) / 8) * 8;
     if n == 0
         bytes = [];
         return;
     end
     b = reshape(bits(1:n), 8, []);
-    bytes = (2.^(0:7)) * b;   % 1 x (n/8)
+    bytes = (2.^(0:7)) * b;   % 1 x (n/8), 各要素は 0..255
 end
 
 function out = ternary(cond, a, b)
