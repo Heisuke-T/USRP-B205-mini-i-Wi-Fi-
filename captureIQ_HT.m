@@ -266,6 +266,8 @@ nonBinaryShown = false;  % 非0/1データを検出した旨を一度だけ表�
 htRejects     = containers.Map('KeyType', 'char', 'ValueType', 'double');
 htMCSCounts   = containers.Map('KeyType', 'double', 'ValueType', 'double');
 htReservedOK  = 0;   % HT-SIG の予約ビットが仕様どおりだった件数
+htSigParsed   = 0;   % HT-SIG の CRC を通り、ビット解釈まで到達した件数
+vhtSigParsed  = 0;   % VHT-SIG-A の CRC を通り、ビット解釈まで到達した件数
 vhtRejects    = containers.Map('KeyType', 'char', 'ValueType', 'double');
 vhtBWCounts   = containers.Map('KeyType', 'double', 'ValueType', 'double');
 vhtNSTSCounts = containers.Map('KeyType', 'double', 'ValueType', 'double');
@@ -352,6 +354,7 @@ while searchOffset + minPreambleLen <= numel(iq)
                 [st, consumed, entry, htInfo] = processHT(pkt, lltfChanEst, noiseEst, chanBW);
 
                 if htInfo.mcs >= 0
+                    htSigParsed = htSigParsed + 1;
                     if isKey(htMCSCounts, htInfo.mcs)
                         htMCSCounts(htInfo.mcs) = htMCSCounts(htInfo.mcs) + 1;
                     else
@@ -377,6 +380,7 @@ while searchOffset + minPreambleLen <= numel(iq)
                 [st, consumed, entry, vhtInfo] = processVHT(pkt, lltfChanEst, noiseEst, chanBW);
 
                 if vhtInfo.bwMHz > 0
+                    vhtSigParsed = vhtSigParsed + 1;
                     if isKey(vhtBWCounts, vhtInfo.bwMHz)
                         vhtBWCounts(vhtInfo.bwMHz) = vhtBWCounts(vhtInfo.bwMHz) + 1;
                     else
@@ -501,8 +505,11 @@ if stats.ht > 0
         end
         fprintf('\n');
     end
-    fprintf('    HT-SIG予約ビット検証: %d/%d 個が仕様どおり', htReservedOK, stats.ht);
-    if htReservedOK < stats.ht * 0.5
+    % 分母は「HT-SIG の CRC を通り、ビット解釈まで到達した件数」。検出だけ
+    % されて CRC で落ちたものを含めると、自前パースの妥当性を測れない。
+    fprintf('    HT-SIG予約ビット検証: %d/%d 個が仕様どおり (CRC通過分のみ)', ...
+        htReservedOK, htSigParsed);
+    if htSigParsed > 0 && htReservedOK < htSigParsed * 0.5
         fprintf('  <-- 大半が不一致。ビット解釈がズレている可能性あり\n');
     else
         fprintf('  (ビット解釈は妥当)\n');
@@ -542,8 +549,9 @@ if stats.vht > 0
         fprintf('\n');
     end
     % VHT-SIG-A のビット解釈が正しいかの自己判定
-    fprintf('    SIG-A予約ビット検証: %d/%d 個が仕様どおり', vhtReservedOK, stats.vht);
-    if vhtReservedOK < stats.vht * 0.5
+    fprintf('    SIG-A予約ビット検証: %d/%d 個が仕様どおり (CRC通過分のみ)', ...
+        vhtReservedOK, vhtSigParsed);
+    if vhtSigParsed > 0 && vhtReservedOK < vhtSigParsed * 0.5
         fprintf('  <-- 大半が不一致。ビット解釈がズレている可能性あり\n');
     else
         fprintf('  (ビット解釈は妥当)\n');
@@ -824,10 +832,11 @@ function [cnt, shown] = recordDeag(cnt, shown, fmtName, info)
         end
     end
 
-    % 想定外のデータ形式は一度だけ警告する (原因究明の手掛かりになるため)
+    % 想定外のデータ形式は一度だけ警告する (原因究明の手掛かりになるため)。
+    % ビット列と16進文字列はどちらも扱えるので、ここに来るのはそれ以外。
     if info.nonBinary && ~shown
         shown = true;
-        fprintf(['    <警告> 分解した MPDU が 0/1 のビット列ではありません。\n', ...
+        fprintf(['    <警告> 分解した MPDU がビット列でも16進文字列でもありません。\n', ...
                  '            class=%s, 値域=[%g %g]\n', ...
                  '            この形式は MAC ヘッダとして解釈できないため除外します。\n'], ...
             info.dataClass, info.dataRange(1), info.dataRange(2));
@@ -1232,10 +1241,19 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
 
     % 全体の status が Success でなくても、取り出せた MPDU は個別に試す
     % (一部のサブフレームだけ壊れている場合でも残りは復号できるため)
+    %
+    % 重要: wlanAMPDUDeaggregate に 'DataFormat','bits' を指定しても、返る
+    % MPDU が16進文字列 (char, '0'-'9''A'-'F') になる場合がある。その形式の
+    % まま 'DataFormat','bits' で wlanMPDUDecode を呼ぶと形式不一致で必ず
+    % 失敗するため、実際のデータ形式を判定して合わせる。
     wState = warning('off', 'all');
     for m = 1:numel(mpduList)
+        dfmt = mpduDataFormat(mpduList{m});
+        if isempty(dfmt)
+            continue;   % 判別できない形式
+        end
         try
-            [c, p, st] = wlanMPDUDecode(mpduList{m}, cfgFormat, 'DataFormat', 'bits');
+            [c, p, st] = wlanMPDUDecode(mpduList{m}, cfgFormat, 'DataFormat', dfmt);
             if strcmpi(string(st), "Success")
                 warning(wState);
                 cfgMAC = c; payload = p; ok = true;
@@ -1249,15 +1267,18 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
 
     % A-MPDU として分解できなかった場合は単一 MPDU として試す
     if isempty(mpduList)
-        try
-            wState = warning('off', 'all');
-            [c, p, st] = wlanMPDUDecode(rxPSDU, cfgFormat, 'DataFormat', 'bits');
-            warning(wState);
-            if strcmpi(string(st), "Success")
-                cfgMAC = c; payload = p; ok = true;
-                return;
+        dfmt = mpduDataFormat(rxPSDU);
+        if ~isempty(dfmt)
+            try
+                wState = warning('off', 'all');
+                [c, p, st] = wlanMPDUDecode(rxPSDU, cfgFormat, 'DataFormat', dfmt);
+                warning(wState);
+                if strcmpi(string(st), "Success")
+                    cfgMAC = c; payload = p; ok = true;
+                    return;
+                end
+            catch
             end
-        catch
         end
     end
 
@@ -1271,16 +1292,19 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
     % いる証拠があるにもかかわらず、緩い妥当性検査を偶然通ったランダムな
     % ビット列を「送信元アドレス」として大量に生んでしまうため行わない。
     for m = 1:numel(mpduList)
-        raw = double(mpduList{m}(:));
-        if ~isempty(raw) && ~all(raw == 0 | raw == 1)
-            % 0/1 でないデータが来ている = 想定と異なるデータ形式。
+        [dfmt, oct] = mpduDataFormat(mpduList{m});
+        if isempty(dfmt)
+            % ビット列でも16進文字列でもない = 想定外のデータ形式。
             % 静かに壊れた結果を出さないよう記録して弾く。
+            raw = double(mpduList{m}(:));
             deagInfo.nonBinary = true;
             deagInfo.dataClass = class(mpduList{m});
-            deagInfo.dataRange = [min(raw) max(raw)];
+            if ~isempty(raw)
+                deagInfo.dataRange = [min(raw) max(raw)];
+            end
             continue;
         end
-        hdr = parseMACHeaderFromBits(mpduList{m});
+        hdr = parseMACHeaderFromOctets(oct);
         if hdr.valid
             cfgMAC  = hdr;      % wlanMACFrameConfig ではなく自前の構造体
             payload = [];
@@ -1291,18 +1315,58 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
     end
 end
 
-function hdr = parseMACHeaderFromBits(mpduBits)
-    % MPDU のビット列から MAC ヘッダ (Frame Control / Address1-3) を直接読む。
-    % FCS を検証しないため、ヘッダ内容が正しい保証は無い点に注意。
+function [fmtStr, oct] = mpduDataFormat(data)
+    % MPDU データの実際の形式を判定し、オクテット列も返す。
+    %   fmtStr: 'bits'   … 0/1 の数値ベクトル
+    %           'octets' … 16進文字列 (char/string)
+    %           ''       … 判別不能
+    % wlanMPDUDecode / wlanAMPDUDeaggregate の 'DataFormat' にはこの値を
+    % そのまま渡せる。
+    fmtStr = '';
+    oct    = [];
+
+    if isempty(data)
+        return;
+    end
+
+    if ischar(data) || isstring(data)
+        s = char(data);
+        s = s(:).';
+        s = s(~isspace(s));
+        if isempty(s) || ~all(isstrprop(s, 'xdigit'))
+            return;   % 16進文字列ではない
+        end
+        fmtStr = 'octets';
+        oct    = hexStrToOctets(s);
+        return;
+    end
+
+    d = double(data(:));
+    if all(d == 0 | d == 1)
+        fmtStr = 'bits';
+        oct    = bitsToOctets(d);
+    end
+end
+
+function oct = hexStrToOctets(s)
+    % 16進文字列 ('4A3B...') をオクテット列 [74 59 ...] へ変換する
+    n = floor(numel(s) / 2) * 2;
+    if n == 0
+        oct = [];
+        return;
+    end
+    v = sscanf(s(1:n), '%2x');
+    oct = v(:).';
+end
+
+function hdr = parseMACHeaderFromOctets(oct)
+    % MPDU のオクテット列から MAC ヘッダ (Frame Control / Address1-3) を
+    % 直接読む。FCS を検証しないため、内容が正しい保証は無い点に注意。
     hdr = struct('valid', false, 'FrameType', '', 'Address1', '', 'Address2', '', ...
         'ManagementConfig', [], 'headerOnly', true);
 
-    if isempty(mpduBits)
-        return;
-    end
-    oct = bitsToOctets(mpduBits);
     if numel(oct) < 24
-        return;   % Address2 まで読めない (2値でなかった場合もここで空になる)
+        return;   % Address2 まで読めない
     end
     if any(oct < 0 | oct > 255 | mod(oct, 1) ~= 0)
         return;   % オクテットとして解釈できない値が混じっている
@@ -1539,17 +1603,17 @@ function ssidStr = parseSSIDFromMgmtFrame(payload)
     if iscell(payload)
         payload = payload{1};
     end
-    payload = double(payload(:)).';
     if isempty(payload)
         return;
     end
 
-    % wlanMPDUDecode に 'DataFormat','bits' を渡しているため payload は
-    % ビット列で返る。オクテット列 (MACはオクテット内 LSB 先頭) に戻す。
-    if max(payload) <= 1 && mod(numel(payload), 8) == 0
-        payload = bitsToOctets(payload);
+    % payload はビット列でも16進文字列でも返り得るので、実際の形式を
+    % 判定してオクテット列へ揃える。
+    [dfmt, oct] = mpduDataFormat(payload);
+    if isempty(dfmt)
+        return;
     end
-    payload = uint8(payload);
+    payload = uint8(oct);
 
     if numel(payload) < 14
         return;
