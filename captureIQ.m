@@ -65,18 +65,18 @@ clear; clc;
 %  ------------------------------------------------------------------------
 
 % --- 保存先 (ホストPC に接続された HDD) ---------------------------------
-%     ★実行前にドライブレターを環境に合わせて確認・修正すること★
-%     Windows の例: 'E:\IQ_raw'
-%     Linux   の例: '/mnt/hdd/IQ_raw'
-hddSavePath = 'E:\IQ_raw';
+%     現在の環境: HDPC-UT (D:)
+hddSavePath = 'D:\IQ_raw';
 
 % --- Wi-Fi 受信パラメータ (5GHz 帯 ch36 / 20MHz) -------------------------
 centerFrequency = 5.180e9;      % [Hz] 5GHz 帯 ch36 (20MHz 帯域幅)
 sampleRate      = 20e6;         % [Sps] 20 MHz 帯域
 gain            = 40;           % [dB] B200 系は 0〜76 dB 程度
                                  %      飽和するなら下げ、弱すぎるなら上げる
-captureDuration = 2.0;          % [s] Beacon 間隔は通常 100ms なので
-                                 %     確実に捕捉したい場合は長めに設定
+captureDuration = 5.0;          % [s] Beacon 間隔は通常 100ms なので
+                                 %     確実に捕捉したい場合は長めに設定。
+                                 %     5s で約 1.6 GB (メモリも同量必要)、
+                                 %     decodeIQ.m の復号は 25 分程度かかる。
 samplesPerFrame = 20000;        % [samples/frame]
 usrpPlatform    = 'B200';
 usrpSerialNum   = '3240497';

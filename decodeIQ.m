@@ -87,8 +87,8 @@ clear; clc;
 %  ------------------------------------------------------------------------
 
 % --- 入力元 (ホストPC に接続された HDD。captureIQ.m の保存先と揃える) ----
-%     ★実行前にドライブレターを環境に合わせて確認・修正すること★
-hddInputPath = 'E:\IQ_raw';
+%     現在の環境: HDPC-UT (D:)
+hddInputPath = 'D:\IQ_raw';
 
 % --- 読み込む生IQファイル ------------------------------------------------
 %     '' にすると hddInputPath 内で最も新しい *_raw.mat を自動選択する。
@@ -97,9 +97,14 @@ inputRawFile = '';
 
 % --- 出力先 --------------------------------------------------------------
 %     同じ内容を HDD と USB メモリの両方へ保存する。
-%     usbSavePath は ResultCSI.m の既定の読み込み先と合わせてある。
-hddSavePath = 'E:\IQ_csi';
-usbSavePath = 'D:\IQ';
+%     HDD は HDPC-UT (D:)。
+hddSavePath = 'D:\IQ_csi';
+
+%     USB メモリのドライブレターをここに設定する (例: 'F:\IQ')。
+%     '' のままにすると USB への保存はスキップし、HDD にのみ保存する。
+%     ※ResultCSI.m の既定の読み込み先は 'D:\IQ' なので、USB を使わない
+%       場合は ResultCSI.m 側の usbSavePath を 'D:\IQ_csi' に変更すること。
+usbSavePath = '';
 
 % --- 抽出したい Wi-Fi の SSID --------------------------------------------
 targetSSID = 'OpenWrt-A';
@@ -185,6 +190,11 @@ outTargets  = { 'HDD', hddSavePath; 'USB', usbSavePath };
 for k = 1:size(outTargets, 1)
     label = outTargets{k, 1};
     pth   = outTargets{k, 2};
+
+    if isempty(pth)
+        % 未設定 (例: USB メモリを使わない) のでこの出力先はスキップ
+        continue;
+    end
 
     if ~exist(pth, 'dir')
         fprintf('%s 保存先フォルダが存在しないため作成します: %s\n', label, pth);
