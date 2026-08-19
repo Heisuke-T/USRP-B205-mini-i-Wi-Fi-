@@ -15,7 +15,7 @@
 %
 %  処理の流れ:
 %    1. USRP を開いて指定時間だけ IQ サンプルを受信する
-%    2. 複素 single 形式で HDD に .mat 保存する
+%    2. 複素 double 形式で HDD に .mat 保存する
 %
 %  必要環境:
 %    - MATLAB / Communications Toolbox
@@ -25,13 +25,17 @@
 %
 %  出力ファイル:
 %    <hddSavePath>/<yyyymmddHHMM>_raw.mat
-%      iq   … 受信 IQ サンプル (complex single 列ベクトル)
+%      iq   … 受信 IQ サンプル (complex double 列ベクトル)
 %      meta … 中心周波数・サンプルレート・オーバーラン回数等の取得条件
 %
-%    ※ファイルサイズの目安 (20 MSps, complex single = 8 byte/sample):
-%        1 秒 → 約 160 MB,  2 秒 → 約 320 MB,  10 秒 → 約 1.6 GB
-%      キャプチャ中はメモリ上に complex double (16 byte/sample) で保持する
-%      ため、必要な空きメモリは上記の 2 倍になる点に注意。
+%    ※ADC は 12bit、USB 経由のサンプル形式は 16bit であり、single (仮数
+%      24bit) でも情報は失われないが、後段の decodeIQ.m / WLAN Toolbox が
+%      double 前提であるため、型変換を挟まず double のまま保存する。
+%
+%    ※ファイルサイズの目安 (20 MSps, complex double = 16 byte/sample):
+%        1 秒 → 約 320 MB,  2 秒 → 約 640 MB,  10 秒 → 約 3.2 GB
+%      キャプチャ中は同じサイズをメモリ上にも確保するため、実際の上限は
+%      HDD 容量ではなく空きメモリ量で決まる点に注意。
 %
 %  次の手順:
 %    このファイルを decodeIQ.m の入力として指定する (既定では最新の
@@ -98,9 +102,10 @@ end
 fclose(fidTest);
 delete(testFile);
 
-% 空き容量の事前確認 (complex single で 8 byte/sample)
-estimatedBytes = captureDuration * sampleRate * 8;
-fprintf('保存予定サイズ: 約 %.2f GB\n', estimatedBytes / 1e9);
+% 保存サイズの事前表示 (complex double で 16 byte/sample)
+% 同じサイズをキャプチャ中にメモリ上へも確保するため、空きメモリも要確認。
+estimatedBytes = captureDuration * sampleRate * 16;
+fprintf('保存予定サイズ: 約 %.2f GB (メモリも同量必要)\n', estimatedBytes / 1e9);
 
 timestamp  = datestr(now, 'yyyymmddHHMM');
 rawMatFile = fullfile(hddSavePath, [timestamp '_raw.mat']);
@@ -193,12 +198,11 @@ fprintf('  キャプチャ完了: %d サンプル, %.2f s, オーバーラン %d
 %% ------------------------------------------------------------------------
 %  5. IQ とメタデータを HDD へ保存
 %  ------------------------------------------------------------------------
-% 復号 (decodeIQ.m) 側で WLAN Toolbox が double を要求するが、ADC は 12bit
-% であり single (仮数 24bit) で情報は失われない。ファイルサイズが半分に
-% なるため single で保存する。
+% 復号 (decodeIQ.m) 側の WLAN Toolbox が double を要求するため、型変換を
+% 挟まず complex double のまま保存する。
 meta = struct();
 meta.description      = 'USRP B205 mini-i captured Wi-Fi IQ samples (5GHz ch36)';
-meta.dataFormat       = 'complex single column vector, variable name: iq';
+meta.dataFormat       = 'complex double column vector, variable name: iq';
 meta.rawMatFile       = rawMatFile;
 meta.wifiChannel      = 36;
 meta.centerFrequency  = centerFrequency;        % [Hz]
@@ -214,8 +218,6 @@ meta.overrunCount     = overrunCount;
 meta.elapsedCapture   = elapsedCapture;         % [s] 実際に要した時間
 meta.captureDatetime  = timestamp;              % 'yyyymmddHHMM'
 meta.matlabVersion    = version;
-
-iq = single(iq); %#ok<NASGU>
 
 % IQ が 2GB を超え得るため -v7.3 (HDF5 ベース) で保存する
 save(rawMatFile, 'iq', 'meta', '-v7.3');

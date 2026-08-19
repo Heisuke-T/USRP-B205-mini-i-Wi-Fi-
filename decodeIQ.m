@@ -143,8 +143,9 @@ if ~isfield(S, 'iq') || ~isfield(S, 'meta')
          'captureIQ.m が出力した *_raw.mat を指定してください。'], inputRawFile);
 end
 
-% WLAN Toolbox の関数群は double を前提とするため変換する
-% (保存時に single にしているが、ADC は 12bit なので情報は失われていない)
+% captureIQ.m は complex double で保存するため通常は変換不要だが、
+% 古い single 形式のファイルも読めるよう double() を通しておく
+% (WLAN Toolbox の関数群は double を前提とする)
 iq   = double(S.iq(:));
 meta = S.meta;
 clear S;
