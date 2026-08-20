@@ -1,4 +1,4 @@
-%% decodeIQ.m
+%% decodeIQ_VHT.m
 % =========================================================================
 %  [第2段] キャプチャ済み IQ をオフライン復号し、指定SSIDのCSIを記録する
 % -------------------------------------------------------------------------
@@ -18,6 +18,12 @@
 %    Non-HT (802.11a/g レガシー) / HT-Mixed (802.11n / Wi-Fi 4) /
 %    SU-VHT (802.11ac / Wi-Fi 5) に対応。
 %    HT-Greenfield と HE (802.11ax / Wi-Fi 6) は未対応 (検出のみ)。
+%
+%    ※ファイル名の "_VHT" は「VHT (Wi-Fi 5) までを対象とする復号器」の意。
+%      HE (802.11ax / Wi-Fi 6) は VHT とプリアンブル構造・SIG フィールドが
+%      大きく異なるため、本ファイルを拡張せず decodeIQ_HE.m として別に
+%      用意する方針。入力 (captureIQ.m の *_raw.mat) と出力 (*_CSI.mat) の
+%      形式は共通とし、ResultCSI.m がどちらの出力も読めるようにする。
 %
 %    HT・VHT対応の制約 (いずれもUSRP B205 mini-iが受信アンテナ1本=SISOのため):
 %      - 空間ストリーム数 = 1 のパケットのみ復号します。
@@ -77,7 +83,8 @@
 %      アップリンクは Address1 が BSSID になるため)。
 %
 %  処理時間の目安:
-%    キャプチャ 1 秒あたり 100〜300 秒程度かかる (電波の混雑度による)。
+%    実測でキャプチャ 1 秒あたり 300〜2400 秒 (電波の混雑度に強く依存)。
+%    混雑した環境での 5 秒キャプチャで約 3 時間20分を要した実績がある。
 % =========================================================================
 
 clear; clc;
@@ -124,7 +131,7 @@ verboseErrors   = false;        % true にすると復号エラーを毎回表�
 if isempty(inputRawFile)
     listing = dir(fullfile(hddInputPath, '*_raw.mat'));
     if isempty(listing)
-        error('decodeIQ:noInputFile', ...
+        error('decodeIQ_VHT:noInputFile', ...
             ['入力ファイルが見つかりません: %s\\*_raw.mat\n', ...
              '先に captureIQ.m を実行するか、inputRawFile にパスを指定してください。'], ...
             hddInputPath);
@@ -138,12 +145,12 @@ elseif isempty(fileparts(inputRawFile))
 end
 
 if ~isfile(inputRawFile)
-    error('decodeIQ:inputNotFound', '入力ファイルが存在しません: %s', inputRawFile);
+    error('decodeIQ_VHT:inputNotFound', '入力ファイルが存在しません: %s', inputRawFile);
 end
 
 S = load(inputRawFile, 'iq', 'meta');
 if ~isfield(S, 'iq') || ~isfield(S, 'meta')
-    error('decodeIQ:badInputFile', ...
+    error('decodeIQ_VHT:badInputFile', ...
         ['入力ファイルに変数 iq / meta がありません: %s\n', ...
          'captureIQ.m が出力した *_raw.mat を指定してください。'], inputRawFile);
 end
@@ -200,7 +207,7 @@ for k = 1:size(outTargets, 1)
         fprintf('%s 保存先フォルダが存在しないため作成します: %s\n', label, pth);
         [ok, msg] = mkdir(pth);
         if ~ok
-            warning('decodeIQ:mkdirFailed', ...
+            warning('decodeIQ_VHT:mkdirFailed', ...
                 '%s 保存先フォルダを作成できませんでした (%s): %s', label, pth, msg);
             continue;
         end
@@ -209,7 +216,7 @@ for k = 1:size(outTargets, 1)
     testFile = fullfile(pth, '.write_test.tmp');
     fidTest  = fopen(testFile, 'w');
     if fidTest == -1
-        warning('decodeIQ:notWritable', ...
+        warning('decodeIQ_VHT:notWritable', ...
             '%s 保存先に書き込みできないためスキップします: %s', label, pth);
         continue;
     end
@@ -220,7 +227,7 @@ for k = 1:size(outTargets, 1)
 end
 
 if isempty(outMatFiles)
-    error('decodeIQ:noWritableOutput', ...
+    error('decodeIQ_VHT:noWritableOutput', ...
         ['書き込み可能な出力先がありません。\n', ...
          '  HDD: %s\n  USB: %s\n', ...
          'ドライブの接続とパスを確認してください。'], hddSavePath, usbSavePath);
@@ -453,7 +460,7 @@ while searchOffset + minPreambleLen <= numel(iq)
             errMsgs(key) = 1;
         end
         if verboseErrors
-            warning('decodeIQ:decodeError', 'パケット処理中にエラー: %s', ME.message);
+            warning('decodeIQ_VHT:decodeError', 'パケット処理中にエラー: %s', ME.message);
         end
         searchOffset = nextSearch;
     end
@@ -666,7 +673,7 @@ end
 matched = pktLog([]);   % 空の構造体配列
 
 if isempty(targetBSSID)
-    warning('decodeIQ:ssidNotFound', ...
+    warning('decodeIQ_VHT:ssidNotFound', ...
         ['指定した SSID "%s" の Beacon/Probe Response を検出できませんでした。\n', ...
          'captureIQ.m の captureDuration を長くする、pktDetThreshold を下げる (例 0.3)、', ...
          'SSID の綴り・電波状況を確認する、などをお試しください。'], targetSSID);
@@ -798,13 +805,13 @@ for k = 1:numel(outMatFiles)
         nSaved = nSaved + 1;
     catch ME
         % 片方 (USB の抜き差し等) が失敗しても、もう片方は残す
-        warning('decodeIQ:saveFailed', ...
+        warning('decodeIQ_VHT:saveFailed', ...
             '保存に失敗しました (%s): %s', outMatFiles{k}, ME.message);
     end
 end
 
 if nSaved == 0
-    error('decodeIQ:allSavesFailed', ...
+    error('decodeIQ_VHT:allSavesFailed', ...
         'すべての出力先への保存に失敗しました。ドライブの接続を確認してください。');
 end
 

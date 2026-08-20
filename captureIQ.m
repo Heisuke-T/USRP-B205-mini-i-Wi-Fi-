@@ -4,7 +4,7 @@
 % -------------------------------------------------------------------------
 %  概要:
 %    Wi-Fi の受信処理は「取得」と「復号」に分かれており、本スクリプトは
-%    そのうちの取得のみを担当する。復号は decodeIQ.m で行う。
+%    そのうちの取得のみを担当する。復号は decodeIQ_VHT.m で行う。
 %
 %    分離している理由:
 %      USRP は 20 MSps で連続的にサンプルを送出し続けるため、受信ループの
@@ -29,7 +29,7 @@
 %      meta … 中心周波数・サンプルレート・オーバーラン回数等の取得条件
 %
 %    ※ADC は 12bit、USB 経由のサンプル形式は 16bit であり、single (仮数
-%      24bit) でも情報は失われないが、後段の decodeIQ.m / WLAN Toolbox が
+%      24bit) でも情報は失われないが、後段の decodeIQ_VHT.m / WLAN Toolbox が
 %      double 前提であるため、型変換を挟まず double のまま保存する。
 %
 %    ※ファイルサイズの目安 (20 MSps, complex double = 16 byte/sample):
@@ -38,7 +38,7 @@
 %      HDD 容量ではなく空きメモリ量で決まる点に注意。
 %
 %  次の手順:
-%    このファイルを decodeIQ.m の入力として指定する (既定では最新の
+%    このファイルを decodeIQ_VHT.m の入力として指定する (既定では最新の
 %    *_raw.mat が自動選択されるため、通常は指定不要)。
 %
 %  注意:
@@ -75,8 +75,11 @@ gain            = 40;           % [dB] B200 系は 0〜76 dB 程度
                                  %      飽和するなら下げ、弱すぎるなら上げる
 captureDuration = 5.0;          % [s] Beacon 間隔は通常 100ms なので
                                  %     確実に捕捉したい場合は長めに設定。
-                                 %     5s で約 1.6 GB (メモリも同量必要)、
-                                 %     decodeIQ.m の復号は 25 分程度かかる。
+                                 %     5s で約 1.6 GB (メモリも同量必要)。
+                                 %     ※decodeIQ_VHT.m の復号は実測で 5s の
+                                 %       キャプチャに約 3 時間20分かかる
+                                 %       (電波の混雑度に依存)。長時間の
+                                 %       キャプチャは復号時間に注意。
 samplesPerFrame = 20000;        % [samples/frame]
 usrpPlatform    = 'B200';
 usrpSerialNum   = '3240497';
@@ -198,7 +201,7 @@ fprintf('  キャプチャ完了: %d サンプル, %.2f s, オーバーラン %d
 %% ------------------------------------------------------------------------
 %  5. IQ とメタデータを HDD へ保存
 %  ------------------------------------------------------------------------
-% 復号 (decodeIQ.m) 側の WLAN Toolbox が double を要求するため、型変換を
+% 復号 (decodeIQ_VHT.m) 側の WLAN Toolbox が double を要求するため、型変換を
 % 挟まず complex double のまま保存する。
 meta = struct();
 meta.description      = 'USRP B205 mini-i captured Wi-Fi IQ samples (5GHz ch36)';
@@ -228,4 +231,4 @@ if overrunCount > 0
              '  あるため、samplesPerFrame を増やす、USB3.0 ポートを使う、\n', ...
              '  他の負荷の高いアプリを終了する等を検討してください。\n'], overrunCount);
 end
-fprintf('次に decodeIQ.m を実行してください (このファイルが自動選択されます)。\n');
+fprintf('次に decodeIQ_VHT.m を実行してください (このファイルが自動選択されます)。\n');
