@@ -45,21 +45,23 @@ clear; clc;
 %% ------------------------------------------------------------------------
 %  1. ユーザ設定
 %  ------------------------------------------------------------------------
-% 入力 CSI ファイル (calculateCSI.m / captureIQ_v2.m / captureIQ_HT.m の出力)。
-%   '' の場合は usbSavePath 内の最新の *_CSI.mat を自動選択。
+% 入力 CSI ファイル
+%   (decodeIQ.m / calculateCSI.m / captureIQ_v2.m / captureIQ_HT.m の出力)。
+%   '' の場合は csiSearchPath 内の最新の *_CSI.mat を自動選択。
 inputCsiFile = '';
 
-% CSI ファイルを探すフォルダ (USB 外部ストレージ)。inputCsiFile 指定時は無視。
-usbSavePath  = 'D:\IQ';
+% CSI ファイルを探すフォルダ。inputCsiFile 指定時は無視。
+%   decodeIQ.m の hddSavePath と揃えること。現在の環境: HDPC-UT (D:)
+csiSearchPath = 'D:\IQ_csi';
 
 %% ------------------------------------------------------------------------
 %  2. CSI データの読み込み
 %  ------------------------------------------------------------------------
 if isempty(inputCsiFile)
-    d = dir(fullfile(usbSavePath, '*_CSI.mat'));
+    d = dir(fullfile(csiSearchPath, '*_CSI.mat'));
     if isempty(d)
         error('ResultCSI:noInput', ...
-            'CSI の .mat (*_CSI.mat) が見つかりません: %s', usbSavePath);
+            'CSI の .mat (*_CSI.mat) が見つかりません: %s', csiSearchPath);
     end
     [~, iLatest] = max([d.datenum]);
     inputCsiFile = fullfile(d(iLatest).folder, d(iLatest).name);
@@ -70,7 +72,23 @@ if ~isfile(inputCsiFile)
 end
 
 fprintf('入力 CSI ファイル: %s\n', inputCsiFile);
-S = load(inputCsiFile);
+
+% load が失敗する主因は「decodeIQ.m の保存が完了していない (実行中・中断)」
+% ため。原因が分かるようファイルサイズを添えて報告する。
+try
+    S = load(inputCsiFile);
+catch loadErr
+    dInfo = dir(inputCsiFile);
+    error('ResultCSI:loadFailed', ...
+        ['CSI ファイルを読み込めませんでした。\n', ...
+         '  ファイル  : %s\n', ...
+         '  サイズ    : %d バイト\n', ...
+         '  更新日時  : %s\n', ...
+         '  エラー    : %s\n', ...
+         'decodeIQ.m が「すべての処理が完了しました。」まで到達しているか\n', ...
+         '確認してください。実行中・中断されたファイルは読み込めません。'], ...
+        inputCsiFile, dInfo.bytes, dInfo.date, loadErr.message);
+end
 
 sampleRate = NaN;
 if isfield(S, 'csiMeta') && isfield(S.csiMeta, 'sampleRate')
