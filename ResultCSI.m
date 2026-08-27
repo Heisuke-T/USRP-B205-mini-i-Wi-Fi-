@@ -1,21 +1,23 @@
 %% ResultCSI.m
 % =========================================================================
 %  CSI (.mat) から振幅 (Amplitude) マップと位相 (Phase) マップを
-%  フォーマット (Non-HT / HT / VHT) ごとに作成・保存するスクリプト
+%  フォーマット (Non-HT / HT / VHT / HE) ごとに作成・保存するスクリプト
 % -------------------------------------------------------------------------
 %  概要:
-%    captureIQ_HT.m (または captureIQ_v2.m / calculateCSI.m) の出力
-%    (<入力名>_CSI.mat) を読み込み、Non-HT / HT / VHT のうちファイルに
-%    含まれているものそれぞれについて、
+%    decodeIQ_VHT.m / decodeIQ_HE.m (または captureIQ_HT.m / captureIQ_v2.m /
+%    calculateCSI.m) の出力 (<入力名>_CSI.mat) を読み込み、
+%    Non-HT / HT / VHT / HE のうちファイルに含まれているものそれぞれについて、
 %      振幅マップ : Amplitude(packet, subcarrier) = |H(k)|        [dB]
 %      位相マップ : Phase(packet, subcarrier)     = angle(H(k))  [rad]
 %    を [パケット数 x サブキャリア数] の行列として計算し、フォーマットごとに
 %    別の figure としてヒートマップ表示、まとめて .mat ファイルに保存します。
-%    (Non-HT/HT は 52 本、VHT(20MHz) は 56 本とサブキャリア数が異なるため、
-%     1 つのマップに混在させると軸がずれて意味を成しません。必ず別マップに
-%     分けて出力します。)
+%    (Non-HT/HT は 52 本、VHT(20MHz) は 56 本、HE(20MHz) は 242 本と
+%     サブキャリア数が異なるため、1 つのマップに混在させると軸がずれて
+%     意味を成しません。必ず別マップに分けて出力します。
+%     さらに HE は 20MHz でも 256点FFT (78.125kHz間隔) なので、
+%     サブキャリア番号 k の刻み幅そのものが他フォーマットと違います。)
 %
-%    captureIQ_HT.m の "csiNonHT/csiHT/csiVHT" 系の変数が無い、古い形式
+%    "csiNonHT/csiHT/csiVHT/csiHE" 系の変数が無い、古い形式
 %    (calculateCSI.m の出力など) の場合は、単一の "csi" 変数から1つだけ
 %    マップを作成します (フォーマット名は csiMeta.primaryFormat があれば
 %    それを使い、無ければ 'CSI' とする)。
@@ -27,7 +29,7 @@
 %
 %  出力 .mat の内容:
 %    results  … struct配列。要素ごとに以下を持つ
-%                 .format            'Non-HT' / 'HT' / 'VHT' など
+%                 .format            'Non-HT' / 'HT' / 'VHT' / 'HE' など
 %                 .amplitude         [numPackets x numSubcarrier] dB
 %                 .phase             [numPackets x numSubcarrier] rad (wrap)
 %                 .phaseUnwrap       [numPackets x numSubcarrier] rad
@@ -98,11 +100,13 @@ end
 %% ------------------------------------------------------------------------
 %  3. フォーマットごとのデータセットを集める
 %  ------------------------------------------------------------------------
-% captureIQ_HT.m 形式 (csiNonHT/csiHT/csiVHT ...) を優先的に探す。
+% フォーマット別形式 (csiNonHT/csiHT/csiVHT/csiHE ...) を優先的に探す。
+% HE は decodeIQ_HE.m の出力にのみ含まれる (無ければ黙って読み飛ばす)。
 candidates = { ...
     'Non-HT', 'csiNonHT', 'subcarrierIndicesNonHT', 'timeSecNonHT'; ...
     'HT',     'csiHT',    'subcarrierIndicesHT20',  'timeSecHT';    ...
-    'VHT',    'csiVHT',   'subcarrierIndicesVHT20', 'timeSecVHT'    ...
+    'VHT',    'csiVHT',   'subcarrierIndicesVHT20', 'timeSecVHT';   ...
+    'HE',     'csiHE',    'subcarrierIndicesHE20',  'timeSecHE'     ...
     };
 
 datasets = struct('format', {}, 'csi', {}, 'subcarrierIndices', {}, 'timeSec', {});
