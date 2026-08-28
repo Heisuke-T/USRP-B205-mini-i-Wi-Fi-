@@ -877,7 +877,7 @@ end
 %% ------------------------------------------------------------------------
 %  7. 保存 (.mat) — HDD と USB メモリの両方へ
 %  ------------------------------------------------------------------------
-% 変数名は calculateCSI.m / ResultCSI.m と揃えて csiMeta とする
+% 変数名は ResultCSI.m と揃えて csiMeta とする
 csiMeta = struct();
 csiMeta.description      = 'CSI filtered by target SSID (Non-HT / HT(NSS=1,20MHz) / SU-VHT(NSTS=1,20MHz))';
 csiMeta.decoder          = 'decode_VHT_v2.m';   % どちらの復号器で作ったか

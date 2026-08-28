@@ -4,8 +4,8 @@
 %  フォーマット (Non-HT / HT / VHT / HE) ごとに作成・保存するスクリプト
 % -------------------------------------------------------------------------
 %  概要:
-%    decodeIQ_VHT.m / decodeIQ_HE.m (または captureIQ_HT.m / captureIQ_v2.m /
-%    calculateCSI.m) の出力 (<入力名>_CSI.mat) を読み込み、
+%    decodeIQ_VHT.m / decode_VHT_v2.m / decodeIQ_VHT_Pico.m / decodeIQ_HE.m
+%    の出力 (<入力名>_CSI.mat) を読み込み、
 %    Non-HT / HT / VHT / HE のうちファイルに含まれているものそれぞれについて、
 %      振幅マップ : Amplitude(packet, subcarrier) = |H(k)|        [dB]
 %      位相マップ : Phase(packet, subcarrier)     = angle(H(k))  [rad]
@@ -17,10 +17,9 @@
 %     さらに HE は 20MHz でも 256点FFT (78.125kHz間隔) なので、
 %     サブキャリア番号 k の刻み幅そのものが他フォーマットと違います。)
 %
-%    "csiNonHT/csiHT/csiVHT/csiHE" 系の変数が無い、古い形式
-%    (calculateCSI.m の出力など) の場合は、単一の "csi" 変数から1つだけ
-%    マップを作成します (フォーマット名は csiMeta.primaryFormat があれば
-%    それを使い、無ければ 'CSI' とする)。
+%    "csiNonHT/csiHT/csiVHT/csiHE" 系の変数が無い古い形式の .mat の場合は、
+%    単一の "csi" 変数から1つだけマップを作成します (フォーマット名は
+%    csiMeta.primaryFormat があればそれを使い、無ければ 'CSI' とする)。
 %
 %  出力ファイル名:
 %    <入力(_CSI.mat)のベース名>_result.mat
@@ -47,8 +46,7 @@ clear; clc;
 %% ------------------------------------------------------------------------
 %  1. ユーザ設定
 %  ------------------------------------------------------------------------
-% 入力 CSI ファイル
-%   (decodeIQ_VHT.m / calculateCSI.m / captureIQ_v2.m / captureIQ_HT.m の出力)。
+% 入力 CSI ファイル (decodeIQ_*.m / decode_VHT_v2.m の出力)。
 %   '' の場合は csiSearchPath 内の最新の *_CSI.mat を自動選択。
 inputCsiFile = '';
 
@@ -128,8 +126,8 @@ for r = 1:size(candidates, 1)
         'subcarrierIndices', S.(subcVar), 'timeSec', tSec); %#ok<SAGROW>
 end
 
-% captureIQ_HT.m 形式が見つからない場合は、単一の csi 変数にフォールバック
-% (calculateCSI.m や、フォーマット別変数を持たない古い captureIQ_v2.m の出力)
+% フォーマット別の変数が見つからない場合は、単一の csi 変数にフォールバック
+% (フォーマット別変数を持たない古い形式の .mat を読むため)
 if isempty(datasets)
     if ~isfield(S, 'csi') || ~isfield(S, 'subcarrierIndices')
         error('ResultCSI:invalidInput', ...
