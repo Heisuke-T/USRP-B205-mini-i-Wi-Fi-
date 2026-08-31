@@ -945,6 +945,51 @@ end
 %% ------------------------------------------------------------------------
 %  6. 送信元の一覧を作り、対象とするトラフィックを選ぶ
 %  ------------------------------------------------------------------------
+
+% --- ビット誤りで化けた送信元アドレスを擬似アドレスへ統合する -------------
+% FCS が通らない状況では、MAC ヘッダのみ復号したパケットの Address2 は
+% ビット誤りでバラバラの値に化ける。実測では 1 つの注入源が 29 個の別々の
+% アドレスとして現れ、下位バイトだけが共通する (…10121122 など) 形になった。
+% これらは実在しない送信元であり、一覧を埋め尽くすうえに本来同じ注入
+% トラフィックである CSI を分断してしまう。
+%
+% そこで「FCS を一度も通しておらず、かつ数件しか現れないアドレス」は
+% 化けたものとみなし、同じ PHY 設定の擬似アドレスへまとめ直す。
+% 統合するのは Address2 の帰属だけで、CSI には手を触れない。
+suspiciousMaxCount = 5;   % これ未満の件数なら化けたアドレスとみなす
+nFoldedBogus = 0;
+if keepPHYOnlyCSI && ~isempty(pktLog)
+    bogusAddrs = containers.Map('KeyType', 'char', 'ValueType', 'logical');
+    tmpBssid = {pktLog.bssid};
+    tmpFcs   = logical([pktLog.fcsVerified]);
+    for k = 1:numel(pktLog)
+        a = tmpBssid{k};
+        if isKey(bogusAddrs, a) || strncmp(a, '(PHY:', 5)
+            continue;
+        end
+        sel = strcmp(tmpBssid, a);
+        bogusAddrs(a) = (sum(sel) < suspiciousMaxCount) && ~any(sel & tmpFcs);
+    end
+
+    for k = 1:numel(pktLog)
+        if pktLog(k).macDecoded && ~pktLog(k).fcsVerified && ...
+                bogusAddrs(pktLog(k).bssid)
+            pktLog(k).bssid      = phyOnlyAddress(pktLog(k).phyFormat, pktLog(k).mcs);
+            pktLog(k).addr1      = '';
+            pktLog(k).frameType  = '(MAC復号不可)';
+            pktLog(k).macDecoded = false;
+            nFoldedBogus = nFoldedBogus + 1;
+        end
+    end
+
+    if nFoldedBogus > 0
+        fprintf(['\n[送信元アドレスの整理] %d 件を擬似アドレスへ統合しました。\n', ...
+                 '  FCS を一度も通しておらず %d 件未満しか現れないアドレスは、\n', ...
+                 '  ペイロードのビット誤りで MAC ヘッダが化けたものとみなしています。\n'], ...
+            nFoldedBogus, suspiciousMaxCount);
+    end
+end
+
 % Beacon から学習できた BSSID/SSID (注入源と周囲のAPを見分けるために使う)
 seenNetworks = struct('bssid', {}, 'ssid', {});
 bssidKeys = keys(bssidToSSID);
@@ -1023,9 +1068,9 @@ else
              '    送信元 MAC は分からないが CSI は有効で、平均間隔が --delay と\n', ...
              '    一致していれば注入トラフィックそのものである。\n', ...
              '  ※"FCS OK" が 0 かつ件数が 1〜数件のアドレスは、ペイロードの\n', ...
-             '    ビット誤りで MAC ヘッダが化けたものである可能性が高い。実在\n', ...
-             '    しない送信元なので選別には使わないこと (下位バイトだけが\n', ...
-             '    共通した似たアドレスが多数並ぶのがその兆候)。\n', ...
+             '    ビット誤りで MAC ヘッダが化けたものである可能性が高く、実在\n', ...
+             '    しない送信元なので選別には使わないこと。keepPHYOnlyCSI が\n', ...
+             '    true なら擬似アドレス側へ自動的に統合される。\n', ...
              '  ※複数空間ストリームのパケットは SISO 受信では復号できず現れない。\n']);
 end
 
@@ -1065,8 +1110,8 @@ if isempty(targetTxAddress)
         % が化けた偽の送信元とみなして候補から外す。keepPHYOnlyCSI = true なら
         % 同じパケット群は擬似アドレス '(PHY:...)' 側にまとまっており、
         % そちらが正しい選択肢になる。
-        if keepPHYOnlyCSI && txCensus(k).nFCSOK == 0 && txCensus(k).count < 5 ...
-                && ~strncmp(addr, '(PHY:', 5)
+        if keepPHYOnlyCSI && txCensus(k).nFCSOK == 0 && ...
+                txCensus(k).count < suspiciousMaxCount && ~strncmp(addr, '(PHY:', 5)
             continue;
         end
         % Beacon を出している = AP なので注入源ではない。件数が同じなら
@@ -1244,6 +1289,7 @@ csiMeta.targetFormats    = targetFormats;
 csiMeta.targetMCS        = targetMCS;
 csiMeta.expectedIntervalUs = expectedIntervalUs;
 csiMeta.keepPHYOnlyCSI   = keepPHYOnlyCSI;   % MAC 不明でも CSI を残したか
+csiMeta.foldedBogusAddrs = nFoldedBogus;     % 化けたアドレスから統合した件数
 csiMeta.primaryFormat    = primaryFormat;   % 変数 csi がどの形式か
 csiMeta.centerFrequency  = centerFrequency;
 csiMeta.sampleRate       = sampleRate;
