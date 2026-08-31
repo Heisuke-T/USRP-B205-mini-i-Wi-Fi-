@@ -39,8 +39,34 @@
 %    2. 注入源と思われるアドレスを確認する。自動選択の結果もそこに出るので、
 %       妥当ならそのままでよい。違っていれば targetTxAddress に明示する。
 %
-%  ベースからの変更点はパケットの選別方法のみで、パケット検出・同期・
-%  CSI 推定・MAC 復号の処理は decode_VHT_v2.m と同一。出力する .mat の
+%  MAC が読めない注入パケットの扱い (keepPHYOnlyCSI):
+%    VHT のデータ部は、プリアンブルや SIG フィールドより遥かに高い受信品質を
+%    要求する。例えば --mcs 3 は 16QAM R=1/2 であり、BPSK R=1/2 の
+%    L-SIG / VHT-SIG-A / VHT-SIG-B より約 10dB 高い SNR が要る。そのため
+%
+%      VHT として検出 857 / SIG-A CRC 通過 854 / 送信帯域も NSTS も正しく読める
+%      → しかし MPDU の FCS は 1 件も通らない
+%
+%    という状態が普通に起こる (注入源が近すぎて ADC が飽和している、逆に
+%    遠すぎて SNR が足りない、など)。送信元 MAC はこの MPDU の中にあるため、
+%    MAC アドレスでの選別 ([A]) はこの状態では機能しない。
+%
+%    一方、本スクリプトが欲しい CSI は VHT-LTF (プリアンブル) から求めており、
+%    MPDU 復号の成否とは無関係に正しく得られている。そこで
+%    keepPHYOnlyCSI = true (既定) では、MAC を復号できなかったパケットも
+%      擬似アドレス '(PHY:VHT-MCS<n>)'
+%    の送信元としてまとめて記録し、手掛かり [B] PHY パラメータ と
+%    [C] 送信間隔 だけで注入トラフィックを選別できるようにしている。
+%    送信間隔の中央値が --delay と一致すれば、それが注入源である裏付けになる。
+%
+%    なぜ FCS が通らないのかは [VHT データ部の品質診断] を見ると分かる。
+%      振幅ピークが 1.0 付近      → ADC 飽和。captureIQ.m の gain を下げる
+%      SNR は高いが EVM が悪い    → 歪み (飽和・非線形・隣接波干渉)
+%      SNR も EVM も悪い          → 受信品質不足。距離/gain/--mcs を見直す
+%
+%  ベースからの変更点はパケットの選別方法と、MAC を復号できなかった
+%  パケットの CSI を残すかどうか (keepPHYOnlyCSI) のみ。パケット検出・同期・
+%  CSI 推定・MAC 復号の処理自体は decode_VHT_v2.m と同一で、出力する .mat の
 %  変数名も同じなので ResultCSI.m はそのまま使える。
 %
 %  高速化の内容:
@@ -158,6 +184,9 @@
 %      phyFormat    … [パケット数 x 1] 'Non-HT' / 'HT' / 'VHT'
 %      fcsVerified  … [パケット数 x 1] false は FCS 未検証 (MAC ヘッダのみ
 %                      から送信元を判定したもの)。CSI 自体には影響しない。
+%      macDecoded   … [パケット数 x 1] false は MAC を全く復号できず、PHY
+%                      パラメータ (フォーマット/MCS/帯域/NSTS) と送信間隔
+%                      だけで注入トラフィックと判断したもの。CSI は有効。
 %      targetTxAddressOut … 実際に選別に使った送信元アドレス
 %      txCensus     … 送信元アドレスごとの集計 (診断用。下記フィールド)
 %                       .address .count .nNonHT .nHT .nVHT .ssid
@@ -172,6 +201,10 @@
 %  decode_VHT_v2.m との比較:
 %    パケットの選別方法以外は同一なので、同じ *_raw.mat に対して両方を
 %    実行すれば、選別前の復号結果 (検出数・FCS検証数) は一致するはず。
+%    ただし keepPHYOnlyCSI = true のときは、decode_VHT_v2.m が捨てている
+%    「MAC を復号できなかった VHT パケット」が本版では記録されるため、
+%    記録件数と csiVHT の行数は一致しない (増える)。厳密に比較したい
+%    場合は keepPHYOnlyCSI = false にすること。
 %    出力ファイル名が同じになるので、片方は別フォルダへ保存するか、
 %    実行後にファイル名を変えておく。
 %
@@ -238,8 +271,28 @@ targetMCS = 3;
 
 % [C] 期待する送信間隔 [us]。PicoScenes の --delay に相当。
 %     0 にすると照合しない。選別後のパケット間隔の中央値と比較して
-%     診断表示するだけで、選別そのものには使わない。
+%     診断表示するほか、送信元の自動選択でも「この間隔で送っている
+%     送信元」を優先する材料に使う。
 expectedIntervalUs = 5780;
+
+% [D] MAC を復号できなかったパケットの CSI を残すか
+%     VHT のデータ部 (例 MCS3 = 16QAM) は、プリアンブルや SIG フィールド
+%     (BPSK R=1/2) より 10dB 近く高い受信品質を要求する。そのため
+%       L-SIG / VHT-SIG-A / VHT-SIG-B は毎回読めるのに、
+%       MPDU の FCS だけが一度も通らない
+%     という状態が普通に起こる (注入源が近すぎて ADC が飽和している、
+%     逆に遠すぎて SNR が足りない、など)。
+%
+%     一方 CSI は VHT-LTF から求めており MPDU 復号とは無関係なので、
+%     この状態でも CSI 自体は正しく得られている。true にすると、MAC を
+%     復号できなかったパケットも捨てずに
+%       擬似アドレス '(PHY:VHT-MCS<n>)'
+%     の送信元としてまとめ、CSI を残す。PHY パラメータ (フォーマット /
+%     MCS / 20MHz / NSTS=1) と送信間隔だけで注入トラフィックを識別する
+%     運用になる (本ファイル冒頭の手掛かり [B][C] のみで選別する形)。
+%
+%     false にすると従来どおり MAC ヘッダを読めたパケットだけを記録する。
+keepPHYOnlyCSI = true;
 
 % --- 出力ファイル名に入れる識別子 ----------------------------------------
 %     <yyyymmddHHMM>_<outputTag>_CSI.mat として保存される。
@@ -404,7 +457,8 @@ subcarrierIndicesVHT20 = [-28:-1, 1:28];    % VHT    CBW20 (56本)
 % フィールドの順序は buildEntry の返す構造体と一致させること
 % (順序が違うと構造体配列への代入でエラーになる)。
 pktLogTemplate = struct('timeSec', 0, 'bssid', '', 'addr1', '', 'frameType', '', ...
-    'ssid', '', 'phyFormat', '', 'mcs', -1, 'fcsVerified', false, 'mpduCount', 0, 'csi', []);
+    'ssid', '', 'phyFormat', '', 'mcs', -1, 'fcsVerified', false, ...
+    'macDecoded', false, 'mpduCount', 0, 'csi', []);
 pktLog  = repmat(pktLogTemplate, 20000, 1);
 numPkts = 0;   % pktLog に実際に格納した件数
 
@@ -413,7 +467,21 @@ bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
 % 復号統計 (診断用)
 stats = struct('detected', 0, 'timingSkip', 0, 'nonHT', 0, 'ht', 0, 'vht', 0, ...
     'htGF', 0, 'other', 0, 'htUnsupported', 0, 'vhtUnsupported', 0, ...
-    'decodeOK', 0, 'noAddr2', 0, 'errors', 0);
+    'decodeOK', 0, 'phyOnly', 0, 'vhtPhyOnly', 0, 'noAddr2', 0, 'errors', 0);
+
+% --- VHT データ部の品質診断 -----------------------------------------------
+% 「SIG は読めるのに FCS が通らない」原因を切り分けるための材料。
+%   受信SNR (L-LTF)      : プリアンブルから見た受信品質
+%   データ部 EVM         : 実際に復調した信号点の誤差。SNR が高いのに EVM が
+%                          悪ければ、雑音ではなく歪み (ADC 飽和など) が原因
+%   振幅ピーク           : 1.0 (正規化フルスケール) に張り付いていれば飽和
+%   SERVICE 内 SIG-B CRC : データ部の先頭16bitが正しく復号できているか
+vhtQualMax = 20000;
+vhtQual = struct('snrdB', nan(vhtQualMax, 1), 'evmPct', nan(vhtQualMax, 1), ...
+    'peak', nan(vhtQualMax, 1));
+nVhtQual   = 0;
+vhtSigBOK  = 0;   % SERVICE 内の VHT-SIG-B CRC を通った件数
+vhtSigBNG  = 0;   % 同 失敗した件数
 errMsgs       = containers.Map('KeyType', 'char', 'ValueType', 'double');
 deagStatusCnt = containers.Map('KeyType', 'char', 'ValueType', 'double');
 nonBinaryShown = false;  % 非0/1データを検出した旨を一度だけ表示するためのフラグ
@@ -547,7 +615,21 @@ while searchOffset + minPreambleLen <= numel(iq)
 
             case fmtStr == "VHT"
                 stats.vht = stats.vht + 1;
-                [st, consumed, entry, vhtInfo] = processVHT(pkt, lltfChanEst, noiseEst, chanBW);
+                [st, consumed, entry, vhtInfo] = processVHT(pkt, lltfChanEst, ...
+                    noiseEst, chanBW, keepPHYOnlyCSI);
+
+                % データ部の品質を記録 (原因切り分け用)
+                if vhtInfo.hasQuality && nVhtQual < vhtQualMax
+                    nVhtQual = nVhtQual + 1;
+                    vhtQual.snrdB(nVhtQual)  = vhtInfo.snrdB;
+                    vhtQual.evmPct(nVhtQual) = vhtInfo.evmPct;
+                    vhtQual.peak(nVhtQual)   = vhtInfo.peakAmp;
+                end
+                if vhtInfo.sigbCRC == 1
+                    vhtSigBOK = vhtSigBOK + 1;
+                elseif vhtInfo.sigbCRC == 0
+                    vhtSigBNG = vhtSigBNG + 1;
+                end
 
                 if vhtInfo.bwMHz > 0
                     vhtSigParsed = vhtSigParsed + 1;
@@ -579,9 +661,22 @@ while searchOffset + minPreambleLen <= numel(iq)
                         ternary(vhtInfo.coding==1,'LDPC','BCC'), vhtInfo.lsigLen, vhtInfo.nsym, ...
                         vhtInfo.apepFromLSIG, vhtInfo.apepFromSIGB, vhtInfo.apepUsed, ...
                         vhtInfo.deagStatus, vhtInfo.mpduCount);
+                    if vhtInfo.hasQuality
+                        fprintf(['            品質: 受信SNR=%.1f dB データ部EVM=%.1f%% ', ...
+                                 '振幅ピーク=%.3f SERVICE内SIG-B_CRC=%s\n'], ...
+                            vhtInfo.snrdB, vhtInfo.evmPct, vhtInfo.peakAmp, ...
+                            ternary(vhtInfo.sigbCRC == 1, 'OK', ...
+                                ternary(vhtInfo.sigbCRC == 0, 'NG', '不明')));
+                    end
                 end
                 if ~isempty(vhtInfo.reason)
-                    stats.vhtUnsupported = stats.vhtUnsupported + 1;
+                    % csiKept = true は「MAC は読めなかったが CSI は残した」。
+                    % 構成が非対応で捨てたものと区別して数える。
+                    if vhtInfo.csiKept
+                        stats.vhtPhyOnly = stats.vhtPhyOnly + 1;
+                    else
+                        stats.vhtUnsupported = stats.vhtUnsupported + 1;
+                    end
                     if isKey(vhtRejects, vhtInfo.reason)
                         vhtRejects(vhtInfo.reason) = vhtRejects(vhtInfo.reason) + 1;
                     else
@@ -607,6 +702,9 @@ while searchOffset + minPreambleLen <= numel(iq)
 
         if st > 0
             stats.decodeOK = stats.decodeOK + 1;
+            if ~isempty(entry) && ~entry.macDecoded
+                stats.phyOnly = stats.phyOnly + 1;
+            end
 
             if isempty(entry)
                 % ACK/CTS など Address2 を持たないフレーム (BSSID 判定に使えない)
@@ -667,6 +765,9 @@ fprintf('    タイミング不正でスキップ: %d\n', stats.timingSkip);
 fprintf('    Non-HT として検出       : %d\n', stats.nonHT);
 fprintf('    HT     として検出       : %d  (うち非対応構成 %d)\n', stats.ht, stats.htUnsupported);
 fprintf('    VHT    として検出       : %d  (うち非対応構成 %d)\n', stats.vht, stats.vhtUnsupported);
+if stats.vhtPhyOnly > 0
+    fprintf('      うち MAC復号不可だが CSI は取得: %d\n', stats.vhtPhyOnly);
+end
 fprintf('    HT-Greenfield            : %d  (非対応)\n', stats.htGF);
 fprintf('    その他フォーマット      : %d  (非対応)\n', stats.other);
 
@@ -725,11 +826,16 @@ if stats.vht > 0
     end
     if vhtRejects.Count > 0
         rKeys = keys(vhtRejects);
-        fprintf('    非対応の理由    : ');
+        fprintf('    MAC を復号できなかった理由: ');
         for k = 1:numel(rKeys)
             fprintf('%s=%d回  ', rKeys{k}, vhtRejects(rKeys{k}));
         end
         fprintf('\n');
+        if keepPHYOnlyCSI && stats.vhtPhyOnly > 0
+            fprintf(['      ※このうち PHY 構成が対応範囲内 (SU/20MHz/NSTS=1) の %d 件は\n', ...
+                     '        keepPHYOnlyCSI = true により CSI を残している。\n'], ...
+                stats.vhtPhyOnly);
+        end
     end
     % VHT-SIG-A のビット解釈が正しいかの自己判定
     fprintf('    SIG-A予約ビット検証: %d/%d 個が仕様どおり (CRC通過分のみ)', ...
@@ -739,9 +845,59 @@ if stats.vht > 0
     else
         fprintf('  (ビット解釈は妥当)\n');
     end
+
+    % --- データ部の受信品質 (FCS が通らない原因の切り分け) ---
+    if nVhtQual > 0
+        snrMed  = median(vhtQual.snrdB(1:nVhtQual),  'omitnan');
+        evmMed  = median(vhtQual.evmPct(1:nVhtQual), 'omitnan');
+        peakMed = median(vhtQual.peak(1:nVhtQual),   'omitnan');
+        peakHi  = mean(vhtQual.peak(1:nVhtQual) > 0.95) * 100;
+
+        fprintf('  [VHT データ部の品質診断] (%d パケットの中央値)\n', nVhtQual);
+        fprintf('    受信SNR (L-LTF)     : %.1f dB\n', snrMed);
+        if isnan(evmMed)
+            fprintf('    データ部 EVM        : 測定できず\n');
+        else
+            fprintf('    データ部 EVM        : %.1f %%  (等価SNR %.1f dB)\n', ...
+                evmMed, -20*log10(max(evmMed, realmin)/100));
+        end
+        fprintf('    振幅ピーク          : %.3f  (フルスケール=1.0, >0.95 が %.1f%%)\n', ...
+            peakMed, peakHi);
+        if vhtSigBOK + vhtSigBNG > 0
+            fprintf('    SERVICE内 SIG-B CRC : OK=%d / NG=%d\n', vhtSigBOK, vhtSigBNG);
+        end
+
+        % --- 判定 ---
+        % MCS3 (16QAM R=1/2) はおよそ EVM 10%% (等価SNR 20dB) 以下でないと
+        % 誤りなく復号できない。プリアンブルの SIG フィールドは BPSK R=1/2
+        % なので 10dB 近く低い品質でも読めてしまい、「SIG は読めるのに FCS が
+        % 通らない」状態になる。
+        fprintf('    判定: ');
+        if ~isnan(peakMed) && (peakMed > 0.95 || peakHi > 20)
+            fprintf(['振幅がフルスケールに達している = ADC が飽和している。\n', ...
+                     '      注入源が近すぎるか captureIQ.m の gain が高すぎる。\n', ...
+                     '      gain を 10〜20dB 下げて取り直すと FCS が通るようになる。\n']);
+        elseif ~isnan(evmMed) && ~isnan(snrMed) && snrMed > 25 && evmMed > 12
+            fprintf(['受信SNR は十分なのに EVM が悪い = 雑音ではなく歪みが原因。\n', ...
+                     '      ADC 飽和・送信側の非線形・強い隣接チャネル干渉を疑う。\n', ...
+                     '      まず captureIQ.m の gain を下げて取り直すこと。\n']);
+        elseif ~isnan(evmMed) && evmMed > 12
+            fprintf(['受信品質が MCS%d の要求に届いていない。\n', ...
+                     '      アンテナを近づける / gain を上げる、あるいは送信側を\n', ...
+                     '      --mcs 0 (BPSK R=1/2) にすると MAC まで復号できる。\n'], ...
+                     ternary(isempty(targetMCS), 3, targetMCS));
+        else
+            fprintf('データ部の品質は良好。\n');
+        end
+        fprintf(['    ※CSI は VHT-LTF (プリアンブル) から求めており、データ部の\n', ...
+                 '      復号可否とは無関係に有効である。\n']);
+    end
 end
-fprintf('  MAC まで復号成功          : %d\n', stats.decodeOK);
-fprintf('    うち Address2 無し(ACK/CTS等、BSSID判定不可): %d\n', stats.noAddr2);
+fprintf('  CSI を記録できたパケット  : %d\n', stats.decodeOK - stats.noAddr2);
+fprintf('    うち MAC まで復号成功   : %d\n', ...
+    stats.decodeOK - stats.noAddr2 - stats.phyOnly);
+fprintf('    うち MAC不明 (PHYのみ)  : %d\n', stats.phyOnly);
+fprintf('  Address2 無し(ACK/CTS等)で除外: %d\n', stats.noAddr2);
 fprintf('  復号エラー                : %d\n', stats.errors);
 
 % --- A-MPDU 分解の結果 (データ復号が機能しているかの判断材料) ---
@@ -760,16 +916,20 @@ if ~isempty(pktLog)
     fprintf('  [FCS 検証の内訳 (全BSSID)]\n');
     allFmt  = {pktLog.phyFormat};
     allFcsV = logical([pktLog.fcsVerified]);
+    allMacD = logical([pktLog.macDecoded]);
     for f = {'Non-HT', 'HT', 'VHT'}
         sel = strcmpi(allFmt, f{1});
         if any(sel)
-            fprintf('    %-6s : 記録%d件 (FCS検証OK=%d, ヘッダのみ推定=%d)\n', ...
-                f{1}, sum(sel), sum(sel & allFcsV), sum(sel & ~allFcsV));
+            fprintf('    %-6s : 記録%d件 (FCS検証OK=%d, ヘッダのみ推定=%d, MAC不明=%d)\n', ...
+                f{1}, sum(sel), sum(sel & allFcsV), ...
+                sum(sel & ~allFcsV & allMacD), sum(sel & ~allMacD));
         end
     end
     fprintf(['    ※あるフォーマットで FCS検証OK が 0 件の場合、そのフォーマットの\n', ...
-             '      データ復号が成立していない (受信SNR不足、または変調パラメータの\n', ...
-             '      推定ミス) ことを示す。\n']);
+             '      データ復号が成立していない (受信品質不足、または変調パラメータの\n', ...
+             '      推定ミス) ことを示す。原因の切り分けは上の\n', ...
+             '      [VHT データ部の品質診断] を参照。CSI 自体はプリアンブルから\n', ...
+             '      求めているため、この結果に関わらず有効である。\n']);
 end
 
 if stats.errors > 0
@@ -856,8 +1016,11 @@ else
     end
     fprintf(['  ※SSID 欄が空 = Beacon を出していない送信元。PicoScenes の\n', ...
              '    injector はここに現れる。件数が突出していれば注入源。\n', ...
-             '  ※MAC ヘッダまで読めたパケットのみを集計している。複数空間\n', ...
-             '    ストリームのパケットは SISO 受信では復号できず現れない。\n']);
+             '  ※"(PHY:VHT-MCSn)" は MAC を復号できなかったパケットを PHY 設定\n', ...
+             '    ごとにまとめた擬似的な送信元 (keepPHYOnlyCSI = true のとき)。\n', ...
+             '    送信元 MAC は分からないが CSI は有効で、平均間隔が --delay と\n', ...
+             '    一致していれば注入トラフィックそのものである。\n', ...
+             '  ※複数空間ストリームのパケットは SISO 受信では復号できず現れない。\n']);
 end
 
 % --- 対象の決定 ----------------------------------------------------------
@@ -895,6 +1058,16 @@ if isempty(targetTxAddress)
         % Beacon を出している = AP なので注入源ではない。件数が同じなら
         % SSID を持たない方を優先する。
         score = n * 2 + double(isempty(txCensus(k).ssid));
+
+        % 送信間隔が --delay と一致していれば注入源である強い証拠なので
+        % 大きく優先する。偶然の一致を避けるため件数が少ないものは除く。
+        if expectedIntervalUs > 0 && n >= 10 && ~isnan(txCensus(k).medianIntervalUs)
+            relErr = abs(txCensus(k).medianIntervalUs - expectedIntervalUs) / expectedIntervalUs;
+            if relErr < 0.10
+                score = score * 10;
+            end
+        end
+
         if score > bestScore
             bestScore = score;
             bestAddr  = addr;
@@ -959,11 +1132,13 @@ if isempty(matched)
     allTimeSec   = [];
     allFrameType = {};
     allFcs       = logical([]);
+    allMacOK     = logical([]);
 else
     allFormats   = {matched.phyFormat}.';
     allTimeSec   = [matched.timeSec].';
     allFrameType = {matched.frameType}.';
     allFcs       = logical([matched.fcsVerified]).';
+    allMacOK     = logical([matched.macDecoded]).';
 end
 
 isNonHT = strcmpi(allFormats, 'Non-HT');
@@ -974,16 +1149,19 @@ csiNonHT       = stackCSI(matched(isNonHT));
 timeSecNonHT   = allTimeSec(isNonHT);
 frameTypeNonHT = allFrameType(isNonHT);
 fcsNonHT       = allFcs(isNonHT);
+macDecodedNonHT = allMacOK(isNonHT);
 
 csiHT       = stackCSI(matched(isHT));
 timeSecHT   = allTimeSec(isHT);
 frameTypeHT = allFrameType(isHT);
 fcsHT       = allFcs(isHT);
+macDecodedHT = allMacOK(isHT);
 
 csiVHT       = stackCSI(matched(isVHT));
 timeSecVHT   = allTimeSec(isVHT);
 frameTypeVHT = allFrameType(isVHT);
 fcsVHT       = allFcs(isVHT);
+macDecodedVHT = allMacOK(isVHT);
 
 if ~isempty(matched)
     fprintf('  内訳: Non-HT=%d, HT=%d, VHT=%d\n', ...
@@ -991,11 +1169,20 @@ if ~isempty(matched)
     totalMPDU = sum([matched.mpduCount]);
     fprintf('  PPDU(電波上の送信単位)数=%d に対し、集約されたMPDU(データ単位)の合計=%d\n', ...
         numel(matched), totalMPDU);
-    nUnverified = sum(~allFcs);
+    nPhyOnly    = sum(~allMacOK);
+    nUnverified = sum(~allFcs & allMacOK);
     if nUnverified > 0
         fprintf(['  ※うち %d 件は FCS 未検証 (ペイロードにビット誤りがあり、\n', ...
-                 '    MAC ヘッダのみから送信元を判定したもの)。CSI 自体は\n', ...
-                 '    プリアンブルから算出しており影響を受けません。\n'], nUnverified);
+                 '    MAC ヘッダのみから送信元を判定したもの)。\n'], nUnverified);
+    end
+    if nPhyOnly > 0
+        fprintf(['  ※うち %d 件は MAC を復号できず、PHY 設定 (フォーマット/MCS/\n', ...
+                 '    20MHz/NSTS=1) と送信間隔だけで注入トラフィックと判断したもの。\n'], ...
+                 nPhyOnly);
+    end
+    if nUnverified > 0 || nPhyOnly > 0
+        fprintf(['    いずれも CSI 自体はプリアンブル (VHT-LTF) から算出しており\n', ...
+                 '    影響を受けません。\n']);
     end
 end
 
@@ -1011,6 +1198,7 @@ subcSets   = {subcarrierIndicesNonHT, subcarrierIndicesHT20, subcarrierIndicesVH
 timeSets   = {timeSecNonHT, timeSecHT, timeSecVHT};
 frameSets  = {frameTypeNonHT, frameTypeHT, frameTypeVHT};
 fcsSets    = {fcsNonHT, fcsHT, fcsVHT};
+macSets    = {macDecodedNonHT, macDecodedHT, macDecodedVHT};
 
 primaryFormat     = formatNames{bestIdx};
 csi               = csiSets{bestIdx};
@@ -1018,6 +1206,7 @@ subcarrierIndices = subcSets{bestIdx};
 timeSec           = timeSets{bestIdx};
 frameType         = frameSets{bestIdx};
 fcsVerified       = fcsSets{bestIdx};
+macDecoded        = macSets{bestIdx};
 phyFormat         = repmat({primaryFormat}, size(csi, 1), 1);
 
 % ResultCSI.m は packetStartIndex と sampleRate から時間軸を作る
@@ -1033,12 +1222,14 @@ end
 %  ------------------------------------------------------------------------
 % 変数名は ResultCSI.m と揃えて csiMeta とする
 csiMeta = struct();
-csiMeta.description      = 'CSI filtered by target SSID (Non-HT / HT(NSS=1,20MHz) / SU-VHT(NSTS=1,20MHz))';
+csiMeta.description      = ['CSI filtered by target transmitter / PHY parameters ', ...
+    '(Non-HT / HT(NSS=1,20MHz) / SU-VHT(NSTS=1,20MHz))'];
 csiMeta.decoder          = 'decodeIQ_VHT_Pico.m';   % どの復号器で作ったか
 csiMeta.targetTxAddress  = targetTxAddress;   % 選別に使った送信元
 csiMeta.targetFormats    = targetFormats;
 csiMeta.targetMCS        = targetMCS;
 csiMeta.expectedIntervalUs = expectedIntervalUs;
+csiMeta.keepPHYOnlyCSI   = keepPHYOnlyCSI;   % MAC 不明でも CSI を残したか
 csiMeta.primaryFormat    = primaryFormat;   % 変数 csi がどの形式か
 csiMeta.centerFrequency  = centerFrequency;
 csiMeta.sampleRate       = sampleRate;
@@ -1050,6 +1241,20 @@ csiMeta.serialNum        = usrpSerialNum;
 csiMeta.pktDetThreshold  = pktDetThreshold;
 csiMeta.overrunCount     = overrunCount;
 csiMeta.decodeStats      = stats;
+
+% VHT データ部の受信品質 (FCS が通らない原因の切り分け用。診断専用)
+if nVhtQual > 0
+    csiMeta.vhtQuality = struct( ...
+        'nPackets',    nVhtQual, ...
+        'snrdBMedian', median(vhtQual.snrdB(1:nVhtQual),  'omitnan'), ...
+        'evmPctMedian', median(vhtQual.evmPct(1:nVhtQual), 'omitnan'), ...
+        'peakAmpMedian', median(vhtQual.peak(1:nVhtQual),  'omitnan'), ...
+        'peakAmpOver095Pct', mean(vhtQual.peak(1:nVhtQual) > 0.95) * 100, ...
+        'sigbCRCOK',   vhtSigBOK, ...
+        'sigbCRCFail', vhtSigBNG);
+else
+    csiMeta.vhtQuality = struct([]);
+end
 csiMeta.captureDatetime  = timestamp;         % キャプチャ時刻
 csiMeta.decodeDatetime   = datestr(now, 'yyyymmddHHMM');   % 復号を行った時刻
 csiMeta.sourceRawFile    = inputRawFile;      % どの生IQから作られたか
@@ -1063,10 +1268,10 @@ targetBSSIDOut = '';          %#ok<NASGU>
 
 saveVars = { ...
     'csi', 'subcarrierIndices', 'packetStartIndex', 'csiMeta', ...
-    'phyFormat', 'fcsVerified', 'timeSec', 'frameType', ...
-    'csiNonHT', 'timeSecNonHT', 'frameTypeNonHT', 'fcsNonHT', ...
-    'csiHT', 'timeSecHT', 'frameTypeHT', 'fcsHT', ...
-    'csiVHT', 'timeSecVHT', 'frameTypeVHT', 'fcsVHT', ...
+    'phyFormat', 'fcsVerified', 'macDecoded', 'timeSec', 'frameType', ...
+    'csiNonHT', 'timeSecNonHT', 'frameTypeNonHT', 'fcsNonHT', 'macDecodedNonHT', ...
+    'csiHT', 'timeSecHT', 'frameTypeHT', 'fcsHT', 'macDecodedHT', ...
+    'csiVHT', 'timeSecVHT', 'frameTypeVHT', 'fcsVHT', 'macDecodedVHT', ...
     'subcarrierIndicesNonHT', 'subcarrierIndicesHT20', 'subcarrierIndicesVHT20', ...
     'targetSSIDOut', 'targetBSSIDOut', 'targetTxAddressOut', ...
     'seenNetworks', 'txCensus'};
@@ -1154,8 +1359,11 @@ function nSamples = ppduSamplesFromLSIG(pkt, chanEst, noiseEst, chanBW)
     end
 end
 
-function rxPSDU = htVhtDataRecover(recoverFcn, rxData, chanEst, noiseEst, cfg)
+function varargout = htVhtDataRecover(recoverFcn, rxData, chanEst, noiseEst, cfg)
     % wlanHTDataRecover / wlanVHTDataRecover を LDPC 早期終了つきで呼ぶ。
+    %
+    % 出力は呼び出し側が要求した数だけそのまま中継する。2番目以降の意味は
+    % 関数によって異なる (wlanVHTDataRecover なら SIG-B CRC・等化後信号点)。
     %
     % 早期終了はパリティ検査が全て通った時点で反復を打ち切る。その時点で
     % 既に有効な符号語になっているため、追加の反復は出力を変えない。
@@ -1169,9 +1377,10 @@ function rxPSDU = htVhtDataRecover(recoverFcn, rxData, chanEst, noiseEst, cfg)
         useEarlyTermination = true;
     end
 
+    nOut = max(nargout, 1);
     if useEarlyTermination
         try
-            rxPSDU = recoverFcn(rxData, chanEst, noiseEst, cfg, ...
+            [varargout{1:nOut}] = recoverFcn(rxData, chanEst, noiseEst, cfg, ...
                 'EarlyTermination', true);
             return;
         catch
@@ -1179,7 +1388,101 @@ function rxPSDU = htVhtDataRecover(recoverFcn, rxData, chanEst, noiseEst, cfg)
             useEarlyTermination = false;
         end
     end
-    rxPSDU = recoverFcn(rxData, chanEst, noiseEst, cfg);
+    [varargout{1:nOut}] = recoverFcn(rxData, chanEst, noiseEst, cfg);
+end
+
+function [rxPSDU, sigbCRCFail, eqSym] = vhtDataRecoverWithDiag(rxData, chanEst, noiseEst, cfg)
+    % wlanVHTDataRecover を診断用の追加出力つきで呼ぶ。
+    %   2番目: SERVICE フィールド内の VHT-SIG-B CRC の検査結果
+    %   3番目: 等化後の信号点 (EVM の算出に使う)
+    % これらを返さない MATLAB バージョンでも動くよう、一度だけ試して結果を
+    % 憶えておき、以後は余計な呼び出しをしない。
+    persistent hasDiagOutputs
+    if isempty(hasDiagOutputs)
+        % まず宣言されている出力数で判定し、それが取れない場合は
+        % 実際に呼んでみて確かめる (下の try/catch)。
+        try
+            nOutDeclared  = nargout('wlanVHTDataRecover');
+            hasDiagOutputs = (nOutDeclared < 0) || (nOutDeclared >= 3);
+        catch
+            hasDiagOutputs = true;
+        end
+    end
+
+    sigbCRCFail = [];
+    eqSym       = [];
+    if hasDiagOutputs
+        try
+            [rxPSDU, sigbCRCFail, eqSym] = htVhtDataRecover(@wlanVHTDataRecover, ...
+                rxData, chanEst, noiseEst, cfg);
+            return;
+        catch
+            hasDiagOutputs = false;
+            sigbCRCFail = [];
+            eqSym       = [];
+        end
+    end
+    rxPSDU = htVhtDataRecover(@wlanVHTDataRecover, rxData, chanEst, noiseEst, cfg);
+end
+
+function info = measureVHTQuality(info, pktSeg, lltfChanEst, noiseEst, eqSym, sigbCRCFail, mcs)
+    % VHT パケットの受信品質を測る (診断専用。復号結果には影響しない)。
+    %
+    %   snrdB   : L-LTF から求めた受信SNR。プリアンブルから見た品質。
+    %   evmPct  : 等化後の信号点と理想信号点の誤差 (EVM)。SNR が高いのに
+    %             EVM が悪ければ、雑音ではなく歪みが原因 (ADC 飽和・
+    %             送信側の非線形・強い隣接波など) だと分かる。
+    %   peakAmp : パケット区間の振幅ピーク。comm.SDRuReceiver の double 出力
+    %             は ±1.0 がフルスケールなので、1.0 付近に張り付いていれば
+    %             飽和している。
+    %   sigbCRC : SERVICE フィールドに埋め込まれた VHT-SIG-B CRC の結果。
+    %             1=OK / 0=NG / -1=不明。OK なら「データ部の先頭16bitは
+    %             正しく復号できている」= スクランブラや符号化パラメータの
+    %             推定は合っており、残りは純粋なビット誤りだと切り分けられる。
+    try
+        if ~isempty(lltfChanEst) && noiseEst > 0
+            info.snrdB = 10 * log10(mean(abs(lltfChanEst(:)).^2) / noiseEst);
+        end
+        if ~isempty(pktSeg)
+            info.peakAmp = max(max(abs(real(pktSeg))), max(abs(imag(pktSeg))));
+        end
+        if ~isempty(eqSym)
+            info.evmPct = evmFromEqSym(eqSym, mcs);
+        end
+        if ~isempty(sigbCRCFail)
+            info.sigbCRC = double(~logical(sigbCRCFail(1)));
+        end
+        info.hasQuality = ~isnan(info.snrdB) || ~isnan(info.evmPct);
+    catch
+        % 診断に失敗しても復号は続ける
+    end
+end
+
+function evmPct = evmFromEqSym(eqSym, mcs)
+    % 等化後の信号点から EVM [%] を求める。
+    % 参照点は「最も近い理想信号点」とする (判定誤りを含むので EVM が非常に
+    % 悪い領域では過小評価になるが、良否の判断には十分)。
+    evmPct = NaN;
+    modOrders = [2 4 4 16 16 64 64 64 256 256];   % VHT MCS0..MCS9 の変調多値数
+    if isempty(eqSym) || mcs < 0 || mcs > 9
+        return;
+    end
+    M = modOrders(mcs + 1);
+    if M == 2
+        ref = [-1; 1];
+    else
+        ref = qammod((0:M-1).', M, 'UnitAveragePower', true);
+    end
+    sym = eqSym(:);
+    if numel(sym) > 4096
+        sym = sym(1:4096);   % 診断用なので先頭だけで十分
+    end
+    [~, idx] = min(abs(sym - ref.'), [], 2);
+    pErr = mean(abs(sym - ref(idx)).^2);
+    pRef = mean(abs(ref).^2);   % UnitAveragePower なので 1
+    if pRef > 0
+        evmPct = 100 * sqrt(pErr / pRef);
+    end
 end
 
 function y = applyCFO(x, fs, cfoHz)
@@ -1380,17 +1683,27 @@ function out = parseHTSIGBits(bits)
     out.isValid = true;
 end
 
-function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst, chanBW)
+function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst, chanBW, keepPHYOnly)
     % SU-VHT (802.11ac, NSTS=1, 20MHz) パケットを復号する。
-    %   status: 1=成功, 0=失敗/非対応, -1=サンプル不足
-    %   info:   診断用 (棄却理由・観測された帯域幅/NSTS/MCS)
+    %   status: 1=成功(entryあり), 0=失敗/非対応, -1=サンプル不足
+    %   info:   診断用 (棄却理由・観測された帯域幅/NSTS/MCS・受信品質)
+    %
+    % keepPHYOnly = true のとき、MPDU (MAC) を復号できなくても PHY の構成が
+    % 対応範囲内 (SU / 20MHz / NSTS=1) であれば CSI を残す。CSI は VHT-LTF
+    % から求めており MPDU 復号の成否とは無関係なため、「SIG は読めるのに
+    % FCS が通らない」状態でも CSI そのものは有効である。
+    if nargin < 5
+        keepPHYOnly = false;
+    end
     entry = [];
     consumed = 560;   % L-STF..VHT-SIG-A
     info = struct('reason', '', 'bwMHz', 0, 'nsts', 0, 'mcs', 0, ...
         'reservedOK', false, 'gi', 0, 'coding', 0, 'lsigLen', 0, 'nsym', 0, ...
         'apepFromLSIG', 0, 'apepFromSIGB', 0, 'apepUsed', 0, ...
         'mpduCount', 0, 'deagStatus', '', ...
-        'nonBinary', false, 'dataClass', '', 'dataRange', [0 0]);
+        'nonBinary', false, 'dataClass', '', 'dataRange', [0 0], ...
+        'csiKept', false, 'hasQuality', false, 'snrdB', NaN, 'evmPct', NaN, ...
+        'peakAmp', NaN, 'sigbCRC', -1);
 
     % [高速化2] L-SIG を先に復号し、PPDU 全長を求めておく。
     %   NSTS>=2 などで棄却する場合も含め、どの段階で失敗しても探索位置を
@@ -1561,8 +1874,16 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
 
     % [高速化4] LDPC は早期終了を有効にする (出力は変わらない。詳細は
     %   htVhtDataRecover のコメントを参照)
-    rxPSDU = htVhtDataRecover(@wlanVHTDataRecover, ...
+    %
+    % wlanVHTDataRecover の 2番目の出力は SERVICE フィールドに埋め込まれた
+    % VHT-SIG-B CRC の検査結果、3番目は等化後の信号点。どちらも「データ部の
+    % 復号が成立しているか」を判断する材料になるので受け取っておく。
+    [rxPSDU, sigbCRCFail, eqSym] = vhtDataRecoverWithDiag( ...
         pkt(ind.VHTData(1):ind.VHTData(2)), vhtChanEst, noiseEst, cfgVHT);
+
+    % --- 受信品質の測定 (SIG は読めるのに FCS が通らない原因の切り分け) ---
+    info = measureVHTQuality(info, pkt(1:ind.VHTData(2)), lltfChanEst, noiseEst, ...
+        eqSym, sigbCRCFail, vhtA.mcs);
 
     % --- VHT の PSDU は A-MPDU なので分解してから MPDU を復号 ---
     [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgVHT);
@@ -1574,7 +1895,16 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     if ~ok
         info.reason = sprintf('MPDU復号失敗(分解=%s,MPDU数=%d)', ...
             deagInfo.status, deagInfo.mpduCount);
-        status = 0;
+        if ~keepPHYOnly
+            status = 0;
+            return;
+        end
+        % MAC は読めなかったが PHY 構成は対応範囲内。CSI は VHT-LTF から
+        % 求めており MPDU 復号の成否と無関係なので、擬似アドレスの下に残す。
+        info.csiKept = true;
+        entry = buildPHYOnlyEntry('VHT', vhtChanEst, vhtA.mcs);
+        entry.mpduCount = max(deagInfo.mpduCount, 1);
+        status = 1;
         return;
     end
 
@@ -1844,8 +2174,41 @@ function entry = buildEntry(cfgMAC, payload, phyFormat, chanEst, mcs)
         'phyFormat',   phyFormat, ...
         'mcs',         mcs, ...          % 注入トラフィックの選別に使う
         'fcsVerified', true, ...         % HT/VHT のヘッダのみ復号時は呼び出し側で false
+        'macDecoded',  true, ...         % MAC ヘッダまで読めた
         'mpduCount',   1, ...            % 集約されている場合は呼び出し側で上書き
         'csi',         chanEst(:).');
+end
+
+function entry = buildPHYOnlyEntry(phyFormat, chanEst, mcs)
+    % MAC を復号できなかったパケット用の記録を作る。
+    %
+    % CSI (chanEst) は VHT-LTF から求めたものであり、MPDU 復号の成否とは
+    % 無関係に有効である。送信元 MAC は分からないので、PHY パラメータから
+    % 作った擬似アドレスを bssid に入れて「同じ PHY 設定で送っている送信元」
+    % としてまとめる。PicoScenes の injector は PHY 設定を固定して送るため、
+    % このグループがそのまま注入トラフィックに対応する。
+    %
+    % 擬似アドレスに MCS を含めるのは、周囲の AP の VHT トラフィック
+    % (MCS がばらつく) と注入分 (MCS 固定) を分けるため。
+    entry = struct( ...
+        'timeSec',     0, ...
+        'bssid',       phyOnlyAddress(phyFormat, mcs), ...
+        'addr1',       '', ...
+        'frameType',   '(MAC復号不可)', ...
+        'ssid',        '', ...
+        'phyFormat',   phyFormat, ...
+        'mcs',         mcs, ...
+        'fcsVerified', false, ...
+        'macDecoded',  false, ...
+        'mpduCount',   1, ...
+        'csi',         chanEst(:).');
+end
+
+function addr = phyOnlyAddress(phyFormat, mcs)
+    % MAC 不明のパケットをまとめる擬似アドレス。
+    % targetTxAddress にこの文字列をそのまま指定すれば、明示的に
+    % 「MAC は読めないが PHY が一致するパケット」だけを選べる。
+    addr = sprintf('(PHY:%s-MCS%d)', phyFormat, mcs);
 end
 
 function ssidStr = extractSSID(cfgMAC, payload)
