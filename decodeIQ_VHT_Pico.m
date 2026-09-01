@@ -1553,23 +1553,49 @@ function info = measureVHTQuality(info, pktSeg, lltfChanEst, noiseEst, eqSym, cp
     %             大きいと、パケット内で位相がシンボルごとにずれていき
     %             値が大きくなる。大きいのに EVM も悪ければ、雑音ではなく
     %             周波数・タイミング推定側の問題を疑う材料になる。
+    % 各項目を個別の try/catch にしているのは、どれか1つ (特に eqSym/cpe の
+    % 形式は MATLAB バージョンや構成によって変わりうる) が例外を出しても、
+    % 他の項目 (特に snrdB。ここが取れないと [VHT データ部の品質診断] の
+    % セクション自体が丸ごと表示されなくなる) を道連れにしないため。
+    % 以前の版はこれを1つの try/catch にまとめており、EVM 計算だけが失敗
+    % した場合でも hasQuality が立たず診断全体が消えるという不具合があった。
+    persistent evmWarned cpeWarned
+    if isempty(evmWarned), evmWarned = false; end
+    if isempty(cpeWarned), cpeWarned = false; end
+
     try
         if ~isempty(lltfChanEst) && noiseEst > 0
             info.snrdB = 10 * log10(mean(abs(lltfChanEst(:)).^2) / noiseEst);
         end
+    catch
+    end
+    try
         if ~isempty(pktSeg)
             info.peakAmp = max(max(abs(real(pktSeg))), max(abs(imag(pktSeg))));
         end
+    catch
+    end
+    try
         if ~isempty(eqSym)
             info.evmPct = evmFromEqSym(eqSym, mcs);
         end
+    catch ME
+        if ~evmWarned
+            evmWarned = true;
+            fprintf('    <警告> EVM計算に失敗 (以後は表示のみ抑止): %s\n', ME.message);
+        end
+    end
+    try
         if ~isempty(cpe)
             info.cpeDeg = rad2deg(sqrt(mean(double(cpe(:)).^2)));
         end
-        info.hasQuality = ~isnan(info.snrdB) || ~isnan(info.evmPct);
-    catch
-        % 診断に失敗しても復号は続ける
+    catch ME
+        if ~cpeWarned
+            cpeWarned = true;
+            fprintf('    <警告> CPE計算に失敗 (以後は表示のみ抑止): %s\n', ME.message);
+        end
     end
+    info.hasQuality = ~isnan(info.snrdB) || ~isnan(info.evmPct);
 end
 
 function evmCeil = evmCeilingPct(mcs)
