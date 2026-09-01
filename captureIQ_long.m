@@ -24,9 +24,15 @@
 %    int16 は USRP が USB で送ってくる元のデータ形式 (sc16) そのものであり、
 %    ADC は 12bit なので情報は一切失われない。復号側で double に戻す。
 %
+%    ※OutputDataType に 'int16' は直接指定できない (有効なのは
+%      'Same as transport data type' / 'double' / 'single' の3つ)。
+%      転送形式 (sc16 = int16) に合わせるため
+%      'Same as transport data type' を指定し、実際に届いたデータの型は
+%      最初のフレームで判定して書き出し精度と倍率を決めている。
+%
 %  出力ファイル:
 %    [1] <hddSavePath>/<yyyymmddHHMM>_raw.bin
-%          I,Q を交互に並べた int16 のべた書き (I0,Q0,I1,Q1,...)
+%          I,Q を交互に並べたべた書き (I0,Q0,I1,Q1,...)。通常は int16。
 %          120 秒で約 9.6 GB
 %    [2] <hddSavePath>/<yyyymmddHHMM>_rawmeta.mat
 %          変数 meta … 取得条件・オーバーラン回数・書き込み統計
@@ -195,9 +201,12 @@ if isempty(usrpSerialNum)
         'usrpSerialNum を指定してください (findsdru の表示を参照)。');
 end
 
-% OutputDataType を int16 にするのがこのスクリプトの要点。
-% USRP が USB で送ってくる sc16 をそのまま受け取るので、変換コストも無く
-% 書き込み量が double の 1/4 で済む。
+% USRP が USB で送ってくる形式 (sc16 = 複素 int16) のまま受け取るのが
+% このスクリプトの要点。変換コストが無く、書き込み量が double の 1/4 で済む。
+%
+% 注意: OutputDataType に 'int16' は指定できない。指定できるのは
+%   'Same as transport data type' / 'double' / 'single' の3つで、
+%   転送形式に合わせるには 'Same as transport data type' を使う。
 rx = comm.SDRuReceiver( ...
     'Platform',            usrpPlatform, ...
     'SerialNum',           usrpSerialNum, ...
@@ -205,15 +214,23 @@ rx = comm.SDRuReceiver( ...
     'Gain',                gain, ...
     'MasterClockRate',     sampleRate * 2, ...
     'DecimationFactor',    2, ...
-    'OutputDataType',      'int16', ...
+    'OutputDataType',      'Same as transport data type', ...
     'SamplesPerFrame',     samplesPerFrame);
+
+% 転送形式を明示する。既定は sc16 (int16) だが、プロパティを持たない
+% バージョンもあるため失敗しても続行する。
+try
+    rx.TransportDataType = 'int16';
+catch
+    % 既定のまま使う。実際の型は最初のフレームを受けてから判定する。
+end
 
 fprintf('\n受信設定:\n');
 fprintf('  中心周波数      : %.4f GHz\n', centerFrequency / 1e9);
 fprintf('  サンプルレート  : %.3f MSps (帯域幅)\n', sampleRate / 1e6);
 fprintf('  ゲイン          : %d dB\n', gain);
 fprintf('  キャプチャ時間  : %.2f s\n', captureDuration);
-fprintf('  データ形式      : int16 (I,Q 交互)\n');
+fprintf('  データ形式      : 転送形式のまま (最初のフレームで判定)\n');
 fprintf('  保存先(.bin)    : %s\n', binFile);
 
 %% ------------------------------------------------------------------------
@@ -225,6 +242,13 @@ overrunCount         = 0;
 writeSecTotal        = 0;    % fwrite に費やした総時間
 writeSecMax          = 0;    % 1回の fwrite の最大時間
 nextReportSample     = sampleRate;   % 1秒ごとに進捗表示
+
+% 受信データの実際の型は最初のフレームを見て決める。
+% 'Same as transport data type' が何になるかは環境依存のため、
+% 型に応じて書き出し精度・1サンプルあたりのバイト数・double へ戻すときの
+% 倍率を切り替える。
+rawPrecision   = '';   % fwrite/fread に渡す精度
+rawScaleFactor = 1;    % double へ戻すときに掛ける倍率
 
 fidBin = fopen(binFile, 'w');
 if fidBin == -1
@@ -247,11 +271,43 @@ try
             overrunCount = overrunCount + 1;
         end
 
+        % --- 最初のフレームで実際のデータ型を判定する ---
+        if isempty(rawPrecision)
+            switch class(iqData)
+                case 'int16'
+                    rawPrecision = 'int16';  rawScaleFactor = 1/32768;
+                    bytesPerSample = 4;
+                case 'int8'
+                    rawPrecision = 'int8';   rawScaleFactor = 1/128;
+                    bytesPerSample = 2;
+                case 'single'
+                    rawPrecision = 'single'; rawScaleFactor = 1;
+                    bytesPerSample = 8;
+                case 'double'
+                    rawPrecision = 'double'; rawScaleFactor = 1;
+                    bytesPerSample = 16;
+                otherwise
+                    fclose(fidBin);
+                    release(rx);
+                    error('captureIQ_long:unsupportedType', ...
+                        '想定外のデータ型です: %s', class(iqData));
+            end
+            reqMBs = sampleRate * bytesPerSample / 1e6;
+            fprintf('  受信データ型    : %s (%d byte/sample, 必要書込速度 %.0f MB/s)\n', ...
+                rawPrecision, bytesPerSample, reqMBs);
+            if ~strcmp(rawPrecision, 'int16')
+                fprintf(['  ※int16 以外で受信しています。書き込み量が増えるため\n', ...
+                         '    オーバーランしやすくなります。想定サイズも\n', ...
+                         '    %.2f GB に変わります。\n'], ...
+                    captureDuration * sampleRate * bytesPerSample / 1e9);
+            end
+        end
+
         % [I0;Q0], [I1;Q1], ... の 2 x N 行列にする。fwrite は列優先で
         % 書き出すので、これで I,Q が交互に並んだべた書きになる。
         v = iqData(1:dataLen);
         writeTic = tic;
-        fwrite(fidBin, [real(v).'; imag(v).'], 'int16');
+        fwrite(fidBin, [real(v).'; imag(v).'], rawPrecision);
         wSec = toc(writeTic);
         writeSecTotal = writeSecTotal + wSec;
         if wSec > writeSecMax
@@ -285,6 +341,12 @@ elapsedCapture = toc(captureTic);
 release(rx);
 fclose(fidBin);
 
+if isempty(rawPrecision)
+    error('captureIQ_long:noSamples', ...
+        ['1フレームも受信できませんでした。USRP の接続と設定を確認してください。\n', ...
+         '生成された %s は空です。'], binFile);
+end
+
 fprintf('\nキャプチャ完了: %d サンプル, %.2f s\n', ...
     totalSamplesCaptured, elapsedCapture);
 fprintf('  オーバーラン    : %d 回\n', overrunCount);
@@ -307,18 +369,17 @@ end
 %% ------------------------------------------------------------------------
 %  5. メタデータの保存
 %  ------------------------------------------------------------------------
-% int16 の生値を complex double へ戻すときの倍率。
+% 生値を complex double へ戻すときの倍率 (型判定時に決めている)。
 % USRP の 'double' 出力はおおよそ ±1 に正規化されているので、それに合わせる。
 % 定数倍は CSI の相対値や復号結果には影響しないが、振幅の絶対値は
 % captureIQ.m で取ったデータとわずかに異なり得る点に注意。
-int16ScaleFactor = 1 / 32768;
-
 meta = struct();
-meta.description      = 'USRP B205 mini-i captured Wi-Fi IQ samples (5GHz ch36), int16 raw stream';
-meta.dataFormat       = 'int16 interleaved I,Q in .bin (I0,Q0,I1,Q1,...)';
+meta.description      = 'USRP B205 mini-i captured Wi-Fi IQ samples (5GHz ch36), raw interleaved stream';
+meta.dataFormat       = sprintf('%s interleaved I,Q in .bin (I0,Q0,I1,Q1,...)', rawPrecision);
 meta.binFile          = binFile;
+meta.rawPrecision     = rawPrecision;
+meta.rawScaleFactor   = rawScaleFactor;
 meta.bytesPerSample   = bytesPerSample;
-meta.int16ScaleFactor = int16ScaleFactor;
 meta.wifiChannel      = 36;
 meta.centerFrequency  = centerFrequency;        % [Hz]
 meta.sampleRate       = sampleRate;             % [Sps] = 帯域幅
@@ -365,8 +426,9 @@ if writeSegments
             startSample = (s - 1) * segSamples;
             nRead = min(segSamples, totalSamplesCaptured - startSample);
 
-            % 2 x nRead の int16 として読む (列が [I;Q] の組)
-            raw = fread(fidIn, [2, nRead], '*int16');
+            % 2 x nRead として読む (列が [I;Q] の組)。書き出したときと
+            % 同じ精度を指定する。
+            raw = fread(fidIn, [2, nRead], ['*' rawPrecision]);
             if isempty(raw)
                 break;
             end
@@ -374,8 +436,8 @@ if writeSegments
 
             % complex double へ変換 (WLAN Toolbox は double 前提)。
             % 実部・虚部を順に作って raw を早めに解放し、ピークを抑える。
-            re = double(raw(1, :)).' * int16ScaleFactor;
-            im = double(raw(2, :)).' * int16ScaleFactor;
+            re = double(raw(1, :)).' * rawScaleFactor;
+            im = double(raw(2, :)).' * rawScaleFactor;
             clear raw;
             iq = complex(re, im); %#ok<NASGU>
             clear re im;
