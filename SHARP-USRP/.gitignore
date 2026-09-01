@@ -1,0 +1,8 @@
+# 処理の途中生成物 (再生成できるためコミットしない)
+Python_code/input_files/*.mat
+Python_code/phase_processing/*.txt
+Python_code/phase_processing/*.json
+Python_code/processed_phase/**/*.mat
+
+__pycache__/
+*.pyc
