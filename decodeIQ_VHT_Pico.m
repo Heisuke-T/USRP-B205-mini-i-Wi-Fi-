@@ -475,13 +475,11 @@ stats = struct('detected', 0, 'timingSkip', 0, 'nonHT', 0, 'ht', 0, 'vht', 0, ..
 %   データ部 EVM         : 実際に復調した信号点の誤差。SNR が高いのに EVM が
 %                          悪ければ、雑音ではなく歪み (ADC 飽和など) が原因
 %   振幅ピーク           : 1.0 (正規化フルスケール) に張り付いていれば飽和
-%   SERVICE 内 SIG-B CRC : データ部の先頭16bitが正しく復号できているか
+%   共通位相誤差 (CPE)   : 残留CFO/SFOの指標。大きいとEVMも悪化する
 vhtQualMax = 20000;
 vhtQual = struct('snrdB', nan(vhtQualMax, 1), 'evmPct', nan(vhtQualMax, 1), ...
-    'peak', nan(vhtQualMax, 1), 'mcs', nan(vhtQualMax, 1));
+    'peak', nan(vhtQualMax, 1), 'mcs', nan(vhtQualMax, 1), 'cpeDeg', nan(vhtQualMax, 1));
 nVhtQual   = 0;
-vhtSigBOK  = 0;   % SERVICE 内の VHT-SIG-B CRC を通った件数
-vhtSigBNG  = 0;   % 同 失敗した件数
 errMsgs       = containers.Map('KeyType', 'char', 'ValueType', 'double');
 deagStatusCnt = containers.Map('KeyType', 'char', 'ValueType', 'double');
 nonBinaryShown = false;  % 非0/1データを検出した旨を一度だけ表示するためのフラグ
@@ -625,11 +623,7 @@ while searchOffset + minPreambleLen <= numel(iq)
                     vhtQual.evmPct(nVhtQual) = vhtInfo.evmPct;
                     vhtQual.peak(nVhtQual)   = vhtInfo.peakAmp;
                     vhtQual.mcs(nVhtQual)    = vhtInfo.mcs;
-                end
-                if vhtInfo.sigbCRC == 1
-                    vhtSigBOK = vhtSigBOK + 1;
-                elseif vhtInfo.sigbCRC == 0
-                    vhtSigBNG = vhtSigBNG + 1;
+                    vhtQual.cpeDeg(nVhtQual) = vhtInfo.cpeDeg;
                 end
 
                 if vhtInfo.bwMHz > 0
@@ -664,10 +658,9 @@ while searchOffset + minPreambleLen <= numel(iq)
                         vhtInfo.deagStatus, vhtInfo.mpduCount);
                     if vhtInfo.hasQuality
                         fprintf(['            品質: 受信SNR=%.1f dB データ部EVM=%.1f%% ', ...
-                                 '振幅ピーク=%.3f SERVICE内SIG-B_CRC=%s\n'], ...
+                                 '振幅ピーク=%.3f 共通位相誤差=%.1f度 採用APEP=%d\n'], ...
                             vhtInfo.snrdB, vhtInfo.evmPct, vhtInfo.peakAmp, ...
-                            ternary(vhtInfo.sigbCRC == 1, 'OK', ...
-                                ternary(vhtInfo.sigbCRC == 0, 'NG', '不明')));
+                            vhtInfo.cpeDeg, vhtInfo.apepUsed);
                     end
                 end
                 if ~isempty(vhtInfo.reason)
@@ -883,8 +876,9 @@ if stats.vht > 0
         end
         fprintf('    振幅ピーク          : %.3f  (フルスケール=1.0, >0.95 が %.1f%%)\n', ...
             peakMed, peakHi);
-        if vhtSigBOK + vhtSigBNG > 0
-            fprintf('    SERVICE内 SIG-B CRC : OK=%d / NG=%d\n', vhtSigBOK, vhtSigBNG);
+        cpeMed = median(vhtQual.cpeDeg(1:nVhtQual), 'omitnan');
+        if ~isnan(cpeMed)
+            fprintf('    共通位相誤差(CPE)   : %.1f 度  (残留CFO/SFOの目安。大きいほど劣化)\n', cpeMed);
         end
         if ~isnan(snrMed) && snrMed > 0
             % CSI の位相ばらつきの目安 (推定SNR gamma に対し標準偏差 ~ 1/sqrt(2*gamma))
@@ -1363,8 +1357,7 @@ if nVhtQual > 0
         'peakAmpOver095Pct', mean(vhtQual.peak(1:nVhtQual) > 0.95) * 100, ...
         'mcsMode',     mode(vhtQual.mcs(1:nVhtQual)), ...
         'requiredSNRdB', vhtRequiredSNRdB(mode(vhtQual.mcs(1:nVhtQual))), ...
-        'sigbCRCOK',   vhtSigBOK, ...
-        'sigbCRCFail', vhtSigBNG);
+        'cpeDegMedian', median(vhtQual.cpeDeg(1:nVhtQual), 'omitnan'));
 else
     csiMeta.vhtQuality = struct([]);
 end
@@ -1476,7 +1469,7 @@ function varargout = htVhtDataRecover(recoverFcn, rxData, chanEst, noiseEst, cfg
     % wlanHTDataRecover / wlanVHTDataRecover を LDPC 早期終了つきで呼ぶ。
     %
     % 出力は呼び出し側が要求した数だけそのまま中継する。2番目以降の意味は
-    % 関数によって異なる (wlanVHTDataRecover なら SIG-B CRC・等化後信号点)。
+    % 関数によって異なる (wlanVHTDataRecover なら 等化後信号点・共通位相誤差)。
     %
     % 早期終了はパリティ検査が全て通った時点で反復を打ち切る。その時点で
     % 既に有効な符号語になっているため、追加の反復は出力を変えない。
@@ -1504,10 +1497,17 @@ function varargout = htVhtDataRecover(recoverFcn, rxData, chanEst, noiseEst, cfg
     [varargout{1:nOut}] = recoverFcn(rxData, chanEst, noiseEst, cfg);
 end
 
-function [rxPSDU, sigbCRCFail, eqSym] = vhtDataRecoverWithDiag(rxData, chanEst, noiseEst, cfg)
+function [rxPSDU, eqSym, cpe] = vhtDataRecoverWithDiag(rxData, chanEst, noiseEst, cfg)
     % wlanVHTDataRecover を診断用の追加出力つきで呼ぶ。
-    %   2番目: SERVICE フィールド内の VHT-SIG-B CRC の検査結果
-    %   3番目: 等化後の信号点 (EVM の算出に使う)
+    % 実際の出力は [bits, eqSym, cpe] の順であり (MATLAB WLAN Toolbox の
+    % 仕様。以前の版では2番目の出力を「VHT-SIG-B CRC」と誤って解釈しており、
+    % 実際には存在しないその出力の代わりに eqSym (等化後の信号点) を、
+    % 3番目の cpe (Common Phase Error、シンボルごとの共通位相誤差 [rad]) を
+    % 誤って eqSym として EVM 計算に渡していた。この誤りにより、EVM は
+    % 実際にはシンボルではなく位相誤差の値を QAM 信号点と比較しており、
+    % 受信SNR によらず一定の値 (約25〜30%) に張り付いていた。
+    %   2番目: 等化後の信号点 eqSym (EVM の算出に使う)
+    %   3番目: シンボルごとの共通位相誤差 cpe [rad] (残留CFO/SFOの指標)
     % これらを返さない MATLAB バージョンでも動くよう、一度だけ試して結果を
     % 憶えておき、以後は余計な呼び出しをしない。
     persistent hasDiagOutputs
@@ -1522,23 +1522,23 @@ function [rxPSDU, sigbCRCFail, eqSym] = vhtDataRecoverWithDiag(rxData, chanEst, 
         end
     end
 
-    sigbCRCFail = [];
-    eqSym       = [];
+    eqSym = [];
+    cpe   = [];
     if hasDiagOutputs
         try
-            [rxPSDU, sigbCRCFail, eqSym] = htVhtDataRecover(@wlanVHTDataRecover, ...
+            [rxPSDU, eqSym, cpe] = htVhtDataRecover(@wlanVHTDataRecover, ...
                 rxData, chanEst, noiseEst, cfg);
             return;
         catch
             hasDiagOutputs = false;
-            sigbCRCFail = [];
-            eqSym       = [];
+            eqSym = [];
+            cpe   = [];
         end
     end
     rxPSDU = htVhtDataRecover(@wlanVHTDataRecover, rxData, chanEst, noiseEst, cfg);
 end
 
-function info = measureVHTQuality(info, pktSeg, lltfChanEst, noiseEst, eqSym, sigbCRCFail, mcs)
+function info = measureVHTQuality(info, pktSeg, lltfChanEst, noiseEst, eqSym, cpe, mcs)
     % VHT パケットの受信品質を測る (診断専用。復号結果には影響しない)。
     %
     %   snrdB   : L-LTF から求めた受信SNR。プリアンブルから見た品質。
@@ -1548,10 +1548,11 @@ function info = measureVHTQuality(info, pktSeg, lltfChanEst, noiseEst, eqSym, si
     %   peakAmp : パケット区間の振幅ピーク。comm.SDRuReceiver の double 出力
     %             は ±1.0 がフルスケールなので、1.0 付近に張り付いていれば
     %             飽和している。
-    %   sigbCRC : SERVICE フィールドに埋め込まれた VHT-SIG-B CRC の結果。
-    %             1=OK / 0=NG / -1=不明。OK なら「データ部の先頭16bitは
-    %             正しく復号できている」= スクランブラや符号化パラメータの
-    %             推定は合っており、残りは純粋なビット誤りだと切り分けられる。
+    %   cpeDeg  : シンボルごとの共通位相誤差 (Common Phase Error) の実効値
+    %             [度]。残留 CFO や SFO (サンプリング周波数オフセット) が
+    %             大きいと、パケット内で位相がシンボルごとにずれていき
+    %             値が大きくなる。大きいのに EVM も悪ければ、雑音ではなく
+    %             周波数・タイミング推定側の問題を疑う材料になる。
     try
         if ~isempty(lltfChanEst) && noiseEst > 0
             info.snrdB = 10 * log10(mean(abs(lltfChanEst(:)).^2) / noiseEst);
@@ -1562,8 +1563,8 @@ function info = measureVHTQuality(info, pktSeg, lltfChanEst, noiseEst, eqSym, si
         if ~isempty(eqSym)
             info.evmPct = evmFromEqSym(eqSym, mcs);
         end
-        if ~isempty(sigbCRCFail)
-            info.sigbCRC = double(~logical(sigbCRCFail(1)));
+        if ~isempty(cpe)
+            info.cpeDeg = rad2deg(sqrt(mean(double(cpe(:)).^2)));
         end
         info.hasQuality = ~isnan(info.snrdB) || ~isnan(info.evmPct);
     catch
@@ -1852,7 +1853,7 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
         'mpduCount', 0, 'deagStatus', '', ...
         'nonBinary', false, 'dataClass', '', 'dataRange', [0 0], ...
         'csiKept', false, 'hasQuality', false, 'snrdB', NaN, 'evmPct', NaN, ...
-        'peakAmp', NaN, 'sigbCRC', -1);
+        'peakAmp', NaN, 'cpeDeg', NaN);
 
     % [高速化2] L-SIG を先に復号し、PPDU 全長を求めておく。
     %   NSTS>=2 などで棄却する場合も含め、どの段階で失敗しても探索位置を
@@ -1984,8 +1985,15 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     catch
     end
 
-    % L-SIG 由来を優先し、駄目なら VHT-SIG-B 由来を使う
-    apepCandidates = [info.apepFromLSIG, info.apepFromSIGB];
+    % --- APEPLength の候補を両方とも実際に復号して試す ---
+    % L-SIG 由来 (RXTIME の丸めを含む概算値) と VHT-SIG-B 由来 (SU-VHT では
+    % 本来こちらが正確な値のはずだが、SIG-B はデータ部と同じ MCS で送られる
+    % ため低SNRでは化けうる) のどちらが正しいかは、実際に復号して MPDU の
+    % FCS が通るかを見るまで分からない。旧版は「バッファに収まる方を機械的に
+    % 採用する」だけで、どちらが正しいかを検証していなかった。
+    % CSI (vhtChanEst) は VHT-LTF から求めており、この候補選択より前に
+    % 確定しているため、複数回試しても CSI には影響しない。
+    apepCandidates = unique([info.apepFromLSIG, info.apepFromSIGB], 'stable');
     apepCandidates = apepCandidates(apepCandidates > 0);
     if isempty(apepCandidates)
         info.reason = 'パケット長を決定できず';
@@ -1993,7 +2001,7 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
         return;
     end
 
-    cfgVHT = [];
+    triedAny = false;
     for c = 1:numel(apepCandidates)
         try
             cfgTry = wlanVHTConfig('ChannelBandwidth', chanBW, ...
@@ -2001,18 +2009,40 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
                 'MCS', vhtA.mcs, 'APEPLength', apepCandidates(c), ...
                 'ChannelCoding', codingStr, 'GuardInterval', giStr);
             indTry = wlanFieldIndices(cfgTry);
-            if numel(pkt) >= indTry.VHTData(2)
-                cfgVHT = cfgTry;
-                ind = indTry;
-                info.apepUsed = apepCandidates(c);
-                break;
-            end
         catch
-            % この候補は不正。次の候補へ
+            continue;   % この候補は不正。次の候補へ
+        end
+        if numel(pkt) < indTry.VHTData(2)
+            continue;   % データがまだ揃っていない
+        end
+        triedAny = true;
+        info.apepUsed = apepCandidates(c);
+
+        % [高速化4] LDPC は早期終了を有効にする (出力は変わらない。詳細は
+        %   htVhtDataRecover のコメントを参照)
+        [rxPSDU, eqSym, cpe] = vhtDataRecoverWithDiag( ...
+            pkt(indTry.VHTData(1):indTry.VHTData(2)), vhtChanEst, noiseEst, cfgTry);
+
+        % --- 受信品質の測定 (SIG は読めるのに FCS が通らない原因の切り分け) ---
+        info = measureVHTQuality(info, pkt(1:indTry.VHTData(2)), lltfChanEst, noiseEst, ...
+            eqSym, cpe, vhtA.mcs);
+
+        % --- VHT の PSDU は A-MPDU なので分解してから MPDU を復号 ---
+        [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgTry);
+        cfgVHT = cfgTry;
+        ind    = indTry;
+        info.mpduCount  = deagInfo.mpduCount;
+        info.deagStatus = deagInfo.status;
+        info.nonBinary  = deagInfo.nonBinary;
+        info.dataClass  = deagInfo.dataClass;
+        info.dataRange  = deagInfo.dataRange;
+
+        if ok
+            break;   % FCS が通った。以降の候補は試さない
         end
     end
 
-    if isempty(cfgVHT)
+    if ~triedAny
         info.reason = sprintf('APEPLength不正/長さ不足(LSIG=%d,SIGB=%d)', ...
             info.apepFromLSIG, info.apepFromSIGB);
         status = -1;   % データがまだ揃っていない可能性もある
@@ -2021,26 +2051,6 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
 
     consumed = double(ind.VHTData(2));
 
-    % [高速化4] LDPC は早期終了を有効にする (出力は変わらない。詳細は
-    %   htVhtDataRecover のコメントを参照)
-    %
-    % wlanVHTDataRecover の 2番目の出力は SERVICE フィールドに埋め込まれた
-    % VHT-SIG-B CRC の検査結果、3番目は等化後の信号点。どちらも「データ部の
-    % 復号が成立しているか」を判断する材料になるので受け取っておく。
-    [rxPSDU, sigbCRCFail, eqSym] = vhtDataRecoverWithDiag( ...
-        pkt(ind.VHTData(1):ind.VHTData(2)), vhtChanEst, noiseEst, cfgVHT);
-
-    % --- 受信品質の測定 (SIG は読めるのに FCS が通らない原因の切り分け) ---
-    info = measureVHTQuality(info, pkt(1:ind.VHTData(2)), lltfChanEst, noiseEst, ...
-        eqSym, sigbCRCFail, vhtA.mcs);
-
-    % --- VHT の PSDU は A-MPDU なので分解してから MPDU を復号 ---
-    [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgVHT);
-    info.mpduCount  = deagInfo.mpduCount;
-    info.deagStatus = deagInfo.status;
-    info.nonBinary  = deagInfo.nonBinary;
-    info.dataClass  = deagInfo.dataClass;
-    info.dataRange  = deagInfo.dataRange;
     if ~ok
         info.reason = sprintf('MPDU復号失敗(分解=%s,MPDU数=%d)', ...
             deagInfo.status, deagInfo.mpduCount);
