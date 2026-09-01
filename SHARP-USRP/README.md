@@ -257,6 +257,10 @@ python3 Python_code/wifi_config.py   # 一覧を表示
 
 ## SHARP オリジナルからの変更点
 
+変更点の詳細（オリジナルのコードとの対比、変えていない部分の明示、
+数値の根拠）は **[CHANGES_FROM_SHARP.md](CHANGES_FROM_SHARP.md)** にまとめてある。
+以下はその要約。
+
 | 変更 | 理由 |
 |---|---|
 | FFT 長・Δf・ヌル配置を `wifi_config.py` に分離 | オリジナルは 80MHz 決め打ち (`F_frequency = 256`, `delete_idxs` 直書き) |
