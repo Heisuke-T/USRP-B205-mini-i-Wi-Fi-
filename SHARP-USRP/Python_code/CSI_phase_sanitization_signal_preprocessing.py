@@ -83,6 +83,14 @@ def process_file(exp_dir, name, out_dir, n_ss, n_core, start_idx,
             f'{name}: csi_buff の列数 {csi_buff.shape[1]} が '
             f'{cfg.name} の FFT 長 {cfg.fft_size} と一致しません。')
 
+    # パケット取得時刻。Doppler 解析で実際のサンプリング間隔を使うため、
+    # CSI と同じ間引き・切り出しを施して最後まで持ち回る。
+    time_all = None
+    if 'time_sec' in contents:
+        t = np.asarray(contents['time_sec'], dtype=float).ravel()
+        if t.size == csi_buff.shape[0]:
+            time_all = t
+
     # FFT 順 -> 中心寄せ順 (index i がサブキャリア i - FFT長/2 に対応)
     csi_buff = np.fft.fftshift(csi_buff, axes=1)
 
@@ -90,6 +98,8 @@ def process_file(exp_dir, name, out_dir, n_ss, n_core, start_idx,
     delete_idxs = np.argwhere(np.sum(np.abs(csi_buff), axis=1) == 0)[:, 0]
     if delete_idxs.size:
         csi_buff = np.delete(csi_buff, delete_idxs, axis=0)
+        if time_all is not None:
+            time_all = np.delete(time_all, delete_idxs, axis=0)
         print(f'  空パケットを {delete_idxs.size} 件除外')
 
     n_tot = n_ss * n_core
@@ -101,10 +111,15 @@ def process_file(exp_dir, name, out_dir, n_ss, n_core, start_idx,
 
     n_time = n_pkt_per_stream - start_idx
     signal_complete = np.zeros((cfg.n_occupied, n_time, n_tot), dtype=complex)
+    time_complete = (np.zeros((n_time, n_tot))
+                     if time_all is not None else None)
 
     for stream in range(n_tot):
         # 複数ストリームの場合、パケットは行方向に交互配置されている
         signal_stream = csi_buff[stream::n_tot, :][start_idx:n_pkt_per_stream, :]
+        if time_complete is not None:
+            time_complete[:, stream] = \
+                time_all[stream::n_tot][start_idx:n_pkt_per_stream]
 
         if nexmon_sign_flip:
             # Nexmon CSI 固有の符号規約。USRP のデータでは不要。
@@ -124,6 +139,9 @@ def process_file(exp_dir, name, out_dir, n_ss, n_core, start_idx,
     os.makedirs(out_dir, exist_ok=True)
     with open(out_file, 'wb') as fp:
         pickle.dump(signal_complete, fp)
+
+    if time_complete is not None:
+        np.save(path.join(out_dir, 'time_' + name + '.npy'), time_complete)
 
     # 後段 (H 推定・再構成) が規格を引き継げるよう記録しておく
     save_meta(out_dir, name, config=cfg.name, n_ss=n_ss, n_core=n_core,

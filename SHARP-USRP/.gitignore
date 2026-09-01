@@ -2,7 +2,11 @@
 Python_code/input_files/*.mat
 Python_code/phase_processing/*.txt
 Python_code/phase_processing/*.json
+Python_code/phase_processing/*.npy
 Python_code/processed_phase/**/*.mat
+Python_code/doppler_traces/**/*.txt
+Python_code/doppler_traces/**/*.json
+Python_code/plots/**/*.png
 
 __pycache__/
 *.pyc

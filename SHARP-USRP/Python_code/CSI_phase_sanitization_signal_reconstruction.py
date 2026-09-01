@@ -85,10 +85,39 @@ def unwrap_and_detrend(H_est):
     return phase_before
 
 
+def _sliced_time(exp_dir, base, stream_str, start_idx, end_idx):
+    """前処理が保存したパケット時刻に、後段と同じ切り出しを適用する。
+
+    手順2 が [start_r:end_r] を、手順3 が [start_idx : 末尾-end_idx] を
+    切り出しているため、同じ順序で適用しないと時刻がずれる。
+    """
+    time_file = path.join(exp_dir, 'time_' + base + '.npy')
+    if not path.exists(time_file):
+        return None
+    try:
+        stream = int(stream_str)
+    except ValueError:
+        return None
+
+    time_all = np.load(time_file)          # [パケット x ストリーム]
+    if stream >= time_all.shape[1]:
+        return None
+    t = time_all[:, stream]
+
+    meta = load_meta(exp_dir, base)
+    start_r = int(meta.get('start_r', 0))
+    end_r = meta.get('end_r', -1)
+    end_r = t.size if end_r in (-1, None) else min(int(end_r), t.size)
+    t = t[start_r:end_r]
+
+    return t[start_idx:t.size - end_idx]
+
+
 def reconstruct_file(tr_name, exp_dir, save_dir, cfg, start_idx, end_idx,
                      label=None, overwrite=False, verbose=True):
     # tr_name は 'Tr_vector_<name>_stream_<s>' 形式
     stem = tr_name[len('Tr_vector_'):]
+    base, _, stream_str = stem.rpartition('_stream_')
     out_name = stem + '.mat'
 
     subdir = save_dir if label is None else path.join(save_dir, label)
@@ -122,8 +151,19 @@ def reconstruct_file(tr_name, exp_dir, save_dir, cfg, start_idx, end_idx,
     # 位相
     csi_matrix_processed[:, :, 1] = unwrap_and_detrend(H_crop).T
 
+    mdic = {'csi_matrix_processed': csi_matrix_processed}
+
+    # Doppler 解析で実サンプリング間隔を使えるよう、同じ切り出しを適用した
+    # パケット時刻を一緒に保存する
+    time_vec = _sliced_time(exp_dir, base, stream_str, start_idx, end_idx)
+    if time_vec is not None and time_vec.size == n_time:
+        mdic['time_sec'] = time_vec
+    elif time_vec is not None:
+        print(f'  警告: 時刻ベクトルの長さ ({time_vec.size}) が '
+              f'パケット数 ({n_time}) と一致しないため保存しません')
+
     os.makedirs(subdir, exist_ok=True)
-    sio.savemat(out_path, {'csi_matrix_processed': csi_matrix_processed})
+    sio.savemat(out_path, mdic)
 
     if verbose:
         print(f'{stem}: {csi_matrix_processed.shape} '
