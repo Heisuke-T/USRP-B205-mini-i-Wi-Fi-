@@ -1649,7 +1649,11 @@ function evmPct = evmFromEqSym(eqSym, mcs)
     else
         ref = qammod((0:M-1).', M, 'UnitAveragePower', true);
     end
-    sym = eqSym(:);
+    % eqSym はビット精度シミュレーション設定などにより int/fi 型の複素数に
+    % なることがあり、その場合 MATLAB は複素数の整数演算をサポートしない
+    % ため以降の減算・べき乗でエラーになる。double へ明示的に変換しておく
+    % (cpe 側は既に double(cpe(:)) としており、同じ対策)。
+    sym = double(eqSym(:));
     if numel(sym) > 4096
         sym = sym(1:4096);   % 診断用なので先頭だけで十分
     end
