@@ -1,6 +1,49 @@
-%% decodeIQ_VHT.m
+%% decode_VHT_v2.m
 % =========================================================================
-%  [第2段] キャプチャ済み IQ をオフライン復号し、指定SSIDのCSIを記録する
+%  [第2段・高速版] キャプチャ済み IQ をオフライン復号し、指定SSIDのCSIを記録
+% -------------------------------------------------------------------------
+%  decodeIQ_VHT.m と同じ結果を、大幅に短い時間で得ることを目的とした版。
+%  復号アルゴリズム自体は変更しておらず、出力される CSI は一致するはず。
+%  (検証方法は末尾の「decodeIQ_VHT.m との比較」を参照)
+%
+%  高速化の内容:
+%    [1] CFO 補正範囲の限定 (支配的な改善。約800倍)
+%        旧版は精CFO補正で iq(pktStart+1:end) と「バッファの残り全体」を
+%        切り出して複素指数を掛けていた。5秒キャプチャでは1パケットあたり
+%        最大1億サンプルの exp() を、しかも粗補正・精補正で2回、検出パケット
+%        1件ごとに実行していた。実際に使うのは高々パケット長分だけである。
+%        本版では 802.11 の最大 PPDU 長 (5.484ms = 109,680サンプル) を上限に
+%        切り出す。さらに粗CFO と精CFO を合算して1回で適用する
+%        (exp(-jθc)·exp(-jθf) = exp(-j(θc+θf)) なので結果は同一)。
+%
+%        旧版の所要時間が「パケット数 x バッファ長」に比例していた実測:
+%          0.5s/1249パケット →   165 s
+%          1.0s/2130パケット →   569 s
+%          5.0s/7968パケット → 12000 s   (キャプチャ長に対しほぼ二乗で悪化)
+%
+%    [2] 復号失敗時もパケット全長をスキップ
+%        旧版は復号に失敗すると探索位置を 560 サンプル(28us)しか進めず、
+%        同じパケットの本体を何度も再走査していた。OFDMデータ部は雑音に
+%        近い統計を持つため、そこで偽のプリアンブル検出が発生する
+%        (旧版の実測では HT-Greenfield 2969件・HT 309件、検出全体の41%)。
+%        本版は L-SIG から PPDU 全長を先に求め、以降どの段階で失敗しても
+%        その分だけ探索位置を進める。
+%
+%    [3] パケット検出窓の適応化
+%        wlanPacketDetect は最初の1件しか返さないため、窓が大きいほど
+%        「見つけた位置より後ろ」を無駄に走査する。密なら小さい窓、
+%        見つからなければ窓を倍々に広げる方式にした。
+%
+%    [4] LDPC の早期終了
+%        パリティ検査が全て通った時点で反復を打ち切る。既に有効な符号語に
+%        なっているため、追加の反復は結果を変えない (出力はビット単位で同一)。
+%        復号方式 (既定のベリーフ伝搬) は結果が変わり得るため変更しない。
+%
+%    [5] 細部
+%        - warning の抑止をループ外で一度だけ行う (状態の保存・復元は
+%          呼び出しコストが高く、パケットごとだと数万回に達する)
+%        - pktLog を事前確保 (逐次成長による O(n^2) のコピーを回避)
+%        - 既定でパケット毎の逐次表示を止める (verbosePackets)
 % -------------------------------------------------------------------------
 %  概要:
 %    captureIQ.m が HDD に保存した生 IQ を読み込み、WLAN Toolbox で
@@ -82,9 +125,26 @@
 %      どちらかが対象 BSSID と一致するかで行う (ダウンリンクは Address2、
 %      アップリンクは Address1 が BSSID になるため)。
 %
+%  decodeIQ_VHT.m との比較:
+%    高速化は「速いが結果が違う」では意味がないため、同じ *_raw.mat に
+%    対して両方を実行し、CSI が一致することを確認してから移行すること。
+%    出力ファイル名が同じになるので、片方は別フォルダへ保存するか、
+%    実行後にファイル名を変えておく。
+%
+%      A = load('..._CSI.mat');   % decodeIQ_VHT.m の出力
+%      B = load('..._CSI.mat');   % decode_VHT_v2.m の出力
+%      isequal(A.csiVHT,     B.csiVHT)       % CSI が完全一致するか
+%      isequal(A.csiNonHT,   B.csiNonHT)
+%      isequal(A.timeSecVHT, B.timeSecVHT)   % 検出位置も一致するか
+%
+%    ※[2] の「失敗時に全長スキップ」により、旧版が同一パケット内で
+%      重複検出していた偽パケットは本版では現れない。そのため
+%      csiMeta.decodeStats の検出数・HT-Greenfield 数などは一致しない。
+%      一致すべきなのは「正しく復号できたパケットの CSI」である。
+%
 %  処理時間の目安:
-%    実測でキャプチャ 1 秒あたり 300〜2400 秒 (電波の混雑度に強く依存)。
-%    混雑した環境での 5 秒キャプチャで約 3 時間20分を要した実績がある。
+%    旧版は混雑環境での 5 秒キャプチャに約 3 時間20分を要した。
+%    本版は数分程度を見込む (実測したら本コメントを更新すること)。
 % =========================================================================
 
 clear; clc;
@@ -124,6 +184,22 @@ pktDetThreshold = 0.5;          % wlanPacketDetect のしきい値 (0〜1)
                                  % 復号時間も伸びる
 verboseErrors   = false;        % true にすると復号エラーを毎回表示する
                                  % (通常は最後に集計のみ表示)
+verbosePackets  = false;         % true にすると復号できたパケットを1件ずつ表示。
+                                 % コマンドウィンドウへの出力は1件あたり数ms
+                                 % かかり、数千件では無視できないため既定で
+                                 % 止めている。保存される .mat の内容は同じ。
+
+% --- 高速化に関する内部パラメータ (通常は変更不要) -----------------------
+% 1パケットの処理に切り出すサンプル数の上限。
+% 802.11 の最大 PPDU 長は 5.484 ms = 109,680 サンプル @20MSps なので、
+% これを超える長さを要求するパケットは正規のものではない。
+maxPktSamples = 120000;
+
+% パケット検出窓。wlanPacketDetect は窓内の最初の1件しか返さないため、
+% 大きい窓はその後ろを無駄に走査することになる。密な区間では小さく、
+% 見つからなければ倍々に広げてループ回数を抑える。
+detectWindowMin = 40000;        % 2 ms 分
+detectWindowMax = 400000;       % 20 ms 分
 
 %% ------------------------------------------------------------------------
 %  2. 生IQファイルの読み込み
@@ -131,7 +207,7 @@ verboseErrors   = false;        % true にすると復号エラーを毎回表�
 if isempty(inputRawFile)
     listing = dir(fullfile(hddInputPath, '*_raw.mat'));
     if isempty(listing)
-        error('decodeIQ_VHT:noInputFile', ...
+        error('decode_VHT_v2:noInputFile', ...
             ['入力ファイルが見つかりません: %s\\*_raw.mat\n', ...
              '先に captureIQ.m を実行するか、inputRawFile にパスを指定してください。'], ...
             hddInputPath);
@@ -145,12 +221,12 @@ elseif isempty(fileparts(inputRawFile))
 end
 
 if ~isfile(inputRawFile)
-    error('decodeIQ_VHT:inputNotFound', '入力ファイルが存在しません: %s', inputRawFile);
+    error('decode_VHT_v2:inputNotFound', '入力ファイルが存在しません: %s', inputRawFile);
 end
 
 S = load(inputRawFile, 'iq', 'meta');
 if ~isfield(S, 'iq') || ~isfield(S, 'meta')
-    error('decodeIQ_VHT:badInputFile', ...
+    error('decode_VHT_v2:badInputFile', ...
         ['入力ファイルに変数 iq / meta がありません: %s\n', ...
          'captureIQ.m が出力した *_raw.mat を指定してください。'], inputRawFile);
 end
@@ -207,7 +283,7 @@ for k = 1:size(outTargets, 1)
         fprintf('%s 保存先フォルダが存在しないため作成します: %s\n', label, pth);
         [ok, msg] = mkdir(pth);
         if ~ok
-            warning('decodeIQ_VHT:mkdirFailed', ...
+            warning('decode_VHT_v2:mkdirFailed', ...
                 '%s 保存先フォルダを作成できませんでした (%s): %s', label, pth, msg);
             continue;
         end
@@ -216,7 +292,7 @@ for k = 1:size(outTargets, 1)
     testFile = fullfile(pth, '.write_test.tmp');
     fidTest  = fopen(testFile, 'w');
     if fidTest == -1
-        warning('decodeIQ_VHT:notWritable', ...
+        warning('decode_VHT_v2:notWritable', ...
             '%s 保存先に書き込みできないためスキップします: %s', label, pth);
         continue;
     end
@@ -227,7 +303,7 @@ for k = 1:size(outTargets, 1)
 end
 
 if isempty(outMatFiles)
-    error('decodeIQ_VHT:noWritableOutput', ...
+    error('decode_VHT_v2:noWritableOutput', ...
         ['書き込み可能な出力先がありません。\n', ...
          '  HDD: %s\n  USB: %s\n', ...
          'ドライブの接続とパスを確認してください。'], hddSavePath, usbSavePath);
@@ -245,8 +321,16 @@ subcarrierIndicesNonHT = [-26:-1, 1:26];    % Non-HT CBW20 (52本)
 subcarrierIndicesHT20  = [-26:-1, 1:26];    % HT     CBW20 (52本, Non-HTと同じ配置)
 subcarrierIndicesVHT20 = [-28:-1, 1:28];    % VHT    CBW20 (56本)
 
-pktLog = struct('timeSec', {}, 'bssid', {}, 'addr1', {}, 'frameType', {}, 'ssid', {}, ...
-    'phyFormat', {}, 'fcsVerified', {}, 'mpduCount', {}, 'csi', {});
+% pktLog は事前確保する。1件ずつ伸ばすと要素ごとに配列全体がコピーされ、
+% 件数の二乗に比例したコストになる (各要素が52〜56要素の複素CSIを持つため
+% 無視できない)。足りなくなったら倍々に伸ばし、最後に切り詰める。
+% フィールドの順序は buildEntry の返す構造体と一致させること
+% (順序が違うと構造体配列への代入でエラーになる)。
+pktLogTemplate = struct('timeSec', 0, 'bssid', '', 'addr1', '', 'frameType', '', ...
+    'ssid', '', 'phyFormat', '', 'fcsVerified', false, 'mpduCount', 0, 'csi', []);
+pktLog  = repmat(pktLogTemplate, 20000, 1);
+numPkts = 0;   % pktLog に実際に格納した件数
+
 bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
 
 % 復号統計 (診断用)
@@ -274,9 +358,15 @@ searchOffset = 0;
 fprintf('\nオフライン復号を開始します...\n');
 decodeTic = tic;
 
+% 警告の抑止はループの外で一度だけ行う。warning の状態保存・復元は
+% 呼び出しコストが高く、パケットごとに実行すると数万回に達して無視できない。
+% ※スクリプトが途中でエラー終了すると抑止が解除されないままになる。
+%   その場合は warning('on', 'all') を手で実行して戻すこと。
+wStateSaved = warning('off', 'all');
+
 % 検出は窓に区切って行う (毎回バッファ全体を走査すると非常に遅くなるため)。
 % 窓の境界にまたがるプリアンブルを取りこぼさないよう少し重ねて進める。
-detectWindow  = 400000;   % 20 ms 分
+detectWindow  = detectWindowMin;
 detectOverlap = 512;      % プリアンブル検出に必要な重なり
 
 while searchOffset + minPreambleLen <= numel(iq)
@@ -288,8 +378,11 @@ while searchOffset + minPreambleLen <= numel(iq)
             break;   % 末尾まで探索済み
         end
         searchOffset = winEnd - detectOverlap;
+        % 見つからなかった区間は疎とみなし、窓を広げてループ回数を抑える
+        detectWindow = min(detectWindow * 2, detectWindowMax);
         continue;
     end
+    detectWindow = detectWindowMin;   % 見つかったら密な区間として窓を戻す
     pktOffset = searchOffset + relOffset;   % 0-based の絶対位置
 
     if numel(iq) - pktOffset < minPreambleLen
@@ -319,9 +412,18 @@ while searchOffset + minPreambleLen <= numel(iq)
         end
 
         % --- 精CFO推定・補正 (L-LTF) ---
-        pkt     = applyCFO(iq(pktStart+1:end), sampleRate, -coarseCFO);
-        fineCFO = wlanFineCFOEstimate(pkt(161:320), chanBW);
-        pkt     = applyCFO(pkt, sampleRate, -fineCFO);
+        % [高速化1] このパケットの処理に必要な範囲だけを切り出す。
+        %   旧版は iq(pktStart+1:end) と残りバッファ全体を渡していたため、
+        %   1パケットあたり最大1億サンプルの複素指数を計算していた。
+        %   802.11 の最大 PPDU 長を超える分は決して使われない。
+        % 精CFO推定には L-LTF (161:320) までがあればよいので、まず先頭だけ
+        % 補正して推定し、粗CFO と合算して1回で全体に適用する。
+        %   exp(-j*theta_c) * exp(-j*theta_f) = exp(-j*(theta_c+theta_f))
+        % なので、2回に分けて掛ける旧版と結果は同一。
+        segEnd  = min(numel(iq), pktStart + maxPktSamples);
+        pre     = applyCFO(iq(pktStart + (1:320)), sampleRate, -coarseCFO);
+        fineCFO = wlanFineCFOEstimate(pre(161:320), chanBW);
+        pkt     = applyCFO(iq(pktStart+1:segEnd), sampleRate, -(coarseCFO + fineCFO));
 
         % --- L-LTF を復調してからチャネル推定・ノイズ推定 ---
         %     (wlanLLTFChannelEstimate は時間領域波形ではなく復調済み
@@ -331,10 +433,8 @@ while searchOffset + minPreambleLen <= numel(iq)
         noiseEst    = wlanLLTFNoiseEstimate(lltfDemod);
 
         % --- フォーマット検出 (L-SIG + 後続2シンボル) ---
-        %     内部の L-SIG チェック失敗警告は独自サマリで集計するため抑止する
-        wState = warning('off', 'all');
+        %     内部の L-SIG チェック失敗警告はループ外で抑止済み
         fmt = wlanFormatDetect(pkt(321:560), lltfChanEst, noiseEst, chanBW);
-        warning(wState);
         fmtStr = upper(string(fmt));
 
         switch true
@@ -436,16 +536,24 @@ while searchOffset + minPreambleLen <= numel(iq)
                 stats.noAddr2 = stats.noAddr2 + 1;
             else
                 entry.timeSec = pktStart / sampleRate;
-                pktLog(end+1) = entry; %#ok<SAGROW>
+
+                numPkts = numPkts + 1;
+                if numPkts > numel(pktLog)
+                    % 事前確保が尽きたら倍に伸ばす (毎回1件ずつ伸ばすより安い)
+                    pktLog = [pktLog; repmat(pktLogTemplate, numel(pktLog), 1)]; %#ok<AGROW>
+                end
+                pktLog(numPkts) = entry;
 
                 if any(strcmpi(entry.frameType, {'Beacon', 'Probe Response'})) && ~isempty(entry.ssid)
                     bssidToSSID(entry.bssid) = entry.ssid;
                 end
 
-                fprintf('  [%7.4fs] %-6s %-16s BSSID=%s%s%s\n', entry.timeSec, ...
-                    entry.phyFormat, entry.frameType, entry.bssid, ...
-                    ternary(~isempty(entry.ssid), sprintf('  SSID="%s"', entry.ssid), ''), ...
-                    ternary(entry.mpduCount > 1, sprintf('  (MPDU集約x%d)', entry.mpduCount), ''));
+                if verbosePackets
+                    fprintf('  [%7.4fs] %-6s %-16s BSSID=%s%s%s\n', entry.timeSec, ...
+                        entry.phyFormat, entry.frameType, entry.bssid, ...
+                        ternary(~isempty(entry.ssid), sprintf('  SSID="%s"', entry.ssid), ''), ...
+                        ternary(entry.mpduCount > 1, sprintf('  (MPDU集約x%d)', entry.mpduCount), ''));
+                end
             end
         end
 
@@ -460,11 +568,16 @@ while searchOffset + minPreambleLen <= numel(iq)
             errMsgs(key) = 1;
         end
         if verboseErrors
-            warning('decodeIQ_VHT:decodeError', 'パケット処理中にエラー: %s', ME.message);
+            % warning はループ外で抑止しているため fprintf で表示する
+            fprintf('  <エラー> パケット処理中にエラー: %s\n', ME.message);
         end
         searchOffset = nextSearch;
     end
 end
+
+% 警告の抑止を解除し、pktLog を実際の件数へ切り詰める
+warning(wStateSaved);
+pktLog = pktLog(1:numPkts);
 
 elapsedDecode = toc(decodeTic);
 
@@ -673,7 +786,7 @@ end
 matched = pktLog([]);   % 空の構造体配列
 
 if isempty(targetBSSID)
-    warning('decodeIQ_VHT:ssidNotFound', ...
+    warning('decode_VHT_v2:ssidNotFound', ...
         ['指定した SSID "%s" の Beacon/Probe Response を検出できませんでした。\n', ...
          'captureIQ.m の captureDuration を長くする、pktDetThreshold を下げる (例 0.3)、', ...
          'SSID の綴り・電波状況を確認する、などをお試しください。'], targetSSID);
@@ -767,6 +880,7 @@ end
 % 変数名は ResultCSI.m と揃えて csiMeta とする
 csiMeta = struct();
 csiMeta.description      = 'CSI filtered by target SSID (Non-HT / HT(NSS=1,20MHz) / SU-VHT(NSTS=1,20MHz))';
+csiMeta.decoder          = 'decode_VHT_v2.m';   % どちらの復号器で作ったか
 csiMeta.primaryFormat    = primaryFormat;   % 変数 csi がどの形式か
 csiMeta.centerFrequency  = centerFrequency;
 csiMeta.sampleRate       = sampleRate;
@@ -805,13 +919,13 @@ for k = 1:numel(outMatFiles)
         nSaved = nSaved + 1;
     catch ME
         % 片方 (USB の抜き差し等) が失敗しても、もう片方は残す
-        warning('decodeIQ_VHT:saveFailed', ...
+        warning('decode_VHT_v2:saveFailed', ...
             '保存に失敗しました (%s): %s', outMatFiles{k}, ME.message);
     end
 end
 
 if nSaved == 0
-    error('decodeIQ_VHT:allSavesFailed', ...
+    error('decode_VHT_v2:allSavesFailed', ...
         'すべての出力先への保存に失敗しました。ドライブの接続を確認してください。');
 end
 
@@ -855,6 +969,56 @@ function [cnt, shown] = recordDeag(cnt, shown, fmtName, info)
                  '            この形式は MAC ヘッダとして解釈できないため除外します。\n'], ...
             info.dataClass, info.dataRange(1), info.dataRange(2));
     end
+end
+
+function nSamples = ppduSamplesFromLSIG(pkt, chanEst, noiseEst, chanBW)
+    % L-SIG から PPDU 全体のサンプル長を求める。復号に失敗しても探索位置を
+    % パケット全長分だけ進められるようにするためのもの。
+    % HT-MF / VHT では L-SIG LENGTH は
+    %   RXTIME = 4*ceil((L_LENGTH+3)/3) + 20 [us]
+    % が PPDU 長になるよう設定されるため、フォーマットに依らず使える。
+    % L-SIG が読めない場合は 0 を返す (呼び出し側が既定値を使う)。
+    nSamples = 0;
+    try
+        [lsigBits, lsigFail] = wlanLSIGRecover(pkt(321:400), chanEst, noiseEst, chanBW);
+        if lsigFail
+            return;
+        end
+        [~, lsigLen] = decodeLSIGBits(lsigBits);
+        if lsigLen > 0
+            nSamples = (4 * ceil((lsigLen + 3) / 3) + 20) * 20;   % 20 samples/us
+        end
+    catch
+        nSamples = 0;
+    end
+end
+
+function rxPSDU = htVhtDataRecover(recoverFcn, rxData, chanEst, noiseEst, cfg)
+    % wlanHTDataRecover / wlanVHTDataRecover を LDPC 早期終了つきで呼ぶ。
+    %
+    % 早期終了はパリティ検査が全て通った時点で反復を打ち切る。その時点で
+    % 既に有効な符号語になっているため、追加の反復は出力を変えない。
+    % したがって復号結果はビット単位で既定動作と一致する。
+    % (復号方式 'LDPCDecodingMethod' は結果が変わり得るので変更しない)
+    %
+    % 名前と値のペアの対応は MATLAB のバージョンにより異なるため、
+    % 受け付けられない場合は既定の呼び出し方へ退避する。
+    persistent useEarlyTermination
+    if isempty(useEarlyTermination)
+        useEarlyTermination = true;
+    end
+
+    if useEarlyTermination
+        try
+            rxPSDU = recoverFcn(rxData, chanEst, noiseEst, cfg, ...
+                'EarlyTermination', true);
+            return;
+        catch
+            % このバージョンでは指定できないので以後は使わない
+            useEarlyTermination = false;
+        end
+    end
+    rxPSDU = recoverFcn(rxData, chanEst, noiseEst, cfg);
 end
 
 function y = applyCFO(x, fs, cfoHz)
@@ -901,10 +1065,9 @@ function [status, consumed, entry] = processNonHT(pkt, chanEst, noiseEst, chanBW
     rxPSDU = wlanNonHTDataRecover(pkt(ind.NonHTData(1):ind.NonHTData(2)), ...
         chanEst, noiseEst, cfgNonHT);
 
-    % 未対応サブタイプの警告は頻出するためここでは抑止する (サマリで集計)
-    wState = warning('off', 'all');
+    % 未対応サブタイプの警告は頻出するが、抑止は呼び出し側でループ外に
+    % まとめて行っている (状態の保存・復元が高コストなため)
     [cfgMAC, payload, mpduStatus] = wlanMPDUDecode(rxPSDU, cfgNonHT, 'DataFormat', 'bits');
-    warning(wState);
 
     if ~strcmpi(string(mpduStatus), "Success")
         status = 0;
@@ -925,6 +1088,15 @@ function [status, consumed, entry, info] = processHT(pkt, lltfChanEst, noiseEst,
         'coding', 0, 'gi', 0, 'aggregated', false, 'reservedOK', false, ...
         'mpduCount', 0, 'deagStatus', '', ...
         'nonBinary', false, 'dataClass', '', 'dataRange', [0 0]);
+
+    % [高速化2] L-SIG から PPDU 全長を先に求めておく。
+    %   以降どの段階で失敗しても、探索位置をパケット全長分だけ進められる。
+    %   旧版は失敗時に 560 サンプル(28us)しか進めず、同じパケットの本体を
+    %   再走査して偽のプリアンブル検出を大量に生んでいた。
+    %   HT-MF では L-SIG LENGTH は
+    %     RXTIME = 4*ceil((L_LENGTH+3)/3) + 20 [us]
+    %   が PPDU 長になるよう設定される。
+    consumed = max(consumed, ppduSamplesFromLSIG(pkt, lltfChanEst, noiseEst, chanBW));
 
     % --- HT-SIG 復号 (2シンボル, pkt(401:560)) ---
     [htsigBits, htsigFail] = wlanHTSIGRecover(pkt(401:560), lltfChanEst, noiseEst, chanBW);
@@ -983,7 +1155,11 @@ function [status, consumed, entry, info] = processHT(pkt, lltfChanEst, noiseEst,
     htDemod   = wlanHTLTFDemodulate(pkt(ind.HTLTF(1):ind.HTLTF(2)), cfgHT);
     htChanEst = wlanHTLTFChannelEstimate(htDemod, cfgHT);
 
-    rxPSDU = wlanHTDataRecover(pkt(ind.HTData(1):ind.HTData(2)), htChanEst, noiseEst, cfgHT);
+    % [高速化4] LDPC は早期終了を有効にする。パリティ検査が全て通った時点で
+    %   反復を打ち切るが、その時点で既に有効な符号語なので出力は変わらない。
+    %   (復号方式そのものは結果が変わり得るため既定のまま)
+    rxPSDU = htVhtDataRecover(@wlanHTDataRecover, ...
+        pkt(ind.HTData(1):ind.HTData(2)), htChanEst, noiseEst, cfgHT);
 
     % --- HT の PSDU は A-MPDU の場合があるので分解してから MPDU を復号 ---
     [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgHT);
@@ -1055,6 +1231,21 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
         'mpduCount', 0, 'deagStatus', '', ...
         'nonBinary', false, 'dataClass', '', 'dataRange', [0 0]);
 
+    % [高速化2] L-SIG を先に復号し、PPDU 全長を求めておく。
+    %   NSTS>=2 などで棄却する場合も含め、どの段階で失敗しても探索位置を
+    %   パケット全長分だけ進められる。旧版は失敗時に 560 サンプル(28us)しか
+    %   進めず、同じパケットの本体を再走査して偽検出を大量に生んでいた。
+    %   ここで得た lsigLen は後段のパケット長算出でもそのまま使う
+    %   (旧版は L-SIG を2回復号していた)。
+    [lsigBits, lsigFail] = wlanLSIGRecover(pkt(321:400), lltfChanEst, noiseEst, chanBW);
+    if ~lsigFail
+        [~, info.lsigLen] = decodeLSIGBits(lsigBits);
+    end
+    if info.lsigLen > 0
+        rxTimeUs = 4 * ceil((info.lsigLen + 3) / 3) + 20;
+        consumed = max(consumed, rxTimeUs * 20);   % 20 samples/us
+    end
+
     % --- VHT-SIG-A 復号 (2シンボル) ---
     [sigaBits, sigaFail] = wlanVHTSIGARecover(pkt(401:560), lltfChanEst, noiseEst, chanBW);
     if sigaFail
@@ -1119,10 +1310,7 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
     % --- パケット長の決定 ---
     % MathWorks の helperVHTConfigRecover と同様、L-SIG と VHT-SIG-A から
     % 求めるのを主とする。VHT-SIG-B の Length は参考値として併記する。
-    [lsigBits, lsigFail] = wlanLSIGRecover(pkt(321:400), lltfChanEst, noiseEst, chanBW);
-    if ~lsigFail
-        [~, info.lsigLen] = decodeLSIGBits(lsigBits);
-    end
+    % (info.lsigLen は関数の先頭で既に取得済み)
 
     % VHT PPDU の受信時間 [us] (IEEE 802.11ac の L-SIG LENGTH との関係)
     %   RXTIME = 4*ceil((L_LENGTH+3)/3) + 20
@@ -1210,8 +1398,10 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
 
     consumed = double(ind.VHTData(2));
 
-    rxPSDU = wlanVHTDataRecover(pkt(ind.VHTData(1):ind.VHTData(2)), ...
-        vhtChanEst, noiseEst, cfgVHT);
+    % [高速化4] LDPC は早期終了を有効にする (出力は変わらない。詳細は
+    %   htVhtDataRecover のコメントを参照)
+    rxPSDU = htVhtDataRecover(@wlanVHTDataRecover, ...
+        pkt(ind.VHTData(1):ind.VHTData(2)), vhtChanEst, noiseEst, cfgVHT);
 
     % --- VHT の PSDU は A-MPDU なので分解してから MPDU を復号 ---
     [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgVHT);
@@ -1260,7 +1450,9 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
     % MPDU が16進文字列 (char, '0'-'9''A'-'F') になる場合がある。その形式の
     % まま 'DataFormat','bits' で wlanMPDUDecode を呼ぶと形式不一致で必ず
     % 失敗するため、実際のデータ形式を判定して合わせる。
-    wState = warning('off', 'all');
+    %
+    % 警告の抑止は呼び出し側でループ外にまとめて行っている
+    % (状態の保存・復元はコストが高く、MPDU ごとだと回数が多すぎるため)。
     for m = 1:numel(mpduList)
         dfmt = mpduDataFormat(mpduList{m});
         if isempty(dfmt)
@@ -1269,7 +1461,6 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
         try
             [c, p, st] = wlanMPDUDecode(mpduList{m}, cfgFormat, 'DataFormat', dfmt);
             if strcmpi(string(st), "Success")
-                warning(wState);
                 cfgMAC = c; payload = p; ok = true;
                 return;
             end
@@ -1277,16 +1468,13 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
             % この MPDU は読み飛ばす
         end
     end
-    warning(wState);
 
     % A-MPDU として分解できなかった場合は単一 MPDU として試す
     if isempty(mpduList)
         dfmt = mpduDataFormat(rxPSDU);
         if ~isempty(dfmt)
             try
-                wState = warning('off', 'all');
                 [c, p, st] = wlanMPDUDecode(rxPSDU, cfgFormat, 'DataFormat', dfmt);
-                warning(wState);
                 if strcmpi(string(st), "Success")
                     cfgMAC = c; payload = p; ok = true;
                     return;

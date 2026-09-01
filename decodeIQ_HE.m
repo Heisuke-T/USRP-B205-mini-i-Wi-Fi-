@@ -1,72 +1,113 @@
-%% captureIQ_HT.m
+%% decodeIQ_HE.m
 % =========================================================================
-%  USRP B205 mini-i でWi-Fiを受信し、WLAN Toolbox でパケットを復号して
-%  「指定SSIDのAPだけ」のCSIを記録する (Non-HT / HT / VHT 対応版)
+%  [第2段] キャプチャ済み IQ をオフライン復号し、指定SSIDのCSIを記録する
+%          (Wi-Fi 6 / 802.11ax = HE 対応版)
 % -------------------------------------------------------------------------
 %  概要:
-%    captureIQ_v2.m に HT (802.11n / Wi-Fi 4) の復号を追加したバージョン。
-%    処理は2段階に分かれています。
-%      [第1段] 生IQのキャプチャ (captureIQ.m と同じ方式)
-%              復号処理を挟まずにひたすら受信するため、オーバーランが
-%              起きにくく取りこぼしが少ない。
-%      [第2段] キャプチャ済みIQのオフライン復号
-%              WLAN Toolbox でパケットを検出・復号し、
-%                1) Beacon/Probe Response から SSID と 送信元アドレス(BSSID)
-%                   の対応を学習
-%                2) 復号できた全パケットについて、プリアンブル (Non-HTは
-%                   L-LTF、HTは HT-LTF、VHTは VHT-LTF) から CSI を算出
-%                3) targetSSID に対応する BSSID のパケットのCSIだけを抽出
-%              して .mat 保存する。
+%    captureIQ.m が HDD に保存した生 IQ を読み込み、WLAN Toolbox で
+%    パケットを検出・復号して、
+%      1) Beacon/Probe Response から SSID と BSSID の対応を学習
+%      2) 復号できた全パケットについて、プリアンブル (Non-HTは L-LTF、
+%         HTは HT-LTF、VHTは VHT-LTF、HEは HE-LTF) から
+%         CSI (チャネル応答 H(k)) を算出
+%      3) targetSSID に対応する BSSID のパケットのCSIだけを抽出
+%    して .mat 保存する。
+%
+%    構成・入出力形式・SSID学習の方針はすべて decodeIQ_VHT.m と同じで、
+%    HE (802.11ax / Wi-Fi 6) の復号経路を追加したものが本ファイル。
+%    captureIQ.m は変更不要 (生IQの形式は共通)。
 %
 %  対応フォーマット:
 %    Non-HT (802.11a/g レガシー) / HT-Mixed (802.11n / Wi-Fi 4) /
-%    SU-VHT (802.11ac / Wi-Fi 5) に対応しています。
-%    HT-Greenfield と HE (802.11ax / Wi-Fi 6) は未対応 (検出のみ)。
+%    SU-VHT (802.11ac / Wi-Fi 5) / HE-SU・HE-EXT-SU (802.11ax / Wi-Fi 6)
 %
-%    HT・VHT対応の制約 (いずれもUSRP B205 mini-iが受信アンテナ1本=SISOのため):
+%    Non-HT を残しているのは必須のため: 5GHz 帯の Beacon / Probe Response は
+%    互換性のため常にレガシーレート (Non-HT) で送信されるので、Non-HT を
+%    復号できないと SSID と BSSID の対応を学習できない。
+%
+%    SISO・20MHz 受信であることによる制約 (USRP B205 mini-i は受信アンテナ1本):
 %      - 空間ストリーム数 = 1 のパケットのみ復号します。
 %        マルチストリームは1本アンテナでは原理的に復号できません。
-%        (HT: MCS0-7 のみ対応。MCS8以上は複数ストリームのため非対応)
 %      - 20MHz動作のパケットのみ対象です。40/80/160MHzで送信された
 %        パケットは本機の受信帯域(20MHz)では正しく復号できません。
-%      - VHT は SU-VHT (GroupID = 0 または 63) のみ対応。MU-MIMO非対応。
 %      - STBC を使用しているパケットは非対応としてスキップします。
 %
-%    HT-SIG / VHT-SIG-A / VHT-SIG-B のビットフィールド解釈は WLAN Toolbox に
-%    専用の解釈関数が無いため、IEEE Std 802.11-2016 / 802.11ac-2013 の仕様に
-%    基づき本スクリプト内で実装しています。実機で復号できない場合、まず
-%    各 processXXX 関数のコメントで示した箇所を疑ってください。
+%    HE のうち非対応のフォーマット (検出・集計のみ):
+%      - HE-MU  … OFDMA / MU-MIMO。復号には HE-SIG-B から RU 割り当てと
+%                 ユーザ情報を読む必要があり、SISO 受信の前提から外れる。
+%      - HE-TB  … トリガベース (上りOFDMA)。送信パラメータは AP が送った
+%                 Trigger フレーム側にあり、HE-TB PPDU 単体では決まらない。
+%      いずれも [HE 詳細] の「非対応の理由」に件数が出ます。
+%
+%  HE の復号手順 (MathWorks "Recovery Procedure for an 802.11ax Packet" 準拠):
+%      L-STF → 粗CFO           (wlanCoarseCFOEstimate)
+%      L-LTF → 精CFO・チャネル/雑音推定
+%      L-SIG+RL-SIG+HE-SIG-A の4シンボル → フォーマット判定 (wlanFormatDetect)
+%      L-SIG+RL-SIG → pre-HE チャネル推定 (wlanPreHEChannelEstimate) と
+%                     L-SIG LENGTH の取得 (wlanLSIGBitRecover)
+%      HE-SIG-A     → wlanHEDemodulate → wlanHEEqualize
+%                     → wlanHESIGABitRecover → interpretHESIGABits
+%                     (wlanHERecoveryConfig に MCS/GI/NSTS 等が入る)
+%      HE-LTF       → wlanHELTFChannelEstimate  ← これが CSI
+%      HE-Data      → wlanHEDemodulate → wlanHEEqualize
+%                     → wlanHEDataBitRecover → A-MPDU分解 → MPDU復号
+%
+%    ※HE では VHT と違い SIG フィールドのビット解釈を自前実装する必要が
+%      ありません (interpretHESIGABits が WLAN Toolbox にあるため)。
+%      HT-SIG / VHT-SIG-A の自前パーサは Non-HT/HT/VHT 経路のために残して
+%      あります。
+%
+%  既知の簡略化 (復号率が伸びないときに見直す箇所):
+%    - パイロットによる残留位相誤差の追跡 (wlanHETrackPilotError) は
+%      行っていません。精CFO補正後の残留位相回転が小さいことを前提として
+%      います。長いパケットほど効いてくるので、末尾側だけ FCS が通らない
+%      ようなら導入を検討してください。
+%    - 雑音分散は L-LTF から求めた 1 つの値をすべてのフィールドに使って
+%      います。HE-Data はサブキャリア間隔が 1/4 (78.125kHz) なので厳密には
+%      スケールが一致しません。「HE-SIG-A は解釈できるのに HE-Data の FCS が
+%      通らない」場合はここを疑ってください。
 %
 %  必要環境:
 %    - MATLAB / Communications Toolbox / WLAN Toolbox
-%    - Communications Toolbox Support Package for USRP Radio
-%    - USB 3.0 接続された USRP B205 mini-i
+%      HE 復号には R2019a 以降 (wlanHEDemodulate / wlanHERecoveryConfig 等)
+%      が必要です。wlanPreHEChannelEstimate が無い版では、L-LTF の推定値を
+%      pre-HE のサブキャリア本数へ広げる簡易版に自動でフォールバックします。
+%    - captureIQ.m が出力した *_raw.mat
 %
-%  出力ファイル:
-%    <保存先>/<yyyymmddHHMM>_<SSID>_CSI.mat
+%  入力ファイル:
+%    <hddInputPath>/<yyyymmddHHMM>_raw.mat   (captureIQ.m の出力。変更不要)
 %
-%    [主データ] ResultCSI.m がそのまま読める形式 (calculateCSI.m と同じ変数名)
+%  出力ファイル (HDD と USB メモリの両方に同じ内容を保存):
+%    <hddSavePath>/<yyyymmddHHMM>_<SSID>_CSI.mat
+%    <usbSavePath>/<yyyymmddHHMM>_<SSID>_CSI.mat
+%      ※ファイル名の日時はキャプチャ時刻 (復号時刻ではない)。元の生IQと
+%        対応が取れるようにするため。
+%
+%    [主データ] ResultCSI.m がそのまま読める形式
 %      csi               … [パケット数 x サブキャリア数] complex の行列
 %      subcarrierIndices … [1 x サブキャリア数] 使用サブキャリア番号 k
 %      packetStartIndex  … [パケット数 x 1] 各パケットのサンプル位置
 %      csiMeta           … 処理条件・復号統計 (sampleRate 等を含む)
-%      ※ Non-HT/HT は 52 本、VHT(20MHz) は 56 本とサブキャリア数が異なる
-%         ため 1 つの行列には混在させられない。3種類のうちパケット数が
-%         最多の形式を主データとし、どれを採用したかは
-%         csiMeta.primaryFormat に記録する。
+%      ※ Non-HT/HT は 52 本、VHT(20MHz) は 56 本、HE(20MHz, 242-tone RU) は
+%         242 本とサブキャリア数が異なるため 1 つの行列には混在させられない。
+%         本スクリプトは HE 用なので、HE のパケットが 1 件でもあれば HE を
+%         主データとし、無ければパケット数が最多の形式を採用する。
+%         どれを採用したかは csiMeta.primaryFormat に記録する。
 %
 %    [フォーマット別] 複数形式が必要な場合はこちらを使う
 %      csiNonHT / timeSecNonHT / frameTypeNonHT / fcsNonHT
 %      csiHT    / timeSecHT    / frameTypeHT    / fcsHT
 %      csiVHT   / timeSecVHT   / frameTypeVHT   / fcsVHT
+%      csiHE    / timeSecHE    / frameTypeHE    / fcsHE
 %      subcarrierIndicesNonHT … [1 x 52]   Non-HT の使用サブキャリア番号
 %      subcarrierIndicesHT20  … [1 x 52]   HT-20MHz の使用サブキャリア番号
 %      subcarrierIndicesVHT20 … [1 x 56]   VHT-20MHz の使用サブキャリア番号
+%      subcarrierIndicesHE20  … [1 x 242]  HE-20MHz の使用サブキャリア番号
 %
 %    [補助]
 %      timeSec      … [パケット数 x 1] キャプチャ開始からの相対時刻 [s]
 %      frameType    … [パケット数 x 1] 各パケットのフレーム種別
-%      phyFormat    … [パケット数 x 1] 'Non-HT' / 'HT' / 'VHT'
+%      phyFormat    … [パケット数 x 1] 'Non-HT' / 'HT' / 'VHT' / 'HE'
 %      fcsVerified  … [パケット数 x 1] false は FCS 未検証 (MAC ヘッダのみ
 %                      から送信元を判定したもの)。CSI 自体には影響しない。
 %      targetSSIDOut / targetBSSIDOut … 指定SSIDと学習されたBSSID
@@ -76,181 +117,198 @@
 %      どちらかが対象 BSSID と一致するかで行う (ダウンリンクは Address2、
 %      アップリンクは Address1 が BSSID になるため)。
 %
-%  注意:
-%    電波の受信・記録は、利用地域の電波法および関連法令を遵守し、
-%    自身が管理する機器・許可された環境でのみ実施してください。
+%  処理時間の目安:
+%    実測でキャプチャ 1 秒あたり 300〜2400 秒 (電波の混雑度に強く依存)。
+%    HE は LDPC が既定で、パケットも長くなりがちなので VHT より遅くなる
+%    傾向があります。まずは captureDuration を短く (1s 程度) して動作確認
+%    することを推奨します。
 % =========================================================================
 
-%% ------------------------------------------------------------------------
-%  0. 直前の実行で残っている USRP オブジェクトの解放
-%  ------------------------------------------------------------------------
-% スクリプトの変数はベースワークスペースに残るため、前回がエラーで終了して
-% いると受信機オブジェクトが USRP を掴んだままになり、次回実行時に
-% "radio is busy" となる。clear より先に明示的に release する。
-if exist('rx', 'var')
-    try
-        release(rx);
-    catch
-    end
-end
 clear; clc;
 
 %% ------------------------------------------------------------------------
 %  1. ユーザ設定パラメータ
 %  ------------------------------------------------------------------------
 
-% --- 保存先 (USB 外部ストレージ) -----------------------------------------
-usbSavePath = 'D:\IQ';
+% --- 入力元 (ホストPC に接続された HDD。captureIQ.m の保存先と揃える) ----
+%     現在の環境: HDPC-UT (D:)
+hddInputPath = 'D:\IQ_raw';
+
+% --- 読み込む生IQファイル ------------------------------------------------
+%     '' にすると hddInputPath 内で最も新しい *_raw.mat を自動選択する。
+%     特定のファイルを指定したい場合はファイル名かフルパスを書く。
+inputRawFile = '';
+
+% --- 出力先 --------------------------------------------------------------
+%     同じ内容を HDD と USB メモリの両方へ保存する。
+%     HDD は HDPC-UT (D:)。
+hddSavePath = 'D:\IQ_csi';
+
+%     USB メモリのドライブレターをここに設定する (例: 'F:\IQ')。
+%     '' のままにすると USB への保存はスキップし、HDD にのみ保存する。
+%     ※ResultCSI.m の既定の読み込み先は 'D:\IQ' なので、USB を使わない
+%       場合は ResultCSI.m 側の usbSavePath を 'D:\IQ_csi' に変更すること。
+usbSavePath = '';
 
 % --- 抽出したい Wi-Fi の SSID --------------------------------------------
 targetSSID = 'OpenWrt-A';
 
-% --- Wi-Fi 受信パラメータ (captureIQ.m と同じ ch36 / 20MHz) --------------
-centerFrequency = 5.180e9;      % [Hz] 5GHz 帯 ch36 (20MHz 帯域幅)
-chanBW          = 'CBW20';      % WLAN Toolbox のチャネル帯域幅指定
-sampleRate      = 20e6;         % [Sps] 20 MHz 帯域
-gain            = 40;           % [dB]
-captureDuration = 2.0;          % [s] Beacon 間隔は通常 100ms なので
-                                 %     確実に捕捉したい場合は長めに設定
-samplesPerFrame = 20000;        % [samples/frame]
-usrpPlatform    = 'B200';
-usrpSerialNum   = '3240497';
-
 % --- 復号パラメータ ------------------------------------------------------
+chanBW          = 'CBW20';      % WLAN Toolbox のチャネル帯域幅指定
+                                 % (キャプチャ時の 20MHz に対応)
 pktDetThreshold = 0.5;          % wlanPacketDetect のしきい値 (0〜1)
-                                 % 検出数が少なすぎる場合は下げる (例 0.3)
-saveRawIQ       = false;        % true にすると生IQも別ファイルに保存する
-                                 % (2秒/20MHz で約 320MB になるので注意)
+                                 % 下げると弱いパケットも拾うが誤検出が増え、
+                                 % 復号時間も伸びる
 verboseErrors   = false;        % true にすると復号エラーを毎回表示する
                                  % (通常は最後に集計のみ表示)
 
 %% ------------------------------------------------------------------------
-%  2. 保存先の準備
+%  2. 生IQファイルの読み込み
 %  ------------------------------------------------------------------------
-if ~exist(usbSavePath, 'dir')
-    fprintf('保存先フォルダが存在しないため作成します: %s\n', usbSavePath);
-    [ok, msg] = mkdir(usbSavePath);
-    if ~ok
-        error('captureIQ_HT:mkdirFailed', ...
-            'USB 保存先フォルダを作成できませんでした (%s): %s', usbSavePath, msg);
+if isempty(inputRawFile)
+    listing = dir(fullfile(hddInputPath, '*_raw.mat'));
+    if isempty(listing)
+        error('decodeIQ_HE:noInputFile', ...
+            ['入力ファイルが見つかりません: %s\\*_raw.mat\n', ...
+             '先に captureIQ.m を実行するか、inputRawFile にパスを指定してください。'], ...
+            hddInputPath);
     end
+    [~, newest] = max([listing.datenum]);
+    inputRawFile = fullfile(listing(newest).folder, listing(newest).name);
+    fprintf('最新の生IQファイルを自動選択しました:\n  %s\n', inputRawFile);
+elseif isempty(fileparts(inputRawFile))
+    % ディレクトリ部分が無い = ファイル名だけの指定なので hddInputPath 配下とみなす
+    inputRawFile = fullfile(hddInputPath, inputRawFile);
 end
 
-testFile = fullfile(usbSavePath, '.write_test.tmp');
-fidTest  = fopen(testFile, 'w');
-if fidTest == -1
-    error('captureIQ_HT:usbNotWritable', ...
-        'USB 保存先に書き込みできません: %s', usbSavePath);
-end
-fclose(fidTest);
-delete(testFile);
-
-timestamp  = datestr(now, 'yyyymmddHHMM');
-ssidSafe   = regexprep(targetSSID, '[^A-Za-z0-9_-]', '_');
-outMatFile = fullfile(usbSavePath, [timestamp '_' ssidSafe '_CSI.mat']);
-rawIQFile  = fullfile(usbSavePath, [timestamp '_raw.mat']);
-
-%% ------------------------------------------------------------------------
-%  3. USRP B205 mini-i 受信機オブジェクトの生成
-%  ------------------------------------------------------------------------
-radioInfo = [];
-try
-    radioInfo = findsdru();
-    if isempty(radioInfo)
-        warning('captureIQ_HT:noRadio', ...
-            'USRP 機器が検出されませんでした。USB 接続と電源を確認してください。');
-    else
-        fprintf('検出された USRP 機器:\n');
-        for k = 1:numel(radioInfo)
-            fprintf('  Platform=%s, SerialNum=%s, Status=%s\n', ...
-                radioInfo(k).Platform, radioInfo(k).SerialNum, radioInfo(k).Status);
-        end
-    end
-catch ME
-    warning('captureIQ_HT:findsdruFailed', 'findsdru の実行に失敗しました: %s', ME.message);
+if ~isfile(inputRawFile)
+    error('decodeIQ_HE:inputNotFound', '入力ファイルが存在しません: %s', inputRawFile);
 end
 
-if isempty(usrpSerialNum)
-    error('captureIQ_HT:noSerialNum', ...
-        'usrpSerialNum を指定してください (findsdru の表示を参照)。');
+S = load(inputRawFile, 'iq', 'meta');
+if ~isfield(S, 'iq') || ~isfield(S, 'meta')
+    error('decodeIQ_HE:badInputFile', ...
+        ['入力ファイルに変数 iq / meta がありません: %s\n', ...
+         'captureIQ.m が出力した *_raw.mat を指定してください。'], inputRawFile);
 end
 
-rx = comm.SDRuReceiver( ...
-    'Platform',            usrpPlatform, ...
-    'SerialNum',           usrpSerialNum, ...
-    'CenterFrequency',     centerFrequency, ...
-    'Gain',                gain, ...
-    'MasterClockRate',     sampleRate * 2, ...
-    'DecimationFactor',    2, ...
-    'OutputDataType',      'double', ...   % WLAN Toolbox 関数は double 前提
-    'SamplesPerFrame',     samplesPerFrame);
+% captureIQ.m は complex double で保存するため通常は変換不要だが、
+% 古い single 形式のファイルも読めるよう double() を通しておく
+% (WLAN Toolbox の関数群は double を前提とする)
+iq   = double(S.iq(:));
+meta = S.meta;
+clear S;
 
-fprintf('\n受信設定:\n');
+% 以降の処理・保存メタデータはキャプチャ時の条件を引き継ぐ
+centerFrequency = meta.centerFrequency;
+sampleRate      = meta.sampleRate;
+gain            = meta.gain;
+captureDuration = meta.captureDuration;
+usrpPlatform    = meta.platform;
+usrpSerialNum   = meta.serialNum;
+overrunCount    = meta.overrunCount;
+timestamp       = meta.captureDatetime;
+
+fprintf('\n読み込んだ生IQ:\n');
+fprintf('  ファイル        : %s\n', inputRawFile);
+fprintf('  キャプチャ日時  : %s\n', timestamp);
+fprintf('  サンプル数      : %d (%.3f s)\n', numel(iq), numel(iq) / sampleRate);
 fprintf('  中心周波数      : %.4f GHz\n', centerFrequency / 1e9);
-fprintf('  サンプルレート  : %.3f MSps (帯域幅)\n', sampleRate / 1e6);
+fprintf('  サンプルレート  : %.3f MSps\n', sampleRate / 1e6);
 fprintf('  ゲイン          : %d dB\n', gain);
-fprintf('  キャプチャ時間  : %.2f s\n', captureDuration);
+fprintf('  オーバーラン    : %d 回\n', overrunCount);
+if overrunCount > 0
+    fprintf('  ※キャプチャ時に取りこぼしがあります。時刻軸に不連続が含まれる\n');
+    fprintf('    可能性があるため、CSI の時系列解釈には注意してください。\n');
+end
 fprintf('  対象 SSID       : %s\n', targetSSID);
-fprintf('  保存先(.mat)    : %s\n', outMatFile);
+
+% --- HE 復号に必要な関数が揃っているかを先に確認する ---------------------
+% 途中でいきなり "Undefined function" になるより、開始前に分かるほうがよい。
+heFuncs = {'wlanHEDemodulate', 'wlanHEOFDMInfo', 'wlanHEEqualize', ...
+           'wlanHESIGABitRecover', 'wlanLSIGBitRecover', ...
+           'wlanHERecoveryConfig', 'wlanHELTFChannelEstimate', ...
+           'wlanHEDataBitRecover', 'wlanHESUConfig'};
+heAvailable = true;
+missingFuncs = {};
+for k = 1:numel(heFuncs)
+    if isempty(which(heFuncs{k}))
+        heAvailable = false;
+        missingFuncs{end+1} = heFuncs{k}; %#ok<SAGROW>
+    end
+end
+if heAvailable
+    fprintf('  HE 復号         : 有効\n');
+else
+    warning('decodeIQ_HE:noHESupport', ...
+        ['この MATLAB では HE の復号ができません (WLAN Toolbox が古いか未導入)。\n', ...
+         '  不足している関数: %s\n', ...
+         '  Non-HT / HT / VHT のみ復号して続行します。'], strjoin(missingFuncs, ', '));
+end
 
 %% ------------------------------------------------------------------------
-%  4. 第1段: 生IQのキャプチャ (復号は行わない)
+%  3. 出力先の準備 (HDD と USB メモリの両方)
 %  ------------------------------------------------------------------------
-totalSamplesTarget = round(captureDuration * sampleRate);
-iqBuffer = complex(zeros(totalSamplesTarget + samplesPerFrame, 1));
-totalSamplesCaptured = 0;
-overrunCount = 0;
+ssidSafe   = regexprep(targetSSID, '[^A-Za-z0-9_-]', '_');
+outFileName = [timestamp '_' ssidSafe '_CSI.mat'];
 
-fprintf('\n[第1段] IQ キャプチャを開始します...\n');
-captureTic = tic;
+outMatFiles = {};   % 実際に書き込めた出力先
+outTargets  = { 'HDD', hddSavePath; 'USB', usbSavePath };
+for k = 1:size(outTargets, 1)
+    label = outTargets{k, 1};
+    pth   = outTargets{k, 2};
 
-% エラーや中断が起きても USRP を必ず解放する
-% (スクリプトの onCleanup はベースワークスペースに残り発火しないため、
-%  try/catch で明示的に解放する)
-try
-    while totalSamplesCaptured < totalSamplesTarget
-        [iqData, dataLen, overrun] = rx();
-        if dataLen == 0
+    if isempty(pth)
+        % 未設定 (例: USB メモリを使わない) のでこの出力先はスキップ
+        continue;
+    end
+
+    if ~exist(pth, 'dir')
+        fprintf('%s 保存先フォルダが存在しないため作成します: %s\n', label, pth);
+        [ok, msg] = mkdir(pth);
+        if ~ok
+            warning('decodeIQ_HE:mkdirFailed', ...
+                '%s 保存先フォルダを作成できませんでした (%s): %s', label, pth, msg);
             continue;
         end
-        if overrun
-            overrunCount = overrunCount + 1;
-        end
-        iqBuffer(totalSamplesCaptured + (1:dataLen)) = iqData(1:dataLen);
-        totalSamplesCaptured = totalSamplesCaptured + dataLen;
     end
-catch captureErr
-    try
-        release(rx);
-    catch
+
+    testFile = fullfile(pth, '.write_test.tmp');
+    fidTest  = fopen(testFile, 'w');
+    if fidTest == -1
+        warning('decodeIQ_HE:notWritable', ...
+            '%s 保存先に書き込みできないためスキップします: %s', label, pth);
+        continue;
     end
-    rethrow(captureErr);
+    fclose(fidTest);
+    delete(testFile);
+
+    outMatFiles{end+1} = fullfile(pth, outFileName); %#ok<SAGROW>
 end
 
-elapsedCapture = toc(captureTic);
-release(rx);
+if isempty(outMatFiles)
+    error('decodeIQ_HE:noWritableOutput', ...
+        ['書き込み可能な出力先がありません。\n', ...
+         '  HDD: %s\n  USB: %s\n', ...
+         'ドライブの接続とパスを確認してください。'], hddSavePath, usbSavePath);
+end
 
-iq = iqBuffer(1:totalSamplesCaptured);
-clear iqBuffer;
-
-fprintf('  キャプチャ完了: %d サンプル, %.2f s, オーバーラン %d 回\n', ...
-    totalSamplesCaptured, elapsedCapture, overrunCount);
-
-if saveRawIQ
-    meta = struct('centerFrequency', centerFrequency, 'sampleRate', sampleRate, ...
-        'gain', gain, 'captureDatetime', timestamp);       %#ok<NASGU>
-    iqSingle = single(iq);                                  %#ok<NASGU>
-    save(rawIQFile, 'iqSingle', 'meta', '-v7.3');
-    fprintf('  生IQを保存しました: %s\n', rawIQFile);
-    clear iqSingle;
+fprintf('  保存先          :\n');
+for k = 1:numel(outMatFiles)
+    fprintf('    %s\n', outMatFiles{k});
 end
 
 %% ------------------------------------------------------------------------
-%  5. 第2段: オフライン復号 (パケット検出 → CSI 推定 → MAC 復号)
+%  4. パケット検出 → CSI 推定 → MAC 復号
 %  ------------------------------------------------------------------------
 subcarrierIndicesNonHT = [-26:-1, 1:26];    % Non-HT CBW20 (52本)
 subcarrierIndicesHT20  = [-26:-1, 1:26];    % HT     CBW20 (52本, Non-HTと同じ配置)
 subcarrierIndicesVHT20 = [-28:-1, 1:28];    % VHT    CBW20 (56本)
+% HE は 20MHz でも 256点FFT (78.125kHz間隔) の 242-tone RU を使うため
+% サブキャリア番号の意味が他フォーマットと異なる。既定値は規格上の
+% 242-tone RU の配置で、実際には最初に復号できた HE パケットの
+% wlanHEOFDMInfo('HE-Data', ...) から取得した値で上書きする。
+subcarrierIndicesHE20  = [-122:-2, 2:122];  % HE     CBW20 (242本)
 
 pktLog = struct('timeSec', {}, 'bssid', {}, 'addr1', {}, 'frameType', {}, 'ssid', {}, ...
     'phyFormat', {}, 'fcsVerified', {}, 'mpduCount', {}, 'csi', {});
@@ -258,8 +316,8 @@ bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
 
 % 復号統計 (診断用)
 stats = struct('detected', 0, 'timingSkip', 0, 'nonHT', 0, 'ht', 0, 'vht', 0, ...
-    'htGF', 0, 'other', 0, 'htUnsupported', 0, 'vhtUnsupported', 0, ...
-    'decodeOK', 0, 'noAddr2', 0, 'errors', 0);
+    'he', 0, 'htGF', 0, 'other', 0, 'htUnsupported', 0, 'vhtUnsupported', 0, ...
+    'heUnsupported', 0, 'decodeOK', 0, 'noAddr2', 0, 'errors', 0);
 errMsgs       = containers.Map('KeyType', 'char', 'ValueType', 'double');
 deagStatusCnt = containers.Map('KeyType', 'char', 'ValueType', 'double');
 nonBinaryShown = false;  % 非0/1データを検出した旨を一度だけ表示するためのフラグ
@@ -275,10 +333,23 @@ vhtReservedOK = 0;   % VHT-SIG-A の予約ビットが仕様どおりだった�
 vhtDetailShown = 0;  % 内訳を表示した VHT パケット数
 vhtDetailMax   = 5;  % 内訳を表示する最大件数
 
-minPreambleLen = 560;   % L-STF..L-SIG + 2シンボル (フォーマット検出まで)
+% --- HE 用の集計 ---
+heFormatCounts = containers.Map('KeyType', 'char', 'ValueType', 'double');
+heRejects      = containers.Map('KeyType', 'char', 'ValueType', 'double');
+heMCSCounts    = containers.Map('KeyType', 'double', 'ValueType', 'double');
+heNSTSCounts   = containers.Map('KeyType', 'double', 'ValueType', 'double');
+heBWCounts     = containers.Map('KeyType', 'double', 'ValueType', 'double');
+heCodingCounts = containers.Map('KeyType', 'char', 'ValueType', 'double');
+heBSSColors    = containers.Map('KeyType', 'double', 'ValueType', 'double');
+heSigParsed    = 0;   % HE-SIG-A の CRC と解釈を通った件数
+heDetailShown  = 0;   % 内訳を表示した HE パケット数
+heDetailMax    = 5;   % 内訳を表示する最大件数
+heSubcResolved = false;  % subcarrierIndicesHE20 を実測値で上書き済みか
+
+minPreambleLen = 560;   % L-STF..L-SIG + 2シンボル (レガシーのフォーマット検出まで)
 searchOffset = 0;
 
-fprintf('\n[第2段] オフライン復号を開始します...\n');
+fprintf('\nオフライン復号を開始します...\n');
 decodeTic = tic;
 
 % 検出は窓に区切って行う (毎回バッファ全体を走査すると非常に遅くなるため)。
@@ -337,10 +408,23 @@ while searchOffset + minPreambleLen <= numel(iq)
         lltfChanEst = wlanLLTFChannelEstimate(lltfDemod, chanBW);
         noiseEst    = wlanLLTFNoiseEstimate(lltfDemod);
 
-        % --- フォーマット検出 (L-SIG + 後続2シンボル) ---
+        % --- フォーマット検出 ---
+        %     wlanFormatDetect は L-LTF の後ろの OFDM シンボルを見て判定する。
+        %     3シンボル (L-SIG + 2) までならレガシー(Non-HT/HT/VHT)判定、
+        %     4シンボル (L-SIG + RL-SIG + HE-SIG-A x2) 渡すと HE も判定できる。
+        %     末尾で 4 シンボル取れないときは 3 シンボルで呼び、
+        %     レガシー判定だけを行う。
         %     内部の L-SIG チェック失敗警告は独自サマリで集計するため抑止する
+        nSymAvail = floor((numel(pkt) - 320) / 80);
+        nSymUse   = min(4, nSymAvail);
+        if nSymUse < 3
+            stats.timingSkip = stats.timingSkip + 1;
+            searchOffset = nextSearch;
+            continue;
+        end
         wState = warning('off', 'all');
-        fmt = wlanFormatDetect(pkt(321:560), lltfChanEst, noiseEst, chanBW);
+        fmt = wlanFormatDetect(pkt(321 : 320 + nSymUse * 80), ...
+            lltfChanEst, noiseEst, chanBW);
         warning(wState);
         fmtStr = upper(string(fmt));
 
@@ -355,11 +439,7 @@ while searchOffset + minPreambleLen <= numel(iq)
 
                 if htInfo.mcs >= 0
                     htSigParsed = htSigParsed + 1;
-                    if isKey(htMCSCounts, htInfo.mcs)
-                        htMCSCounts(htInfo.mcs) = htMCSCounts(htInfo.mcs) + 1;
-                    else
-                        htMCSCounts(htInfo.mcs) = 1;
-                    end
+                    htMCSCounts = bumpMap(htMCSCounts, htInfo.mcs);
                 end
                 if htInfo.reservedOK
                     htReservedOK = htReservedOK + 1;
@@ -368,11 +448,7 @@ while searchOffset + minPreambleLen <= numel(iq)
                     recordDeag(deagStatusCnt, nonBinaryShown, 'HT', htInfo);
                 if ~isempty(htInfo.reason)
                     stats.htUnsupported = stats.htUnsupported + 1;
-                    if isKey(htRejects, htInfo.reason)
-                        htRejects(htInfo.reason) = htRejects(htInfo.reason) + 1;
-                    else
-                        htRejects(htInfo.reason) = 1;
-                    end
+                    htRejects = bumpMap(htRejects, htInfo.reason);
                 end
 
             case fmtStr == "VHT"
@@ -381,18 +457,10 @@ while searchOffset + minPreambleLen <= numel(iq)
 
                 if vhtInfo.bwMHz > 0
                     vhtSigParsed = vhtSigParsed + 1;
-                    if isKey(vhtBWCounts, vhtInfo.bwMHz)
-                        vhtBWCounts(vhtInfo.bwMHz) = vhtBWCounts(vhtInfo.bwMHz) + 1;
-                    else
-                        vhtBWCounts(vhtInfo.bwMHz) = 1;
-                    end
+                    vhtBWCounts = bumpMap(vhtBWCounts, vhtInfo.bwMHz);
                 end
                 if vhtInfo.nsts > 0
-                    if isKey(vhtNSTSCounts, vhtInfo.nsts)
-                        vhtNSTSCounts(vhtInfo.nsts) = vhtNSTSCounts(vhtInfo.nsts) + 1;
-                    else
-                        vhtNSTSCounts(vhtInfo.nsts) = 1;
-                    end
+                    vhtNSTSCounts = bumpMap(vhtNSTSCounts, vhtInfo.nsts);
                 end
                 if vhtInfo.reservedOK
                     vhtReservedOK = vhtReservedOK + 1;
@@ -412,10 +480,61 @@ while searchOffset + minPreambleLen <= numel(iq)
                 end
                 if ~isempty(vhtInfo.reason)
                     stats.vhtUnsupported = stats.vhtUnsupported + 1;
-                    if isKey(vhtRejects, vhtInfo.reason)
-                        vhtRejects(vhtInfo.reason) = vhtRejects(vhtInfo.reason) + 1;
-                    else
-                        vhtRejects(vhtInfo.reason) = 1;
+                    vhtRejects = bumpMap(vhtRejects, vhtInfo.reason);
+                end
+
+            case startsWith(fmtStr, "HE")
+                stats.he = stats.he + 1;
+                heFormatCounts = bumpMap(heFormatCounts, char(fmtStr));
+
+                if ~heAvailable
+                    % WLAN Toolbox が HE 非対応。検出だけ記録して読み捨てる
+                    stats.heUnsupported = stats.heUnsupported + 1;
+                    heRejects = bumpMap(heRejects, 'WLAN Toolbox が HE 未対応');
+                    st = 0; consumed = 640; entry = [];
+                else
+                    [st, consumed, entry, heInfo] = ...
+                        processHE(pkt, lltfChanEst, noiseEst, chanBW, fmtStr);
+
+                    if heInfo.sigaParsed
+                        heSigParsed  = heSigParsed + 1;
+                        heMCSCounts  = bumpMap(heMCSCounts, heInfo.mcs);
+                        heNSTSCounts = bumpMap(heNSTSCounts, heInfo.nsts);
+                        heBWCounts   = bumpMap(heBWCounts, heInfo.bwMHz);
+                        if ~isempty(heInfo.coding)
+                            heCodingCounts = bumpMap(heCodingCounts, heInfo.coding);
+                        end
+                        if heInfo.bssColor >= 0
+                            heBSSColors = bumpMap(heBSSColors, heInfo.bssColor);
+                        end
+                    end
+                    [deagStatusCnt, nonBinaryShown] = ...
+                        recordDeag(deagStatusCnt, nonBinaryShown, 'HE', heInfo);
+
+                    % HE のサブキャリア番号は復号できたパケットから実測する
+                    if ~heSubcResolved && ~isempty(heInfo.subcIdx)
+                        subcarrierIndicesHE20 = heInfo.subcIdx(:).';
+                        heSubcResolved = true;
+                    end
+
+                    % 最初の数件だけ内訳を表示 (パラメータ推定が妥当かの確認用)
+                    if heDetailShown < heDetailMax && heInfo.sigaParsed
+                        heDetailShown = heDetailShown + 1;
+                        fprintf(['    <HE#%d> %s MCS=%d NSTS=%d BW=%dMHz GI=%.1fus ', ...
+                                 'HE-LTF=%dx 符号化=%s DCM=%d\n', ...
+                                 '           BSSColor=%d %s | L-SIG長=%d PSDU長=%dB ', ...
+                                 'サブキャリア=%d本 | A-MPDU分解=%s MPDU数=%d\n'], ...
+                            heDetailShown, heInfo.packetFormat, heInfo.mcs, heInfo.nsts, ...
+                            heInfo.bwMHz, heInfo.giUs, heInfo.heltfType, heInfo.coding, ...
+                            heInfo.dcm, heInfo.bssColor, ...
+                            ternary(heInfo.uplink, '上り', '下り'), ...
+                            heInfo.lsigLen, heInfo.psduLen, heInfo.numSubcarriers, ...
+                            heInfo.deagStatus, heInfo.mpduCount);
+                    end
+
+                    if ~isempty(heInfo.reason)
+                        stats.heUnsupported = stats.heUnsupported + 1;
+                        heRejects = bumpMap(heRejects, heInfo.reason);
                     end
                 end
 
@@ -467,7 +586,7 @@ while searchOffset + minPreambleLen <= numel(iq)
             errMsgs(key) = 1;
         end
         if verboseErrors
-            warning('captureIQ_HT:decodeError', 'パケット処理中にエラー: %s', ME.message);
+            warning('decodeIQ_HE:decodeError', 'パケット処理中にエラー: %s', ME.message);
         end
         searchOffset = nextSearch;
     end
@@ -476,7 +595,7 @@ end
 elapsedDecode = toc(decodeTic);
 
 %% ------------------------------------------------------------------------
-%  6. 復号結果のサマリ表示
+%  5. 復号結果のサマリ表示
 %  ------------------------------------------------------------------------
 fprintf('\n[復号サマリ] (所要 %.2f s)\n', elapsedDecode);
 fprintf('  パケット検出数            : %d\n', stats.detected);
@@ -484,27 +603,14 @@ fprintf('    タイミング不正でスキップ: %d\n', stats.timingSkip);
 fprintf('    Non-HT として検出       : %d\n', stats.nonHT);
 fprintf('    HT     として検出       : %d  (うち非対応構成 %d)\n', stats.ht, stats.htUnsupported);
 fprintf('    VHT    として検出       : %d  (うち非対応構成 %d)\n', stats.vht, stats.vhtUnsupported);
+fprintf('    HE     として検出       : %d  (うち非対応構成 %d)\n', stats.he, stats.heUnsupported);
 fprintf('    HT-Greenfield            : %d  (非対応)\n', stats.htGF);
 fprintf('    その他フォーマット      : %d  (非対応)\n', stats.other);
 
 if stats.ht > 0
     fprintf('  [HT 詳細]\n');
-    if htMCSCounts.Count > 0
-        mKeys = sort(cell2mat(keys(htMCSCounts)));
-        fprintf('    MCS の内訳: ');
-        for k = 1:numel(mKeys)
-            fprintf('MCS%d=%d回  ', mKeys(k), htMCSCounts(mKeys(k)));
-        end
-        fprintf('\n');
-    end
-    if htRejects.Count > 0
-        rKeys = keys(htRejects);
-        fprintf('    非対応の理由: ');
-        for k = 1:numel(rKeys)
-            fprintf('%s=%d回  ', rKeys{k}, htRejects(rKeys{k}));
-        end
-        fprintf('\n');
-    end
+    printCountMapNum(htMCSCounts, '    MCS の内訳: ', 'MCS%d=%d回  ');
+    printCountMapChar(htRejects, '    非対応の理由: ');
     % 分母は「HT-SIG の CRC を通り、ビット解釈まで到達した件数」。検出だけ
     % されて CRC で落ちたものを含めると、自前パースの妥当性を測れない。
     fprintf('    HT-SIG予約ビット検証: %d/%d 個が仕様どおり (CRC通過分のみ)', ...
@@ -518,36 +624,22 @@ end
 
 if stats.vht > 0
     fprintf('  [VHT 詳細]\n');
-    if vhtBWCounts.Count > 0
-        bwKeys = cell2mat(keys(vhtBWCounts));
-        fprintf('    送信帯域幅の内訳: ');
-        for k = 1:numel(bwKeys)
-            fprintf('%dMHz=%d回  ', bwKeys(k), vhtBWCounts(bwKeys(k)));
-        end
-        fprintf('\n');
-    end
+    printCountMapNum(vhtBWCounts, '    送信帯域幅の内訳: ', '%dMHz=%d回  ');
     if vhtNSTSCounts.Count > 0
         nKeys = cell2mat(keys(vhtNSTSCounts));
         fprintf('    空間ストリーム数: ');
         for k = 1:numel(nKeys)
             fprintf('NSTS=%d が %d回  ', nKeys(k), vhtNSTSCounts(nKeys(k)));
         end
-        multiKeys = nKeys(nKeys >= 2);
-        nMultiStream = sum(cellfun(@(k) vhtNSTSCounts(k), num2cell(multiKeys)));
         fprintf('\n');
-        if any(nKeys >= 2)
+        multiKeys = nKeys(nKeys >= 2);
+        if ~isempty(multiKeys)
+            nMultiStream = sum(cellfun(@(k) vhtNSTSCounts(k), num2cell(multiKeys)));
             fprintf(['    ※NSTS>=2 の分 (計%d件) は送信元 BSSID が分からず、\n', ...
                      '      特定のSSIDに帰属させることができません。\n'], nMultiStream);
         end
     end
-    if vhtRejects.Count > 0
-        rKeys = keys(vhtRejects);
-        fprintf('    非対応の理由    : ');
-        for k = 1:numel(rKeys)
-            fprintf('%s=%d回  ', rKeys{k}, vhtRejects(rKeys{k}));
-        end
-        fprintf('\n');
-    end
+    printCountMapChar(vhtRejects, '    非対応の理由    : ');
     % VHT-SIG-A のビット解釈が正しいかの自己判定
     fprintf('    SIG-A予約ビット検証: %d/%d 個が仕様どおり (CRC通過分のみ)', ...
         vhtReservedOK, vhtSigParsed);
@@ -557,6 +649,38 @@ if stats.vht > 0
         fprintf('  (ビット解釈は妥当)\n');
     end
 end
+
+if stats.he > 0
+    fprintf('  [HE 詳細]\n');
+    printCountMapChar(heFormatCounts, '    PPDU形式の内訳  : ');
+    fprintf('    HE-SIG-A 解釈成功: %d 件 (検出 %d 件中)\n', heSigParsed, stats.he);
+    printCountMapNum(heBWCounts,   '    送信帯域幅の内訳: ', '%dMHz=%d回  ');
+    printCountMapNum(heMCSCounts,  '    MCS の内訳      : ', 'MCS%d=%d回  ');
+    printCountMapChar(heCodingCounts, '    符号化方式      : ');
+    if heNSTSCounts.Count > 0
+        nKeys = cell2mat(keys(heNSTSCounts));
+        fprintf('    空間ストリーム数: ');
+        for k = 1:numel(nKeys)
+            fprintf('NSTS=%d が %d回  ', nKeys(k), heNSTSCounts(nKeys(k)));
+        end
+        fprintf('\n');
+        multiKeys = nKeys(nKeys >= 2);
+        if ~isempty(multiKeys)
+            nMultiStream = sum(cellfun(@(k) heNSTSCounts(k), num2cell(multiKeys)));
+            fprintf(['    ※NSTS>=2 の分 (計%d件) は受信アンテナ1本では復号できず、\n', ...
+                     '      特定のSSIDに帰属させることができません。\n'], nMultiStream);
+        end
+    end
+    % BSS Color は HE-SIG-A に平文で入っており、CRC を通っていれば信頼できる。
+    % 同じ BSS のパケットかどうかの二次的な手掛かりになる。
+    printCountMapNum(heBSSColors, '    BSS Color       : ', 'Color%d=%d回  ');
+    printCountMapChar(heRejects,  '    非対応の理由    : ');
+    if heSigParsed == 0 && stats.he > 0
+        fprintf(['    ※HE-SIG-A を1件も解釈できていません。受信SNR不足か、\n', ...
+                 '      HE パケットが 40/80MHz で送信されている可能性があります。\n']);
+    end
+end
+
 fprintf('  MAC まで復号成功          : %d\n', stats.decodeOK);
 fprintf('    うち Address2 無し(ACK/CTS等、BSSID判定不可): %d\n', stats.noAddr2);
 fprintf('  復号エラー                : %d\n', stats.errors);
@@ -577,7 +701,7 @@ if ~isempty(pktLog)
     fprintf('  [FCS 検証の内訳 (全BSSID)]\n');
     allFmt  = {pktLog.phyFormat};
     allFcsV = logical([pktLog.fcsVerified]);
-    for f = {'Non-HT', 'HT', 'VHT'}
+    for f = {'Non-HT', 'HT', 'VHT', 'HE'}
         sel = strcmpi(allFmt, f{1});
         if any(sel)
             fprintf('    %-6s : 記録%d件 (FCS検証OK=%d, ヘッダのみ推定=%d)\n', ...
@@ -600,7 +724,7 @@ if stats.errors > 0
 end
 
 %% ------------------------------------------------------------------------
-%  7. 対象 SSID の BSSID を特定し、CSI を抽出
+%  6. 対象 SSID の BSSID を特定し、CSI を抽出
 %  ------------------------------------------------------------------------
 seenNetworks = struct('bssid', {}, 'ssid', {});
 bssidKeys = keys(bssidToSSID);
@@ -624,14 +748,16 @@ if isempty(seenNetworks)
 else
     isHTPkt  = strcmpi({pktLog.phyFormat}, 'HT');
     isVHTPkt = strcmpi({pktLog.phyFormat}, 'VHT');
+    isHEPkt  = strcmpi({pktLog.phyFormat}, 'HE');
     for k = 1:numel(seenNetworks)
         bssid = seenNetworks(k).bssid;
         belongs = strcmp(allBssid, bssid) | strcmp(allAddr1, bssid);
         nAll  = sum(belongs);
         nHT   = sum(isHTPkt  & belongs);
         nVHT  = sum(isVHTPkt & belongs);
-        fprintf('  BSSID=%s  SSID="%s"  (全%d件, うちHT=%d件, VHT=%d件)\n', ...
-            bssid, seenNetworks(k).ssid, nAll, nHT, nVHT);
+        nHE   = sum(isHEPkt  & belongs);
+        fprintf('  BSSID=%s  SSID="%s"  (全%d件, うちHT=%d件, VHT=%d件, HE=%d件)\n', ...
+            bssid, seenNetworks(k).ssid, nAll, nHT, nVHT, nHE);
     end
     fprintf(['  ※ここでの件数は MAC ヘッダまで読めた(=BSSID が判明した)パケットのみ。\n', ...
              '    複数空間ストリームのパケットは SISO 受信ではヘッダも含めて\n', ...
@@ -645,12 +771,7 @@ knownBssidSet = {seenNetworks.bssid};
 uplinkSenders = containers.Map('KeyType', 'char', 'ValueType', 'double');
 for k = 1:numel(pktLog)
     if any(strcmp(knownBssidSet, pktLog(k).addr1)) && ~any(strcmp(knownBssidSet, pktLog(k).bssid))
-        s = pktLog(k).bssid;
-        if isKey(uplinkSenders, s)
-            uplinkSenders(s) = uplinkSenders(s) + 1;
-        else
-            uplinkSenders(s) = 1;
-        end
+        uplinkSenders = bumpMap(uplinkSenders, pktLog(k).bssid);
     end
 end
 if uplinkSenders.Count > 0
@@ -680,9 +801,9 @@ end
 matched = pktLog([]);   % 空の構造体配列
 
 if isempty(targetBSSID)
-    warning('captureIQ_HT:ssidNotFound', ...
+    warning('decodeIQ_HE:ssidNotFound', ...
         ['指定した SSID "%s" の Beacon/Probe Response を検出できませんでした。\n', ...
-         'captureDuration を長くする、pktDetThreshold を下げる (例 0.3)、', ...
+         'captureIQ.m の captureDuration を長くする、pktDetThreshold を下げる (例 0.3)、', ...
          'SSID の綴り・電波状況を確認する、などをお試しください。'], targetSSID);
 else
     isMatch = strcmp(allBssid, targetBSSID) | strcmp(allAddr1, targetBSSID);
@@ -692,8 +813,9 @@ else
 end
 
 % --- フォーマット別に [パケット数 x サブキャリア数] の行列へまとめる ---
-% Non-HT/HT は 52 本、VHT(20MHz) は 56 本とサブキャリア数が異なるため、
-% 1 つの行列には混ぜられない。フォーマットごとに分けて保存する。
+% Non-HT/HT は 52 本、VHT(20MHz) は 56 本、HE(20MHz) は 242 本と
+% サブキャリア数が異なるため、1 つの行列には混ぜられない。
+% フォーマットごとに分けて保存する。
 if isempty(matched)
     allFormats   = {};
     allTimeSec   = [];
@@ -709,6 +831,7 @@ end
 isNonHT = strcmpi(allFormats, 'Non-HT');
 isHT    = strcmpi(allFormats, 'HT');
 isVHT   = strcmpi(allFormats, 'VHT');
+isHE    = strcmpi(allFormats, 'HE');
 
 csiNonHT       = stackCSI(matched(isNonHT));
 timeSecNonHT   = allTimeSec(isNonHT);
@@ -725,9 +848,14 @@ timeSecVHT   = allTimeSec(isVHT);
 frameTypeVHT = allFrameType(isVHT);
 fcsVHT       = allFcs(isVHT);
 
+csiHE       = stackCSI(matched(isHE));
+timeSecHE   = allTimeSec(isHE);
+frameTypeHE = allFrameType(isHE);
+fcsHE       = allFcs(isHE);
+
 if ~isempty(matched)
-    fprintf('  内訳: Non-HT=%d, HT=%d, VHT=%d\n', ...
-        size(csiNonHT, 1), size(csiHT, 1), size(csiVHT, 1));
+    fprintf('  内訳: Non-HT=%d, HT=%d, VHT=%d, HE=%d\n', ...
+        size(csiNonHT, 1), size(csiHT, 1), size(csiVHT, 1), size(csiHE, 1));
     totalMPDU = sum([matched.mpduCount]);
     fprintf('  PPDU(電波上の送信単位)数=%d に対し、集約されたMPDU(データ単位)の合計=%d\n', ...
         numel(matched), totalMPDU);
@@ -741,16 +869,22 @@ end
 
 % --- ResultCSI.m 互換の「主」データを決める ---
 % ResultCSI.m は csi (行列) / subcarrierIndices / packetStartIndex /
-% csiMeta という変数名を前提とするため、3種類のうちパケット数が最も
-% 多い形式をその名前でも保存する。
-counts = [size(csiNonHT,1), size(csiHT,1), size(csiVHT,1)];
-[~, bestIdx] = max(counts);
-formatNames = {'Non-HT', 'HT', 'VHT'};
-csiSets    = {csiNonHT, csiHT, csiVHT};
-subcSets   = {subcarrierIndicesNonHT, subcarrierIndicesHT20, subcarrierIndicesVHT20};
-timeSets   = {timeSecNonHT, timeSecHT, timeSecVHT};
-frameSets  = {frameTypeNonHT, frameTypeHT, frameTypeVHT};
-fcsSets    = {fcsNonHT, fcsHT, fcsVHT};
+% csiMeta という変数名を前提とするため、いずれか 1 形式をその名前でも保存する。
+% 本スクリプトの目的は HE の CSI 収集なので、HE が 1 件でもあれば HE を
+% 優先する。HE が 0 件のときだけパケット数が最多の形式にフォールバックする。
+counts = [size(csiNonHT,1), size(csiHT,1), size(csiVHT,1), size(csiHE,1)];
+if counts(4) > 0
+    bestIdx = 4;
+else
+    [~, bestIdx] = max(counts);
+end
+formatNames = {'Non-HT', 'HT', 'VHT', 'HE'};
+csiSets    = {csiNonHT, csiHT, csiVHT, csiHE};
+subcSets   = {subcarrierIndicesNonHT, subcarrierIndicesHT20, ...
+              subcarrierIndicesVHT20, subcarrierIndicesHE20};
+timeSets   = {timeSecNonHT, timeSecHT, timeSecVHT, timeSecHE};
+frameSets  = {frameTypeNonHT, frameTypeHT, frameTypeVHT, frameTypeHE};
+fcsSets    = {fcsNonHT, fcsHT, fcsVHT, fcsHE};
 
 primaryFormat     = formatNames{bestIdx};
 csi               = csiSets{bestIdx};
@@ -769,11 +903,12 @@ if ~isempty(csi)
 end
 
 %% ------------------------------------------------------------------------
-%  8. 保存 (.mat)
+%  7. 保存 (.mat) — HDD と USB メモリの両方へ
 %  ------------------------------------------------------------------------
-% 変数名は calculateCSI.m / ResultCSI.m と揃えて csiMeta とする
+% 変数名は ResultCSI.m と揃えて csiMeta とする
 csiMeta = struct();
-csiMeta.description      = 'CSI filtered by target SSID (Non-HT / HT(NSS=1,20MHz) / SU-VHT(NSTS=1,20MHz))';
+csiMeta.description      = ['CSI filtered by target SSID ', ...
+    '(Non-HT / HT(NSS=1,20MHz) / SU-VHT(NSTS=1,20MHz) / HE-SU(NSTS=1,20MHz))'];
 csiMeta.primaryFormat    = primaryFormat;   % 変数 csi がどの形式か
 csiMeta.centerFrequency  = centerFrequency;
 csiMeta.sampleRate       = sampleRate;
@@ -785,22 +920,47 @@ csiMeta.serialNum        = usrpSerialNum;
 csiMeta.pktDetThreshold  = pktDetThreshold;
 csiMeta.overrunCount     = overrunCount;
 csiMeta.decodeStats      = stats;
-csiMeta.captureDatetime  = timestamp;
+csiMeta.heSupported      = heAvailable;       % HE 復号が有効だったか
+csiMeta.captureDatetime  = timestamp;         % キャプチャ時刻
+csiMeta.decodeDatetime   = datestr(now, 'yyyymmddHHMM');   % 復号を行った時刻
+csiMeta.sourceRawFile    = inputRawFile;      % どの生IQから作られたか
+csiMeta.captureMeta      = meta;              % キャプチャ時の全メタデータ
+csiMeta.decodedBy        = 'decodeIQ_HE.m';
 csiMeta.matlabVersion    = version;
 
 targetSSIDOut  = targetSSID;  %#ok<NASGU>
 targetBSSIDOut = targetBSSID; %#ok<NASGU>
 
-save(outMatFile, ...
+saveVars = { ...
     'csi', 'subcarrierIndices', 'packetStartIndex', 'csiMeta', ...
     'phyFormat', 'fcsVerified', 'timeSec', 'frameType', ...
     'csiNonHT', 'timeSecNonHT', 'frameTypeNonHT', 'fcsNonHT', ...
     'csiHT', 'timeSecHT', 'frameTypeHT', 'fcsHT', ...
     'csiVHT', 'timeSecVHT', 'frameTypeVHT', 'fcsVHT', ...
-    'subcarrierIndicesNonHT', 'subcarrierIndicesHT20', 'subcarrierIndicesVHT20', ...
-    'targetSSIDOut', 'targetBSSIDOut', 'seenNetworks', '-v7.3');
+    'csiHE', 'timeSecHE', 'frameTypeHE', 'fcsHE', ...
+    'subcarrierIndicesNonHT', 'subcarrierIndicesHT20', ...
+    'subcarrierIndicesVHT20', 'subcarrierIndicesHE20', ...
+    'targetSSIDOut', 'targetBSSIDOut', 'seenNetworks'};
 
-fprintf('\n結果を保存しました: %s\n', outMatFile);
+fprintf('\n');
+nSaved = 0;
+for k = 1:numel(outMatFiles)
+    try
+        save(outMatFiles{k}, saveVars{:}, '-v7.3');
+        fprintf('結果を保存しました: %s\n', outMatFiles{k});
+        nSaved = nSaved + 1;
+    catch ME
+        % 片方 (USB の抜き差し等) が失敗しても、もう片方は残す
+        warning('decodeIQ_HE:saveFailed', ...
+            '保存に失敗しました (%s): %s', outMatFiles{k}, ME.message);
+    end
+end
+
+if nSaved == 0
+    error('decodeIQ_HE:allSavesFailed', ...
+        'すべての出力先への保存に失敗しました。ドライブの接続を確認してください。');
+end
+
 fprintf('すべての処理が完了しました。\n');
 
 %% ------------------------------------------------------------------------
@@ -819,17 +979,47 @@ function M = stackCSI(entries)
     M = cat(1, entries(keep).csi);
 end
 
+function m = bumpMap(m, key)
+    % containers.Map のカウンタを 1 増やす (キーが無ければ 1 で作る)
+    if isKey(m, key)
+        m(key) = m(key) + 1;
+    else
+        m(key) = 1;
+    end
+end
+
+function printCountMapNum(m, label, fmt)
+    % 数値キーの集計 Map をキー昇順で 1 行に表示する
+    if m.Count == 0
+        return;
+    end
+    kk = sort(cell2mat(keys(m)));
+    fprintf('%s', label);
+    for k = 1:numel(kk)
+        fprintf(fmt, kk(k), m(kk(k)));
+    end
+    fprintf('\n');
+end
+
+function printCountMapChar(m, label)
+    % 文字列キーの集計 Map を 1 行に表示する
+    if m.Count == 0
+        return;
+    end
+    kk = keys(m);
+    fprintf('%s', label);
+    for k = 1:numel(kk)
+        fprintf('%s=%d回  ', kk{k}, m(kk{k}));
+    end
+    fprintf('\n');
+end
+
 function [cnt, shown] = recordDeag(cnt, shown, fmtName, info)
     % A-MPDU 分解の結果を集計する。ここが失敗しているか成功しているかで、
     % 「データ復号自体が壊れている」のか「FCS だけ通らない」のかを切り分ける。
     % deagStatus が空 = 分解まで到達せず (SIG段階で棄却) なので集計しない
     if ~isempty(info.deagStatus)
-        key = sprintf('%s: %s', fmtName, info.deagStatus);
-        if isKey(cnt, key)
-            cnt(key) = cnt(key) + 1;
-        else
-            cnt(key) = 1;
-        end
+        cnt = bumpMap(cnt, sprintf('%s: %s', fmtName, info.deagStatus));
     end
 
     % 想定外のデータ形式は一度だけ警告する (原因究明の手掛かりになるため)。
@@ -1219,6 +1409,351 @@ function [status, consumed, entry, info] = processVHT(pkt, lltfChanEst, noiseEst
         entry.mpduCount   = deagInfo.mpduCount;   % 0 = A-MPDU分解失敗
     end
     status = 1;
+end
+
+
+function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst, chanBW, fmtStr)
+    % HE-SU / HE-EXT-SU (802.11ax, NSTS=1, 20MHz) パケットを復号する。
+    %   status: 1=成功, 0=失敗/非対応, -1=サンプル不足
+    %   info:   診断用 (棄却理由・観測されたMCS/NSTS/帯域幅など)
+    %
+    % 手順は MathWorks の "Recovery Procedure for an 802.11ax Packet" と同じ。
+    % VHT と違い SIG フィールドのビット解釈は WLAN Toolbox
+    % (interpretHESIGABits) に任せられるので、自前パーサは不要。
+    entry = [];
+    consumed = 640;   % L-STF..HE-SIG-A(2シンボル)
+    info = struct('reason', '', 'packetFormat', char(fmtStr), 'sigaParsed', false, ...
+        'bwMHz', 0, 'nsts', 0, 'mcs', -1, 'coding', '', 'giUs', 0, ...
+        'heltfType', 0, 'dcm', false, 'stbc', false, 'bssColor', -1, ...
+        'uplink', false, 'lsigLen', 0, 'psduLen', 0, 'numSubcarriers', 0, ...
+        'subcIdx', [], 'mpduCount', 0, 'deagStatus', '', ...
+        'nonBinary', false, 'dataClass', '', 'dataRange', [0 0]);
+
+    % --- 本スクリプトで扱う HE PPDU 形式かを先に判定する ---
+    % HE の PPDU 形式でプリアンブル長 (HE-SIG-A のシンボル数) が変わる。
+    %   HE-SU / HE-MU / HE-TB … HE-SIG-A は 2 シンボル
+    %   HE-EXT-SU (ER SU)     … HE-SIG-A は 2 シンボルを 2 回繰り返して 4 シンボル
+    switch upper(char(fmtStr))
+        case 'HE-SU'
+            sigaSyms = 2;
+        case 'HE-EXT-SU'
+            sigaSyms = 4;
+        case 'HE-MU'
+            % HE-SIG-B から RU 割り当てとユーザ情報を読む必要があり、
+            % SISO・単一ユーザ前提の本スクリプトの対象外。
+            info.reason = 'HE-MU(OFDMA/MU-MIMO)';
+            status = 0; return;
+        case 'HE-TB'
+            % 送信パラメータは AP が送った Trigger フレーム側にあるため、
+            % HE-TB PPDU 単体からは復号条件が決まらない。
+            info.reason = 'HE-TB(トリガベース。Triggerフレーム無しでは復号不可)';
+            status = 0; return;
+        otherwise
+            info.reason = sprintf('未対応のHE形式(%s)', char(fmtStr));
+            status = 0; return;
+    end
+
+    consumed = 480 + sigaSyms * 80;
+    if numel(pkt) < consumed
+        status = -1;
+        return;
+    end
+
+    % --- L-SIG + RL-SIG: pre-HE のチャネル推定と L-SIG LENGTH の取得 ---
+    % HE PPDU の L-SIG / RL-SIG / HE-SIG-A は 20MHz あたり 56 本の
+    % サブキャリア (レガシーの 52 本 + 両端に 4 本) で送られる。
+    % L-LTF の推定値は 52 本しか無いので、追加の 4 本を含む推定値を作る。
+    lsigDemod    = wlanHEDemodulate(pkt(321:480), 'L-SIG', chanBW);   % L-SIG + RL-SIG
+    preInfo      = wlanHEOFDMInfo('L-SIG', chanBW);
+    chanEstPreHE = preHEChannelEstimateCompat(lsigDemod, lltfChanEst, chanBW);
+
+    [eqLSIG, csiLSIG] = heEqualizeCompat(lsigDemod(preInfo.DataIndices, :, :), ...
+        chanEstPreHE(preInfo.DataIndices, :), noiseEst, chanBW, 'L-SIG');
+    [lsigFail, lsigInfo] = lsigBitRecoverCompat(eqLSIG, noiseEst, csiLSIG);
+    if lsigFail
+        info.reason = 'L-SIG パリティ失敗';
+        status = 0;
+        return;
+    end
+    info.lsigLen = double(lsigInfo.Length);
+
+    % --- HE-SIG-A の復号 ---
+    % HE-SIG-A は pre-HE のサブキャリアに載るので、チャネル推定は
+    % L-SIG と同じ chanEstPreHE を使う。
+    sigaDemod = wlanHEDemodulate(pkt(481 : 480 + sigaSyms * 80), 'HE-SIG-A', chanBW);
+    sigaInfo  = wlanHEOFDMInfo('HE-SIG-A', chanBW);
+    [eqSIGA, csiSIGA] = heEqualizeCompat(sigaDemod(sigaInfo.DataIndices, :, :), ...
+        chanEstPreHE(sigaInfo.DataIndices, :), noiseEst, chanBW, 'HE-SIG-A');
+
+    [sigaBits, sigaFail] = heSIGABitRecoverCompat(eqSIGA, noiseEst, csiSIGA);
+    if sigaFail
+        info.reason = 'HE-SIG-A CRC失敗';
+        status = 0;
+        return;
+    end
+
+    % --- HE-SIG-A のビット解釈 (WLAN Toolbox に任せる) ---
+    % L-SIG LENGTH はデータ部のシンボル数の算出に必要なので、解釈前に渡す。
+    try
+        cfgRx = wlanHERecoveryConfig('PacketFormat', char(fmtStr), ...
+            'ChannelBandwidth', chanBW, 'LSIGLength', info.lsigLen);
+    catch
+        % 古い版では LSIGLength を構築時に渡せないことがあるので後から設定する
+        cfgRx = wlanHERecoveryConfig('PacketFormat', char(fmtStr), ...
+            'ChannelBandwidth', chanBW);
+        cfgRx.LSIGLength = info.lsigLen;
+    end
+
+    [cfgRx, failInterp] = interpretHESIGABits(cfgRx, sigaBits);
+    if failInterp
+        info.reason = 'HE-SIG-A解釈不能';
+        status = 0;
+        return;
+    end
+    info.sigaParsed = true;
+
+    % --- 解釈できたパラメータを診断用に控える ---
+    info.bwMHz     = bwStringToMHz(getProp(cfgRx, 'ChannelBandwidth', chanBW));
+    info.nsts      = double(getProp(cfgRx, 'NumSpaceTimeStreams', 0));
+    info.mcs       = double(getProp(cfgRx, 'MCS', -1));
+    info.coding    = char(string(getProp(cfgRx, 'ChannelCoding', '')));
+    info.giUs      = double(getProp(cfgRx, 'GuardInterval', 0));
+    info.heltfType = double(getProp(cfgRx, 'HELTFType', 0));
+    info.dcm       = logical(getProp(cfgRx, 'DCM', false));
+    info.stbc      = logical(getProp(cfgRx, 'STBC', false));
+    info.bssColor  = double(getProp(cfgRx, 'BSSColor', -1));
+    info.uplink    = logical(getProp(cfgRx, 'UplinkIndication', false));
+
+    % --- SISO(受信1本)/20MHz 受信では扱えない構成をここで弾く ---
+    if info.bwMHz ~= bwStringToMHz(chanBW)
+        info.reason = sprintf('帯域幅%dMHz(20MHz受信では復号不可)', info.bwMHz);
+        status = 0; return;
+    elseif info.nsts ~= 1
+        info.reason = sprintf('NSTS=%d(アンテナ1本では復号不可)', info.nsts);
+        status = 0; return;
+    elseif info.stbc
+        info.reason = 'STBC';
+        status = 0; return;
+    end
+
+    % --- フィールド位置と PSDU 長 ---
+    try
+        ind = wlanFieldIndices(cfgRx);
+    catch ME
+        info.reason = ['フィールド位置算出失敗: ' ME.message];
+        status = 0; return;
+    end
+
+    try
+        info.psduLen = double(getPSDULength(cfgRx));
+    catch
+        info.psduLen = 0;
+    end
+    if info.psduLen <= 0
+        info.reason = 'PSDU長を決定できず';
+        status = 0; return;
+    end
+
+    if numel(pkt) < ind.HEData(2)
+        status = -1;
+        return;   % データ部がまだ届いていない (末尾で切れている)
+    end
+
+    % パケット末尾は HE-Data の後ろに PE (Packet Extension) が付く。
+    % 次のパケット探索を PE の後ろから始めるため、あれば末尾に含める。
+    lastSample = double(ind.HEData(2));
+    if isfield(ind, 'HEPE') && ~isempty(ind.HEPE) && numel(pkt) >= double(ind.HEPE(2))
+        lastSample = max(lastSample, double(ind.HEPE(2)));
+    end
+    consumed = lastSample;
+
+    % --- HE-LTF を復調してチャネル推定 (= CSI) ---
+    % 20MHz の HE-SU は 242-tone RU なので、ここで得られる CSI は 242 本。
+    % Non-HT/HT(52本)・VHT(56本)とはサブキャリアの間隔も本数も異なる。
+    demodHELTF = wlanHEDemodulate(pkt(ind.HELTF(1):ind.HELTF(2)), 'HE-LTF', cfgRx);
+    heChanEst  = wlanHELTFChannelEstimate(demodHELTF, cfgRx);
+
+    ofdmInfo = wlanHEOFDMInfo('HE-Data', cfgRx);
+    info.numSubcarriers = size(heChanEst, 1);
+    if isfield(ofdmInfo, 'ActiveFrequencyIndices') && ...
+            numel(ofdmInfo.ActiveFrequencyIndices) == info.numSubcarriers
+        info.subcIdx = double(ofdmInfo.ActiveFrequencyIndices(:)).';
+    end
+
+    % --- HE-Data の復号 ---
+    % 雑音分散は L-LTF から求めた値 (noiseEst) をそのまま使っている。
+    % HE-Data はサブキャリア間隔が 1/4 (78.125kHz) なので、厳密には
+    % L-LTF 由来の値とスケールが一致しない。MMSE 等化と LDPC の LLR に
+    % 効くため、「HE-SIG-A は解釈できるのに HE-Data の FCS が通らない」
+    % 場合はここを最初に疑うとよい (HE-LTF から雑音を推定し直す)。
+    demodData = wlanHEDemodulate(pkt(ind.HEData(1):ind.HEData(2)), 'HE-Data', cfgRx);
+    [eqData, csiData] = heEqualizeCompat(demodData(ofdmInfo.DataIndices, :, :), ...
+        heChanEst(ofdmInfo.DataIndices, :, :), noiseEst, cfgRx, 'HE-Data');
+    rxPSDU = heDataBitRecoverCompat(eqData, noiseEst, csiData, cfgRx);
+
+    % --- HE の PSDU は必ず A-MPDU なので分解してから MPDU を復号 ---
+    % wlanAMPDUDeaggregate / wlanMPDUDecode は wlanHERecoveryConfig ではなく
+    % 送信用の wlanHESUConfig を受け取るため、復号したパラメータから作り直す。
+    cfgMACPhy = buildHEMACConfig(cfgRx, info.psduLen, chanBW);
+    [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgMACPhy);
+    info.mpduCount  = deagInfo.mpduCount;
+    info.deagStatus = deagInfo.status;
+    info.nonBinary  = deagInfo.nonBinary;
+    info.dataClass  = deagInfo.dataClass;
+    info.dataRange  = deagInfo.dataRange;
+    if ~ok
+        info.reason = sprintf('MPDU復号失敗(分解=%s,MPDU数=%d)', ...
+            deagInfo.status, deagInfo.mpduCount);
+        status = 0;
+        return;
+    end
+
+    entry = buildEntry(cfgMAC, payload, 'HE', heChanEst);
+    if ~isempty(entry)
+        entry.fcsVerified = ~deagInfo.headerOnly;
+        entry.mpduCount   = deagInfo.mpduCount;   % 0 = A-MPDU分解失敗
+    end
+    status = 1;
+end
+
+function chanEst = preHEChannelEstimateCompat(lsigDemod, lltfChanEst, chanBW)
+    % pre-HE フィールド (L-SIG / RL-SIG / HE-SIG-A) 用のチャネル推定を返す。
+    %
+    % HE PPDU ではこれらのフィールドが 20MHz あたり 56 本のサブキャリアで
+    % 送られる (レガシーの 52 本 + 両端の 4 本)。両端 4 本を L-SIG/RL-SIG
+    % から推定するのが wlanPreHEChannelEstimate。
+    try
+        chanEst = wlanPreHEChannelEstimate(lsigDemod, lltfChanEst, chanBW);
+        return;
+    catch
+        % wlanPreHEChannelEstimate が無い MATLAB 向けのフォールバック
+    end
+
+    % フォールバック: L-LTF の推定値を両端に複製して本数だけ合わせる。
+    % 追加される 4 本 (k=±27, ±28) は隣接サブキャリアと相関が高く、
+    % SIG フィールドは BPSK + 畳み込み符号なのでこの近似で復号できる。
+    info = wlanHEOFDMInfo('L-SIG', chanBW);
+    h    = lltfChanEst(:, 1);
+    nPre = double(info.NumTones);
+    nL   = numel(h);
+    if nPre <= nL
+        chanEst = h(1:nPre);
+        return;
+    end
+    nEdge   = floor((nPre - nL) / 2);
+    chanEst = [repmat(h(1), nEdge, 1); h; repmat(h(end), nPre - nL - nEdge, 1)];
+end
+
+function [eqSym, csi] = heEqualizeCompat(sym, chEst, noiseEst, cfg, field)
+    % HE のフィールドを等化する。wlanHEEqualize があればそれを使い、
+    % 無ければ受信アンテナ1本 (SISO) 前提の MMSE 等化を自前で行う。
+    try
+        [eqSym, csi] = wlanHEEqualize(sym, chEst, noiseEst, cfg, field);
+        return;
+    catch
+    end
+
+    % フォールバック: SISO の MMSE 等化
+    %   eq = conj(h)*y / (|h|^2 + N0),  CSI = |h|^2
+    h = chEst;
+    h = reshape(h, size(h, 1), []);
+    h = h(:, 1);
+    y = reshape(sym, size(sym, 1), []);   % [サブキャリア x シンボル]
+    csi   = abs(h).^2;
+    eqSym = (conj(h) .* y) ./ (csi + noiseEst);
+end
+
+function [failCheck, lsigInfo] = lsigBitRecoverCompat(eqLSIG, noiseEst, csiLSIG)
+    % HE PPDU の L-SIG を復号し、パリティ結果と LENGTH/MCS を返す。
+    % HE では L-SIG が RL-SIG として繰り返し送られるので 2 シンボルまとめて
+    % 渡すと誤り耐性が上がるが、これを受け付けない版があるので、
+    % その場合は L-SIG の 1 シンボルだけでもう一度試す。
+    try
+        [~, failCheck, lsigInfo] = wlanLSIGBitRecover(eqLSIG, noiseEst, csiLSIG);
+        return;
+    catch ME
+        if size(eqLSIG, 2) < 2
+            rethrow(ME);
+        end
+    end
+    [~, failCheck, lsigInfo] = wlanLSIGBitRecover(eqLSIG(:, 1, :), noiseEst, csiLSIG);
+end
+
+function [bits, failCRC] = heSIGABitRecoverCompat(eqSIGA, noiseEst, csiSIGA)
+    % HE-SIG-A の情報ビットを復元する。
+    % HE-EXT-SU では HE-SIG-A が 4 シンボル (2 シンボルを 2 回繰り返し) に
+    % なるが、これを受け付けない版があるので、その場合は先頭 2 シンボルだけで
+    % もう一度試す。
+    try
+        [bits, failCRC] = wlanHESIGABitRecover(eqSIGA, noiseEst, csiSIGA);
+        return;
+    catch ME
+        if size(eqSIGA, 2) <= 2
+            rethrow(ME);
+        end
+    end
+    [bits, failCRC] = wlanHESIGABitRecover(eqSIGA(:, 1:2, :), noiseEst, csiSIGA);
+end
+
+function rxPSDU = heDataBitRecoverCompat(eqData, noiseEst, csiData, cfgRx)
+    % HE-Data のビットを復元する。csi を受け取らない版があるので両方試す。
+    try
+        rxPSDU = wlanHEDataBitRecover(eqData, noiseEst, csiData, cfgRx);
+        return;
+    catch
+    end
+    rxPSDU = wlanHEDataBitRecover(eqData, noiseEst, cfgRx);
+end
+
+function cfg = buildHEMACConfig(cfgRx, psduLen, chanBW)
+    % A-MPDU 分解 / MPDU 復号に渡す PHY コンフィグを作る。
+    % wlanAMPDUDeaggregate / wlanMPDUDecode は受信用の wlanHERecoveryConfig を
+    % 受け付けないため、復号済みパラメータから送信用の wlanHESUConfig を作る。
+    % (MAC の解析に効くのは「HE のフォーマットである」ことと帯域幅だけなので、
+    %  細かい変調パラメータの設定に失敗しても致命的ではない)
+    try
+        cfg = wlanHESUConfig( ...
+            'ChannelBandwidth',     getProp(cfgRx, 'ChannelBandwidth', chanBW), ...
+            'NumTransmitAntennas',  1, ...
+            'NumSpaceTimeStreams',  1, ...
+            'MCS',                  double(getProp(cfgRx, 'MCS', 0)), ...
+            'ChannelCoding',        char(string(getProp(cfgRx, 'ChannelCoding', 'LDPC'))), ...
+            'GuardInterval',        double(getProp(cfgRx, 'GuardInterval', 0.8)), ...
+            'HELTFType',            double(getProp(cfgRx, 'HELTFType', 4)), ...
+            'APEPLength',           max(double(psduLen), 1));
+        return;
+    catch
+    end
+
+    try
+        cfg = wlanHESUConfig('ChannelBandwidth', getProp(cfgRx, 'ChannelBandwidth', chanBW));
+    catch
+        cfg = wlanHESUConfig();
+    end
+end
+
+function v = getProp(obj, name, defaultVal)
+    % オブジェクトのプロパティを安全に読む (無ければ既定値)。
+    % wlanHERecoveryConfig は PPDU 形式によって持つプロパティが変わるため。
+    v = defaultVal;
+    try
+        p = obj.(name);
+        if ~isempty(p)
+            v = p;
+        end
+    catch
+    end
+end
+
+function mhz = bwStringToMHz(bwStr)
+    % 'CBW20' -> 20 のように WLAN Toolbox の帯域幅指定を MHz の数値へ直す
+    s = char(string(bwStr));
+    d = regexp(s, '\d+', 'match', 'once');
+    if isempty(d)
+        mhz = 0;
+    else
+        mhz = str2double(d);
+    end
 end
 
 function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgFormat)
