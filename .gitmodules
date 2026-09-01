@@ -1,0 +1,6 @@
+[submodule "external/SHARP"]
+	path = external/SHARP
+	url = https://github.com/Heisuke-T/SHARP.git
+[submodule "external/SHARP-ax"]
+	path = external/SHARP-ax
+	url = https://github.com/Heisuke-T/SHARPax.git
