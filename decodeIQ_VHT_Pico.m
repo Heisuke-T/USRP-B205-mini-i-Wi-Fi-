@@ -478,7 +478,7 @@ stats = struct('detected', 0, 'timingSkip', 0, 'nonHT', 0, 'ht', 0, 'vht', 0, ..
 %   SERVICE 内 SIG-B CRC : データ部の先頭16bitが正しく復号できているか
 vhtQualMax = 20000;
 vhtQual = struct('snrdB', nan(vhtQualMax, 1), 'evmPct', nan(vhtQualMax, 1), ...
-    'peak', nan(vhtQualMax, 1));
+    'peak', nan(vhtQualMax, 1), 'mcs', nan(vhtQualMax, 1));
 nVhtQual   = 0;
 vhtSigBOK  = 0;   % SERVICE 内の VHT-SIG-B CRC を通った件数
 vhtSigBNG  = 0;   % 同 失敗した件数
@@ -624,6 +624,7 @@ while searchOffset + minPreambleLen <= numel(iq)
                     vhtQual.snrdB(nVhtQual)  = vhtInfo.snrdB;
                     vhtQual.evmPct(nVhtQual) = vhtInfo.evmPct;
                     vhtQual.peak(nVhtQual)   = vhtInfo.peakAmp;
+                    vhtQual.mcs(nVhtQual)    = vhtInfo.mcs;
                 end
                 if vhtInfo.sigbCRC == 1
                     vhtSigBOK = vhtSigBOK + 1;
@@ -853,10 +854,29 @@ if stats.vht > 0
         peakMed = median(vhtQual.peak(1:nVhtQual),   'omitnan');
         peakHi  = mean(vhtQual.peak(1:nVhtQual) > 0.95) * 100;
 
-        fprintf('  [VHT データ部の品質診断] (%d パケットの中央値)\n', nVhtQual);
-        fprintf('    受信SNR (L-LTF)     : %.1f dB\n', snrMed);
+        % 観測されたMCSの最頻値 (要求SNRとの比較に使う)
+        mcsObs = mode(vhtQual.mcs(1:nVhtQual));
+        evmCeil = evmCeilingPct(mcsObs);          % 信号点がランダムなときのEVM
+        evmSaturated = ~isnan(evmMed) && ~isnan(evmCeil) && evmMed > 0.8 * evmCeil;
+        reqSNR  = vhtRequiredSNRdB(mcsObs);       % そのMCSに必要な受信SNRの目安
+
+        fprintf('  [VHT データ部の品質診断] (%d パケットの中央値, MCS%d)\n', ...
+            nVhtQual, mcsObs);
+        fprintf('    受信SNR (L-LTF)     : %.1f dB', snrMed);
+        if ~isnan(reqSNR)
+            fprintf('   (MCS%d の目安 %.0f dB に対し %+.1f dB)', ...
+                mcsObs, reqSNR, snrMed - reqSNR);
+        end
+        fprintf('\n');
         if isnan(evmMed)
             fprintf('    データ部 EVM        : 測定できず\n');
+        elseif evmSaturated
+            % EVM は「最も近い理想信号点」を基準に測っているため、信号点が
+            % 判定領域からはみ出すほど劣化すると値が頭打ちになる。頭打ちに
+            % 達している = データ部が事実上復調できていない、という意味。
+            fprintf('    データ部 EVM        : %.1f %%  <-- 判定飽和 (この変調の上限 ≒ %.1f%%)\n', ...
+                evmMed, evmCeil);
+            fprintf('                          信号点が理想点と対応づかない = データ部は復調できていない\n');
         else
             fprintf('    データ部 EVM        : %.1f %%  (等価SNR %.1f dB)\n', ...
                 evmMed, -20*log10(max(evmMed, realmin)/100));
@@ -866,31 +886,47 @@ if stats.vht > 0
         if vhtSigBOK + vhtSigBNG > 0
             fprintf('    SERVICE内 SIG-B CRC : OK=%d / NG=%d\n', vhtSigBOK, vhtSigBNG);
         end
+        if ~isnan(snrMed) && snrMed > 0
+            % CSI の位相ばらつきの目安 (推定SNR gamma に対し標準偏差 ~ 1/sqrt(2*gamma))
+            gammaLin = 10^(snrMed / 10);
+            fprintf('    CSI の位相ばらつき  : 約 ±%.0f 度 (この SNR での目安)\n', ...
+                rad2deg(1 / sqrt(2 * gammaLin)));
+        end
 
         % --- 判定 ---
-        % MCS3 (16QAM R=1/2) はおよそ EVM 10%% (等価SNR 20dB) 以下でないと
-        % 誤りなく復号できない。プリアンブルの SIG フィールドは BPSK R=1/2
-        % なので 10dB 近く低い品質でも読めてしまい、「SIG は読めるのに FCS が
-        % 通らない」状態になる。
+        % SIG フィールドは BPSK R=1/2 なので低い SNR でも読めてしまう。
+        % データ部が要求する SNR との差が「SIG は読めるのに FCS が通らない」
+        % 状態を生む。振幅ピークは飽和の有無だけを見る指標であり、
+        % 小さいこと自体は SNR とは直接関係しない (SNR はアンテナ入力の
+        % 信号対雑音比で決まり、受信機の gain を上げても改善しない)。
         fprintf('    判定: ');
         if ~isnan(peakMed) && (peakMed > 0.95 || peakHi > 20)
             fprintf(['振幅がフルスケールに達している = ADC が飽和している。\n', ...
                      '      注入源が近すぎるか captureIQ.m の gain が高すぎる。\n', ...
-                     '      gain を 10〜20dB 下げて取り直すと FCS が通るようになる。\n']);
-        elseif ~isnan(evmMed) && ~isnan(snrMed) && snrMed > 25 && evmMed > 12
+                     '      gain を 10〜20dB 下げて取り直すこと。\n']);
+        elseif ~isnan(snrMed) && ~isnan(reqSNR) && snrMed < reqSNR
+            fprintf(['受信SNR が MCS%d の要求に %.1f dB 足りない。\n'], ...
+                mcsObs, reqSNR - snrMed);
+            fprintf(['      SNR はアンテナ入力で決まるため、captureIQ.m の gain を\n', ...
+                     '      上げても改善しない (信号と雑音が同じだけ増えるため)。\n', ...
+                     '      効くのは次の順:\n', ...
+                     '        1. 送信側を --mcs 0 (BPSK R=1/2, 目安 %.0f dB) にする\n', ...
+                     '           ※CSI の品質は MCS に依存しないので副作用は無い\n', ...
+                     '        2. 送受信アンテナを近づける / 向きと見通しを改善する\n', ...
+                     '        3. PicoScenes 側の送信出力を上げる\n', ...
+                     '        4. 空いているチャネルへ移る (周囲のAPと干渉している)\n'], ...
+                vhtRequiredSNRdB(0));
+        elseif ~isnan(snrMed) && ~isnan(evmMed) && ~evmSaturated && ...
+                snrMed > 20 && evmMed > 2 * 100 / 10^(snrMed/20)
             fprintf(['受信SNR は十分なのに EVM が悪い = 雑音ではなく歪みが原因。\n', ...
-                     '      ADC 飽和・送信側の非線形・強い隣接チャネル干渉を疑う。\n', ...
-                     '      まず captureIQ.m の gain を下げて取り直すこと。\n']);
-        elseif ~isnan(evmMed) && evmMed > 12
-            fprintf(['受信品質が MCS%d の要求に届いていない。\n', ...
-                     '      アンテナを近づける / gain を上げる、あるいは送信側を\n', ...
-                     '      --mcs 0 (BPSK R=1/2) にすると MAC まで復号できる。\n'], ...
-                     ternary(isempty(targetMCS), 3, targetMCS));
+                     '      ADC 飽和・送信側の非線形・強い隣接チャネル干渉を疑う。\n']);
         else
             fprintf('データ部の品質は良好。\n');
         end
         fprintf(['    ※CSI は VHT-LTF (プリアンブル) から求めており、データ部の\n', ...
-                 '      復号可否とは無関係に有効である。\n']);
+                 '      復号可否とは無関係に有効である。ただし CSI 自体の\n', ...
+                 '      ばらつきは受信SNR で決まるため、SNR の改善は CSI の\n', ...
+                 '      品質向上にも直接効く。\n']);
     end
 end
 fprintf('  CSI を記録できたパケット  : %d\n', stats.decodeOK - stats.noAddr2);
@@ -1310,6 +1346,8 @@ if nVhtQual > 0
         'evmPctMedian', median(vhtQual.evmPct(1:nVhtQual), 'omitnan'), ...
         'peakAmpMedian', median(vhtQual.peak(1:nVhtQual),  'omitnan'), ...
         'peakAmpOver095Pct', mean(vhtQual.peak(1:nVhtQual) > 0.95) * 100, ...
+        'mcsMode',     mode(vhtQual.mcs(1:nVhtQual)), ...
+        'requiredSNRdB', vhtRequiredSNRdB(mode(vhtQual.mcs(1:nVhtQual))), ...
         'sigbCRCOK',   vhtSigBOK, ...
         'sigbCRCFail', vhtSigBNG);
 else
@@ -1516,6 +1554,42 @@ function info = measureVHTQuality(info, pktSeg, lltfChanEst, noiseEst, eqSym, si
     catch
         % 診断に失敗しても復号は続ける
     end
+end
+
+function evmCeil = evmCeilingPct(mcs)
+    % 「最も近い理想信号点」を基準にした EVM の上限 [%]。
+    %
+    % 受信信号点が判定領域内で一様に散らばる (= 事実上ランダム) とき、
+    % 最近傍点との距離の二乗平均は d^2/6 になる (d は最小信号点間距離)。
+    % 単位平均電力の方形QAMでは d = sqrt(6/(M-1)) なので、EVM の上限は
+    %   100 * d / sqrt(6) = 100 / sqrt(M-1)  [%]
+    % となる。測定値がこれに近ければ、EVM の値そのものには意味が無く
+    % 「データ部が復調できていない」ことだけを示している。
+    evmCeil = NaN;
+    modOrders = [2 4 4 16 16 64 64 64 256 256];   % VHT MCS0..MCS9
+    if isnan(mcs) || mcs < 0 || mcs > 9
+        return;
+    end
+    M = modOrders(mcs + 1);
+    if M < 4
+        M = 4;   % BPSK は判定が1次元だが、目安として QPSK と同じ値を使う
+    end
+    evmCeil = 100 / sqrt(M - 1);
+end
+
+function snrdB = vhtRequiredSNRdB(mcs)
+    % VHT 20MHz / 1空間ストリームで、そのMCSのデータ部を誤りなく復号する
+    % のに必要な受信SNRの目安 [dB] (AWGN, PER 10%% 程度)。
+    % 厳密な閾値ではなく「足りているか」を判断するための目安として使う。
+    %   MCS0 BPSK 1/2 / MCS1 QPSK 1/2 / MCS2 QPSK 3/4 / MCS3 16QAM 1/2 /
+    %   MCS4 16QAM 3/4 / MCS5 64QAM 2/3 / MCS6 64QAM 3/4 / MCS7 64QAM 5/6 /
+    %   MCS8 256QAM 3/4 / MCS9 256QAM 5/6
+    table = [5 8 10 13 17 21 22 24 28 30];
+    snrdB = NaN;
+    if isnan(mcs) || mcs < 0 || mcs > 9
+        return;
+    end
+    snrdB = table(mcs + 1);
 end
 
 function evmPct = evmFromEqSym(eqSym, mcs)
