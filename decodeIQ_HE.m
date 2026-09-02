@@ -174,6 +174,17 @@ pktDetThreshold = 0.5;          % wlanPacketDetect のしきい値 (0〜1)
 verboseErrors   = false;        % true にすると復号エラーを毎回表示する
                                  % (通常は最後に集計のみ表示)
 
+% --- MAC が読めなかった HE パケットを BSS Color で拾うか --------------------
+%     高い MCS (1024QAM 等) では受信SNRが少し足りないだけでデータ部の FCS が
+%     通らなくなるが、CSI はプリアンブル (HE-LTF) から算出しているので影響を
+%     受けない。HE-SIG-A の BSS Color は CRC を通ったうえで読めるため、
+%     MAC が読めたパケットから Color -> BSSID を学習しておけば、読めなかった
+%     パケットも同じ BSS のものとして CSI を残せる。
+%     ※ Color は 6bit しかないため、近隣に同じ Color の BSS があると混ざる
+%       可能性がある。厳密に MAC で確認できたものだけが欲しい場合は false に
+%       する (その場合 fcsVerified が false の HE 記録は出力されない)。
+useBSSColorFallback = true;
+
 %% ------------------------------------------------------------------------
 %  2. 生IQファイルの読み込み
 %  ------------------------------------------------------------------------
@@ -344,13 +355,13 @@ subcarrierIndicesVHT20 = [-28:-1, 1:28];    % VHT    CBW20 (56本)
 subcarrierIndicesHE20  = [-122:-2, 2:122];  % HE     CBW20 (242本)
 
 pktLog = struct('timeSec', {}, 'bssid', {}, 'addr1', {}, 'frameType', {}, 'ssid', {}, ...
-    'phyFormat', {}, 'fcsVerified', {}, 'mpduCount', {}, 'csi', {});
+    'phyFormat', {}, 'bssColor', {}, 'fcsVerified', {}, 'mpduCount', {}, 'csi', {});
 bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
 
 % 復号統計 (診断用)
 stats = struct('detected', 0, 'timingSkip', 0, 'nonHT', 0, 'ht', 0, 'vht', 0, ...
     'he', 0, 'htGF', 0, 'other', 0, 'htUnsupported', 0, 'vhtUnsupported', 0, ...
-    'heUnsupported', 0, 'decodeOK', 0, 'noAddr2', 0, 'errors', 0);
+    'heUnsupported', 0, 'decodeOK', 0, 'csiOnly', 0, 'noAddr2', 0, 'errors', 0);
 errMsgs       = containers.Map('KeyType', 'char', 'ValueType', 'double');
 deagStatusCnt = containers.Map('KeyType', 'char', 'ValueType', 'double');
 nonBinaryShown = false;  % 非0/1データを検出した旨を一度だけ表示するためのフラグ
@@ -626,7 +637,13 @@ while searchOffset + minPreambleLen <= numel(iq)
             continue;
         end
 
-        if st > 0
+        if st == 2
+            % MAC は読めなかったが CSI は取れている HE パケット。
+            % 後段で BSS Color を手掛かりに対象SSIDへ帰属させる。
+            stats.csiOnly = stats.csiOnly + 1;
+            entry.timeSec = pktStart / sampleRate;
+            pktLog(end+1) = entry; %#ok<SAGROW>
+        elseif st > 0
             stats.decodeOK = stats.decodeOK + 1;
 
             if isempty(entry)
@@ -802,6 +819,7 @@ if stats.he > 0
 end
 
 fprintf('  MAC まで復号成功          : %d\n', stats.decodeOK);
+fprintf('  CSIのみ記録(HE, MAC未復号): %d\n', stats.csiOnly);
 fprintf('    うち Address2 無し(ACK/CTS等、BSSID判定不可): %d\n', stats.noAddr2);
 fprintf('  復号エラー                : %d\n', stats.errors);
 
@@ -918,7 +936,61 @@ for k = 1:numel(seenNetworks)
     end
 end
 
+% --- BSS Color と BSSID の対応を学習する ------------------------------------
+% HE-SIG-A の BSS Color は CRC を通ったうえで得られる 6bit の BSS 識別子で、
+% MAC ヘッダが読めなくても分かる。高MCS (1024QAM 等) では受信SNRが少し
+% 足りないだけでデータ部の FCS が通らなくなるが、CSI はプリアンブル
+% (HE-LTF) から算出しているので影響を受けない。そこで
+%   「MAC が読めたパケット」から Color -> BSSID の対応を学習し、
+%   「MAC が読めなかったパケット」を Color 一致で同じ BSS に帰属させる
+% ことで、CSI を捨てずに済ませる。
+%
+% 6bit しかないので別々の BSS が同じ Color を使うことはあり得る。学習中に
+% 1つの Color が複数の BSSID に結びついた場合は、その Color での帰属を
+% 諦める (誤って別ネットワークの CSI を混ぜるより、取りこぼす方が安全)。
+allColors  = [pktLog.bssColor];
+colorToBSSID   = containers.Map('KeyType', 'double', 'ValueType', 'char');
+colorConflicts = containers.Map('KeyType', 'double', 'ValueType', 'logical');
+for k = 1:numel(pktLog)
+    c = pktLog(k).bssColor;
+    if c < 0 || isempty(pktLog(k).bssid)
+        continue;   % HE以外、または送信元が分からなかったパケット
+    end
+    if isKey(colorToBSSID, c)
+        if ~strcmp(colorToBSSID(c), pktLog(k).bssid)
+            % 同じ Color に別の BSSID。ただしアップリンク(送信元=クライアント)
+            % でも Color は AP と同じなので、Address1 が既知の BSSID なら矛盾
+            % ではない。ここでは安全側に倒して衝突として扱う。
+            if ~strcmp(pktLog(k).addr1, colorToBSSID(c))
+                colorConflicts(c) = true;
+            end
+        end
+    else
+        colorToBSSID(c) = pktLog(k).bssid;
+    end
+end
+
+if colorToBSSID.Count > 0
+    fprintf('\nBSS Color と BSSID の対応 (MACが読めたパケットから学習):\n');
+    cKeys = sort(cell2mat(keys(colorToBSSID)));
+    for k = 1:numel(cKeys)
+        bs = colorToBSSID(cKeys(k));
+        ss = '';
+        for j = 1:numel(seenNetworks)
+            if strcmp(seenNetworks(j).bssid, bs)
+                ss = seenNetworks(j).ssid;
+                break;
+            end
+        end
+        conflict = isKey(colorConflicts, cKeys(k)) && colorConflicts(cKeys(k));
+        fprintf('  Color%-2d -> BSSID=%s%s%s\n', cKeys(k), bs, ...
+            ternary(~isempty(ss), sprintf('  SSID="%s"', ss), ''), ...
+            ternary(conflict, '   <-- 複数のBSSIDと衝突。Colorでの帰属は行いません', ''));
+    end
+end
+
 matched = pktLog([]);   % 空の構造体配列
+nByColor = 0;
 
 if isempty(targetBSSID)
     warning('decodeIQ_HE:ssidNotFound', ...
@@ -927,9 +999,33 @@ if isempty(targetBSSID)
          'SSID の綴り・電波状況を確認する、などをお試しください。'], targetSSID);
 else
     isMatch = strcmp(allBssid, targetBSSID) | strcmp(allAddr1, targetBSSID);
+
+    % 対象 BSSID に対応する BSS Color を求め、MACが読めなかったパケットを拾う
+    if useBSSColorFallback
+        targetColors = [];
+        cKeys = cell2mat(keys(colorToBSSID));
+        for k = 1:numel(cKeys)
+            if strcmp(colorToBSSID(cKeys(k)), targetBSSID) && ...
+                    ~(isKey(colorConflicts, cKeys(k)) && colorConflicts(cKeys(k)))
+                targetColors(end+1) = cKeys(k); %#ok<SAGROW>
+            end
+        end
+        if ~isempty(targetColors)
+            noMAC     = cellfun(@isempty, allBssid);
+            byColor   = noMAC & ismember(allColors, targetColors);
+            nByColor  = sum(byColor);
+            isMatch   = isMatch | byColor;
+        end
+    end
+
     matched = pktLog(isMatch);
     fprintf('\n対象 SSID "%s" (BSSID=%s) のパケット数: %d (アップリンク+ダウンリンク)\n', ...
         targetSSID, targetBSSID, numel(matched));
+    if nByColor > 0
+        fprintf(['  うち %d 件は MAC ヘッダが読めず、HE-SIG-A の BSS Color 一致で\n', ...
+                 '  帰属させたものです (CSI はプリアンブル由来なので有効。\n', ...
+                 '  fcsVerified = false、frameType = "(MAC未復号)" が目印)。\n'], nByColor);
+    end
 end
 
 % --- フォーマット別に [パケット数 x サブキャリア数] の行列へまとめる ---
@@ -1041,6 +1137,9 @@ csiMeta.pktDetThreshold  = pktDetThreshold;
 csiMeta.overrunCount     = overrunCount;
 csiMeta.decodeStats      = stats;
 csiMeta.heSupported      = heAvailable;       % HE 復号が有効だったか
+csiMeta.useBSSColorFallback = useBSSColorFallback;
+csiMeta.numByBSSColor    = nByColor;          % BSS Color 一致で帰属させた件数
+csiMeta.bssColorMap      = colorToBSSID;      % 学習した Color -> BSSID
 csiMeta.captureDatetime  = timestamp;         % キャプチャ時刻
 csiMeta.decodeDatetime   = datestr(now, 'yyyymmddHHMM');   % 復号を行った時刻
 csiMeta.sourceRawFile    = inputRawFile;      % どの生IQから作られたか
@@ -1725,12 +1824,29 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
     if ~ok
         info.reason = sprintf('MPDU復号失敗(分解=%s,MPDU数=%d)', ...
             deagInfo.status, deagInfo.mpduCount);
-        status = 0;
+
+        % MAC ヘッダは読めなかったが、CSI は HE-LTF から既に得られている。
+        % HE-SIG-A の BSS Color は CRC を通っており、どの BSS のパケットかを
+        % 示すので、これを手掛かりに後段で対象SSIDへ帰属させられる。
+        % CSI を捨てないよう「CSIのみ」の記録として返す (status=2)。
+        entry = struct( ...
+            'timeSec',     0, ...
+            'bssid',       '', ...        % 送信元不明
+            'addr1',       '', ...
+            'frameType',   '(MAC未復号)', ...
+            'ssid',        '', ...
+            'phyFormat',   'HE', ...
+            'bssColor',    info.bssColor, ...
+            'fcsVerified', false, ...
+            'mpduCount',   0, ...
+            'csi',         heChanEst(:).');
+        status = 2;
         return;
     end
 
     entry = buildEntry(cfgMAC, payload, 'HE', heChanEst);
     if ~isempty(entry)
+        entry.bssColor    = info.bssColor;
         entry.fcsVerified = ~deagInfo.headerOnly;
         entry.mpduCount   = deagInfo.mpduCount;   % 0 = A-MPDU分解失敗
     end
@@ -2205,6 +2321,7 @@ function entry = buildEntry(cfgMAC, payload, phyFormat, chanEst)
         'frameType',   frameType, ...
         'ssid',        ssidStr, ...
         'phyFormat',   phyFormat, ...
+        'bssColor',    -1, ...           % HE のみ。呼び出し側で HE-SIG-A の値を入れる
         'fcsVerified', true, ...         % HT/VHT のヘッダのみ復号時は呼び出し側で false
         'mpduCount',   1, ...            % 集約されている場合は呼び出し側で上書き
         'csi',         chanEst(:).');
