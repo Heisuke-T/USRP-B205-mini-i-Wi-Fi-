@@ -58,10 +58,9 @@
 %      あります。
 %
 %  既知の簡略化 (復号率が伸びないときに見直す箇所):
-%    - パイロットによる残留位相誤差の追跡 (wlanHETrackPilotError) は
-%      行っていません。精CFO補正後の残留位相回転が小さいことを前提として
-%      います。長いパケットほど効いてくるので、末尾側だけ FCS が通らない
-%      ようなら導入を検討してください。
+%    - 位相追跡は wlanHETrackPilotError による共通位相誤差 (CPE) の補正
+%      までです。サブキャリアごとに傾く成分 (SFO によるタイミングドリフト)
+%      までは追い切れないため、非常に長いパケットの末尾では誤差が残ります。
 %    - 雑音分散は L-LTF から求めた 1 つの値をすべてのフィールドに使って
 %      います。HE-Data はサブキャリア間隔が 1/4 (78.125kHz) なので厳密には
 %      スケールが一致しません。「HE-SIG-A は解釈できるのに HE-Data の FCS が
@@ -259,6 +258,27 @@ else
          '  Non-HT / HT / VHT のみ復号して続行します。'], strjoin(missingFuncs, ', '));
 end
 
+% --- 受信レベルの確認 ------------------------------------------------------
+% ADC が飽和していると、BPSK/QPSK のプリアンブルや SIG フィールドは通るのに
+% 高次QAM (64QAM以上) のデータ部だけが壊れる、という症状が出る。HE は
+% MCS8〜11 で 1024QAM まで使うため、ここの確認が効く。
+% 全サンプルを評価するとメモリを大量に使うので、間引いて概算する。
+levelStep   = max(1, floor(numel(iq) / 5e6));
+levelSample = iq(1:levelStep:end);
+peakLevel   = max(max(abs(real(levelSample))), max(abs(imag(levelSample))));
+rmsLevel    = sqrt(mean(abs(levelSample).^2));
+satRatio    = mean(abs(real(levelSample)) > 0.99 * peakLevel | ...
+                   abs(imag(levelSample)) > 0.99 * peakLevel);
+clear levelSample;
+fprintf('  受信レベル      : ピーク %.4f, RMS %.5f (PAPR %.1f dB)\n', ...
+    peakLevel, rmsLevel, 20*log10(peakLevel / max(rmsLevel, eps)));
+if satRatio > 1e-4
+    fprintf(['  ※サンプルの %.3f%% がピーク付近に張り付いています。ADC が飽和\n', ...
+             '    している可能性が高いです。飽和すると BPSK/QPSK は通るのに\n', ...
+             '    64QAM 以上だけが壊れるため、captureIQ.m の gain を 10 dB 程度\n', ...
+             '    下げて取り直してください。\n'], satRatio * 100);
+end
+
 %% ------------------------------------------------------------------------
 %  3. 出力先の準備 (HDD と USB メモリの両方)
 %  ------------------------------------------------------------------------
@@ -354,6 +374,7 @@ heNSTSCounts   = containers.Map('KeyType', 'double', 'ValueType', 'double');
 heBWCounts     = containers.Map('KeyType', 'double', 'ValueType', 'double');
 heCodingCounts = containers.Map('KeyType', 'char', 'ValueType', 'double');
 heBSSColors    = containers.Map('KeyType', 'double', 'ValueType', 'double');
+heMCSOKCounts  = containers.Map('KeyType', 'double', 'ValueType', 'double');
 heSigParsed    = 0;   % HE-SIG-A の CRC と解釈を通った件数
 heDetailShown  = 0;   % 内訳を表示した HE パケット数
 heDetailMax    = 5;   % 内訳を表示する最大件数
@@ -565,6 +586,11 @@ while searchOffset + minPreambleLen <= numel(iq)
                     if ~isempty(heInfo.reason)
                         stats.heUnsupported = stats.heUnsupported + 1;
                         heRejects = bumpMap(heRejects, heInfo.reason);
+                    elseif st > 0 && heInfo.sigaParsed
+                        % MAC まで到達できたものだけを MCS 別に数える。
+                        % 上の「MCS の内訳」(SIG-A が読めた全件) と見比べると、
+                        % どの変調方式で復号が破綻しているかが分かる。
+                        heMCSOKCounts = bumpMap(heMCSOKCounts, heInfo.mcs);
                     end
                 end
 
@@ -686,6 +712,13 @@ if stats.he > 0
     fprintf('    HE-SIG-A 解釈成功: %d 件 (検出 %d 件中)\n', heSigParsed, stats.he);
     printCountMapNum(heBWCounts,   '    送信帯域幅の内訳: ', '%dMHz=%d回  ');
     printCountMapNum(heMCSCounts,  '    MCS の内訳      : ', 'MCS%d=%d回  ');
+    printCountMapNum(heMCSOKCounts, '    うち復号成功    : ', 'MCS%d=%d回  ');
+    if heMCSCounts.Count > 0 && heMCSOKCounts.Count == 0
+        fprintf(['    ※SIG-A は読めているのに MAC まで到達したものが 0 件です。\n', ...
+                 '      プリアンブルは復号できているので受信自体は成立しており、\n', ...
+                 '      データ部の変調が受信品質に対して重すぎる (高MCS)、\n', ...
+                 '      または ADC が飽和している可能性が高いです。\n']);
+    end
     printCountMapChar(heCodingCounts, '    符号化方式      : ');
     if heNSTSCounts.Count > 0
         nKeys = cell2mat(keys(heNSTSCounts));
@@ -1493,9 +1526,15 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
     % HE PPDU の L-SIG / RL-SIG / HE-SIG-A は 20MHz あたり 56 本の
     % サブキャリア (レガシーの 52 本 + 両端に 4 本) で送られる。
     % L-LTF の推定値は 52 本しか無いので、追加の 4 本を含む推定値を作る。
+    % 復号したパラメータを入れていく器。PPDU形式と帯域幅だけ先に確定させ、
+    % 残りは L-SIG と HE-SIG-A の中身で順に埋めていく。
+    cfgRx = wlanHERecoveryConfig('PacketFormat', char(fmtStr), ...
+        'ChannelBandwidth', chanBW);
+
     lsigDemod    = wlanHEDemodulate(pkt(321:480), 'L-SIG', chanBW);   % L-SIG + RL-SIG
     preInfo      = wlanHEOFDMInfo('L-SIG', chanBW);
     chanEstPreHE = preHEChannelEstimateCompat(lsigDemod, lltfChanEst, chanBW);
+    lsigDemod    = heTrackPilotErrorCompat(lsigDemod, chanEstPreHE, cfgRx, 'L-SIG');
 
     [eqLSIG, csiLSIG] = heEqualizeCompat(lsigDemod(preInfo.DataIndices, :, :), ...
         chanEstPreHE(preInfo.DataIndices, :), noiseEst, chanBW, 'L-SIG');
@@ -1512,6 +1551,7 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
     % L-SIG と同じ chanEstPreHE を使う。
     sigaDemod = wlanHEDemodulate(pkt(481 : 480 + sigaSyms * 80), 'HE-SIG-A', chanBW);
     sigaInfo  = wlanHEOFDMInfo('HE-SIG-A', chanBW);
+    sigaDemod = heTrackPilotErrorCompat(sigaDemod, chanEstPreHE, cfgRx, 'HE-SIG-A');
     [eqSIGA, csiSIGA] = heEqualizeCompat(sigaDemod(sigaInfo.DataIndices, :, :), ...
         chanEstPreHE(sigaInfo.DataIndices, :), noiseEst, chanBW, 'HE-SIG-A');
 
@@ -1524,15 +1564,7 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
 
     % --- HE-SIG-A のビット解釈 (WLAN Toolbox に任せる) ---
     % L-SIG LENGTH はデータ部のシンボル数の算出に必要なので、解釈前に渡す。
-    try
-        cfgRx = wlanHERecoveryConfig('PacketFormat', char(fmtStr), ...
-            'ChannelBandwidth', chanBW, 'LSIGLength', info.lsigLen);
-    catch
-        % 古い版では LSIGLength を構築時に渡せないことがあるので後から設定する
-        cfgRx = wlanHERecoveryConfig('PacketFormat', char(fmtStr), ...
-            'ChannelBandwidth', chanBW);
-        cfgRx.LSIGLength = info.lsigLen;
-    end
+    cfgRx.LSIGLength = info.lsigLen;
 
     [cfgRx, failInterp] = interpretHESIGABits(cfgRx, sigaBits);
     if failInterp
@@ -1617,6 +1649,7 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
     % 効くため、「HE-SIG-A は解釈できるのに HE-Data の FCS が通らない」
     % 場合はここを最初に疑うとよい (HE-LTF から雑音を推定し直す)。
     demodData = wlanHEDemodulate(pkt(ind.HEData(1):ind.HEData(2)), 'HE-Data', cfgRx);
+    demodData = heTrackPilotErrorCompat(demodData, heChanEst, cfgRx, 'HE-Data');
     [eqData, csiData] = heEqualizeCompat(demodData(ofdmInfo.DataIndices, :, :), ...
         heChanEst(ofdmInfo.DataIndices, :, :), noiseEst, cfgRx, 'HE-Data');
     rxPSDU = heDataBitRecoverCompat(eqData, noiseEst, csiData, cfgRx);
@@ -1672,6 +1705,39 @@ function chanEst = preHEChannelEstimateCompat(lsigDemod, lltfChanEst, chanBW)
     end
     nEdge   = floor((nPre - nL) / 2);
     chanEst = [repmat(h(1), nEdge, 1); h; repmat(h(end), nPre - nL - nEdge, 1)];
+end
+
+function sym = heTrackPilotErrorCompat(sym, chanEst, cfg, field)
+    % パイロットサブキャリアを使って残留位相誤差 (CPE) と振幅誤差を補正する。
+    %
+    % なぜ必要か:
+    %   精CFO推定 (wlanFineCFOEstimate) は L-LTF の 8us だけを見るので、
+    %   数百 Hz 程度の残差が残る。さらに送受信のサンプリングクロック差
+    %   (SFO) もある。どちらも「時間が経つほど位相が回る」誤差なので、
+    %   プリアンブルや SIG フィールド (先頭 40us) では無視できても、
+    %   A-MPDU で数 ms 続く HE-Data の後半では位相が数ラジアン回ってしまう。
+    %   残留 CFO が 200 Hz でも 2ms 後には約14度回り、64QAM 以上は壊れる。
+    %   「Non-HT (短い) は FCS が全部通るのに HE-Data だけ壊れる」ときは
+    %   まずこれを疑う。
+    %
+    % sym は data+pilot 両方のサブキャリアを含む [Nst x Nsym x Nr] を渡すこと
+    % (等化のために data だけ取り出す前に呼ぶ)。
+    persistent unavailable
+    if ~isempty(unavailable) && unavailable
+        return;
+    end
+    try
+        sym = wlanHETrackPilotError(sym, chanEst, cfg, field);
+    catch ME
+        % 補正できなくても復号自体は続行できるので、一度だけ警告して
+        % 以降は追跡なしで進む (毎パケット例外を出すと非常に遅くなる)。
+        unavailable = true;
+        warning('decodeIQ_HE:noPilotTracking', ...
+            ['パイロットによる位相追跡を行えません: %s\n', ...
+             '  長い HE パケット (A-MPDU) の復号率が大きく下がります。\n', ...
+             '  wlanHETrackPilotError は R2019b 以降の WLAN Toolbox に含まれます。'], ...
+            ME.message);
+    end
 end
 
 function [eqSym, csi] = heEqualizeCompat(sym, chEst, noiseEst, cfg, field)
