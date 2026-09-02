@@ -118,10 +118,23 @@
 %      アップリンクは Address1 が BSSID になるため)。
 %
 %  処理時間の目安:
-%    実測でキャプチャ 1 秒あたり 300〜2400 秒 (電波の混雑度に強く依存)。
-%    HE は LDPC が既定で、パケットも長くなりがちなので VHT より遅くなる
-%    傾向があります。まずは captureDuration を短く (1s 程度) して動作確認
-%    することを推奨します。
+%    電波の混雑度に強く依存します。まずは captureDuration を短く (1s 程度)
+%    して動作確認することを推奨します。
+%
+%    復号が遅いときの主な要因は次の3つです。
+%      1) キャプチャ長そのもの
+%         パケット検出は全サンプルを走査するので、キャプチャが長いほど
+%         比例して時間がかかります。
+%      2) HE のデータ復号 (LDPC)
+%         HE は LDPC が既定で、MATLAB の LDPC 復号は反復計算のため
+%         BCC (Viterbi) より大幅に遅くなります。さらに HE は A-MPDU で
+%         数万バイトまとめて送るのでパケット 1 個が長くなります。
+%         decodeIQ_VHT.m は HE パケットを検出だけして読み捨てていたので、
+%         同じ電波を復号しても本スクリプトの方が遅くなるのは正常です。
+%      3) 誤検出パケットの復号試行
+%         pktDetThreshold を下げすぎると雑音を拾って復号を試み続けます。
+%         復号サマリの「パケット検出数」に対して「MAC まで復号成功」が
+%         極端に少ない場合は、しきい値を上げる方が速くなります。
 % =========================================================================
 
 clear; clc;
@@ -151,7 +164,7 @@ hddSavePath = 'D:\IQ_csi';
 usbSavePath = '';
 
 % --- 抽出したい Wi-Fi の SSID --------------------------------------------
-targetSSID = 'OpenWrt-A';
+targetSSID = 'WAX202';
 
 % --- 復号パラメータ ------------------------------------------------------
 chanBW          = 'CBW20';      % WLAN Toolbox のチャネル帯域幅指定
@@ -349,6 +362,18 @@ heSubcResolved = false;  % subcarrierIndicesHE20 を実測値で上書き済み�
 minPreambleLen = 560;   % L-STF..L-SIG + 2シンボル (レガシーのフォーマット検出まで)
 searchOffset = 0;
 
+% 1パケットの復号に切り出す最大長。
+%   802.11 は 1 つの PPDU の継続時間を 5.484 ms 以下と定めている
+%   (aPPDUMaxTime)。20 MSps なら約 11 万サンプルなので、6 ms 分あれば
+%   どんなパケットでも全体が収まる。
+%
+%   ここを区切るのは速度のためで、効果は非常に大きい。区切らずに
+%   iq(pktStart+1:end) を渡すと、パケット 1 個ごとに「残りのIQ全部」
+%   (5秒キャプチャなら 1 億サンプル = 1.6 GB) をコピーして、その全要素に
+%   CFO補正の複素指数を掛ける処理が 2 回走る。実際に使うのは先頭の
+%   数万サンプルだけなので、大半が完全な無駄になる。
+maxPPDULen = round(6e-3 * sampleRate);
+
 fprintf('\nオフライン復号を開始します...\n');
 decodeTic = tic;
 
@@ -397,7 +422,12 @@ while searchOffset + minPreambleLen <= numel(iq)
         end
 
         % --- 精CFO推定・補正 (L-LTF) ---
-        pkt     = applyCFO(iq(pktStart+1:end), sampleRate, -coarseCFO);
+        %     1 PPDU 分 (最大 maxPPDULen サンプル) だけを切り出して補正する。
+        %     この窓に収まりきらない = 規格上の最大PPDU長を超えるパケットは
+        %     復号側で「サンプル不足」と判定され読み捨てられるが、それは
+        %     誤検出なので問題ない。
+        pktEnd  = min(numel(iq), pktStart + maxPPDULen);
+        pkt     = applyCFO(iq(pktStart+1:pktEnd), sampleRate, -coarseCFO);
         fineCFO = wlanFineCFOEstimate(pkt(161:320), chanBW);
         pkt     = applyCFO(pkt, sampleRate, -fineCFO);
 
