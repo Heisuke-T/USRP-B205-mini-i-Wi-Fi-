@@ -375,6 +375,9 @@ heBWCounts     = containers.Map('KeyType', 'double', 'ValueType', 'double');
 heCodingCounts = containers.Map('KeyType', 'char', 'ValueType', 'double');
 heBSSColors    = containers.Map('KeyType', 'double', 'ValueType', 'double');
 heMCSOKCounts  = containers.Map('KeyType', 'double', 'ValueType', 'double');
+heSNRs         = [];  % HE パケットごとの受信SNR推定 [dB]
+hePilotTracked = 0;   % HE-Data の位相追跡が実際に効いた件数
+hePilotTotal   = 0;   % HE-Data の復号まで到達した件数
 heSigParsed    = 0;   % HE-SIG-A の CRC と解釈を通った件数
 heDetailShown  = 0;   % 内訳を表示した HE パケット数
 heDetailMax    = 5;   % 内訳を表示する最大件数
@@ -549,6 +552,10 @@ while searchOffset + minPreambleLen <= numel(iq)
 
                     if heInfo.sigaParsed
                         heSigParsed  = heSigParsed + 1;
+                        % 受信SNRの概算 (L-LTF のチャネル推定電力 / 雑音分散)。
+                        % どのMCSまで復号できる見込みがあるかの判断に使う。
+                        heSNRs(end+1) = 10 * log10( ...
+                            mean(abs(lltfChanEst(:)).^2) / max(noiseEst, eps)); %#ok<SAGROW>
                         heMCSCounts  = bumpMap(heMCSCounts, heInfo.mcs);
                         heNSTSCounts = bumpMap(heNSTSCounts, heInfo.nsts);
                         heBWCounts   = bumpMap(heBWCounts, heInfo.bwMHz);
@@ -581,6 +588,15 @@ while searchOffset + minPreambleLen <= numel(iq)
                             ternary(heInfo.uplink, '上り', '下り'), ...
                             heInfo.lsigLen, heInfo.psduLen, heInfo.numSubcarriers, ...
                             heInfo.deagStatus, heInfo.mpduCount);
+                    end
+
+                    % HE-Data の復号まで到達したものについて、位相追跡が
+                    % 実際に効いたかを数える (棄却されたものも含めて数える)
+                    if heInfo.numSubcarriers > 0
+                        hePilotTotal = hePilotTotal + 1;
+                        if heInfo.pilotTracked
+                            hePilotTracked = hePilotTracked + 1;
+                        end
                     end
 
                     if ~isempty(heInfo.reason)
@@ -738,6 +754,47 @@ if stats.he > 0
     % 同じ BSS のパケットかどうかの二次的な手掛かりになる。
     printCountMapNum(heBSSColors, '    BSS Color       : ', 'Color%d=%d回  ');
     printCountMapChar(heRejects,  '    非対応の理由    : ');
+
+    % --- 位相追跡が実際に効いたか ---
+    % ここが 0 だと、A-MPDU の後半が位相回転で壊れたままになる。
+    if hePilotTotal > 0
+        fprintf('    位相追跡(HE-Data): %d/%d 件に適用', hePilotTracked, hePilotTotal);
+        if hePilotTracked == 0
+            fprintf('  <-- 効いていません。上の警告を確認してください\n');
+        else
+            fprintf('\n');
+        end
+    end
+
+    % --- 受信SNRと、観測されたMCSの所要SNRの比較 ---
+    % これが最終的な判断材料。SNRが所要値に届いていなければ、
+    % 復号器を改良しても復号率は上がらない。
+    if ~isempty(heSNRs)
+        sortedSNR = sort(heSNRs);
+        medSNR    = sortedSNR(max(1, round(0.50 * numel(sortedSNR))));
+        loSNR     = sortedSNR(max(1, round(0.10 * numel(sortedSNR))));
+        hiSNR     = sortedSNR(max(1, round(0.90 * numel(sortedSNR))));
+        fprintf('    受信SNR推定     : 中央値 %.1f dB (下位10%% %.1f dB / 上位10%% %.1f dB)\n', ...
+            medSNR, loSNR, hiSNR);
+
+        % 最も多かった MCS の所要SNRと比べる
+        mcsKeys   = cell2mat(keys(heMCSCounts));
+        mcsVals   = cell2mat(values(heMCSCounts));
+        [~, iMax] = max(mcsVals);
+        domMCS    = mcsKeys(iMax);
+        reqSNR    = heRequiredSNR(domMCS);
+        fprintf('    最多MCS%d の所要SNR: 約 %d dB (%s)', domMCS, reqSNR, heModulationName(domMCS));
+        if medSNR < reqSNR
+            fprintf('  <-- %.1f dB 不足\n', reqSNR - medSNR);
+            fprintf(['      受信品質に対して変調が重すぎます。復号器側では改善\n', ...
+                     '      できないので、送信側の MCS を下げてください。\n', ...
+                     '      (PicoScenes で送信するなら MCS を 0〜4 に固定する、\n', ...
+                     '       AP が送信側なら iperf3 の向きを逆にして PicoScenes を\n', ...
+                     '       送信側にする、アンテナを近づける、等)\n']);
+        else
+            fprintf('  (SNRは足りている)\n');
+        end
+    end
     if heSigParsed == 0 && stats.he > 0
         fprintf(['    ※HE-SIG-A を1件も解釈できていません。受信SNR不足か、\n', ...
                  '      HE パケットが 40/80MHz で送信されている可能性があります。\n']);
@@ -1489,6 +1546,7 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
         'bwMHz', 0, 'nsts', 0, 'mcs', -1, 'coding', '', 'giUs', 0, ...
         'heltfType', 0, 'dcm', false, 'stbc', false, 'bssColor', -1, ...
         'uplink', false, 'lsigLen', 0, 'psduLen', 0, 'numSubcarriers', 0, ...
+        'pilotTracked', false, ...
         'subcIdx', [], 'mpduCount', 0, 'deagStatus', '', ...
         'nonBinary', false, 'dataClass', '', 'dataRange', [0 0]);
 
@@ -1649,7 +1707,7 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
     % 効くため、「HE-SIG-A は解釈できるのに HE-Data の FCS が通らない」
     % 場合はここを最初に疑うとよい (HE-LTF から雑音を推定し直す)。
     demodData = wlanHEDemodulate(pkt(ind.HEData(1):ind.HEData(2)), 'HE-Data', cfgRx);
-    demodData = heTrackPilotErrorCompat(demodData, heChanEst, cfgRx, 'HE-Data');
+    [demodData, info.pilotTracked] = heTrackPilotErrorCompat(demodData, heChanEst, cfgRx, 'HE-Data');
     [eqData, csiData] = heEqualizeCompat(demodData(ofdmInfo.DataIndices, :, :), ...
         heChanEst(ofdmInfo.DataIndices, :, :), noiseEst, cfgRx, 'HE-Data');
     rxPSDU = heDataBitRecoverCompat(eqData, noiseEst, csiData, cfgRx);
@@ -1707,7 +1765,31 @@ function chanEst = preHEChannelEstimateCompat(lsigDemod, lltfChanEst, chanBW)
     chanEst = [repmat(h(1), nEdge, 1); h; repmat(h(end), nPre - nL - nEdge, 1)];
 end
 
-function sym = heTrackPilotErrorCompat(sym, chanEst, cfg, field)
+function snrDb = heRequiredSNR(mcs)
+    % HE (20MHz, NSS=1) で MCS ごとにおおよそ必要な受信SNR [dB]。
+    % IEEE 802.11ax の受信感度規定から導いた目安で、実装や環境で数dB動く。
+    % 「復号できないのが受信品質のせいか、処理のせいか」を切り分ける用途。
+    table = [2 5 9 11 15 18 20 25 29 31 34 37];   % MCS0..MCS11
+    if mcs >= 0 && mcs <= 11
+        snrDb = table(mcs + 1);
+    else
+        snrDb = NaN;
+    end
+end
+
+function name = heModulationName(mcs)
+    % MCS 番号に対応する変調方式と符号化率
+    names = {'BPSK 1/2', 'QPSK 1/2', 'QPSK 3/4', '16QAM 1/2', '16QAM 3/4', ...
+             '64QAM 2/3', '64QAM 3/4', '64QAM 5/6', '256QAM 3/4', '256QAM 5/6', ...
+             '1024QAM 3/4', '1024QAM 5/6'};
+    if mcs >= 0 && mcs <= 11
+        name = names{mcs + 1};
+    else
+        name = '不明';
+    end
+end
+
+function [sym, applied] = heTrackPilotErrorCompat(sym, chanEst, cfg, field)
     % パイロットサブキャリアを使って残留位相誤差 (CPE) と振幅誤差を補正する。
     %
     % なぜ必要か:
@@ -1717,26 +1799,39 @@ function sym = heTrackPilotErrorCompat(sym, chanEst, cfg, field)
     %   プリアンブルや SIG フィールド (先頭 40us) では無視できても、
     %   A-MPDU で数 ms 続く HE-Data の後半では位相が数ラジアン回ってしまう。
     %   残留 CFO が 200 Hz でも 2ms 後には約14度回り、64QAM 以上は壊れる。
-    %   「Non-HT (短い) は FCS が全部通るのに HE-Data だけ壊れる」ときは
-    %   まずこれを疑う。
     %
     % sym は data+pilot 両方のサブキャリアを含む [Nst x Nsym x Nr] を渡すこと
     % (等化のために data だけ取り出す前に呼ぶ)。
-    persistent unavailable
-    if ~isempty(unavailable) && unavailable
+    %
+    % 失敗したフィールドだけを個別に無効化する点が重要。まとめて無効化すると、
+    % 先頭の L-SIG で失敗しただけで、本当に効かせたい HE-Data の補正まで
+    % 止まってしまう。
+    persistent disabledFields
+    if isempty(disabledFields)
+        disabledFields = containers.Map('KeyType', 'char', 'ValueType', 'logical');
+    end
+
+    key = char(string(field));
+    if isKey(disabledFields, key) && disabledFields(key)
+        applied = false;
         return;
     end
+
     try
         sym = wlanHETrackPilotError(sym, chanEst, cfg, field);
+        applied = true;
     catch ME
-        % 補正できなくても復号自体は続行できるので、一度だけ警告して
-        % 以降は追跡なしで進む (毎パケット例外を出すと非常に遅くなる)。
-        unavailable = true;
+        % 補正できなくても復号自体は続行できるので、そのフィールドについて
+        % 一度だけ警告し、以降は追跡なしで進む
+        % (毎パケット例外を出すと非常に遅くなる)。
+        disabledFields(key) = true;
+        applied = false;
         warning('decodeIQ_HE:noPilotTracking', ...
-            ['パイロットによる位相追跡を行えません: %s\n', ...
-             '  長い HE パケット (A-MPDU) の復号率が大きく下がります。\n', ...
+            ['%s の位相追跡を行えません: %s\n', ...
+             '  このフィールドは補正なしで進みます。HE-Data で出ている場合、\n', ...
+             '  長い A-MPDU の復号率が大きく下がります。\n', ...
              '  wlanHETrackPilotError は R2019b 以降の WLAN Toolbox に含まれます。'], ...
-            ME.message);
+            key, ME.message);
     end
 end
 
