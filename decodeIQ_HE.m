@@ -98,6 +98,10 @@
 %      csiHT    / timeSecHT    / frameTypeHT    / fcsHT
 %      csiVHT   / timeSecVHT   / frameTypeVHT   / fcsVHT
 %      csiHE    / timeSecHE    / frameTypeHE    / fcsHE
+%      uplinkHE   … [パケット数 x 1] true=上り(STA->AP), false=下り(AP->STA)
+%                   HE-SIG-A の UL/DL ビット由来。上りと下りは送信機が違う
+%                   ので CSI も別物。解析時は必ず分けること。
+%      bssColorHE … [パケット数 x 1] HE-SIG-A の BSS Color
 %      subcarrierIndicesNonHT … [1 x 52]   Non-HT の使用サブキャリア番号
 %      subcarrierIndicesHT20  … [1 x 52]   HT-20MHz の使用サブキャリア番号
 %      subcarrierIndicesVHT20 … [1 x 56]   VHT-20MHz の使用サブキャリア番号
@@ -355,7 +359,7 @@ subcarrierIndicesVHT20 = [-28:-1, 1:28];    % VHT    CBW20 (56本)
 subcarrierIndicesHE20  = [-122:-2, 2:122];  % HE     CBW20 (242本)
 
 pktLog = struct('timeSec', {}, 'bssid', {}, 'addr1', {}, 'frameType', {}, 'ssid', {}, ...
-    'phyFormat', {}, 'bssColor', {}, 'fcsVerified', {}, 'mpduCount', {}, 'csi', {});
+    'phyFormat', {}, 'bssColor', {}, 'uplink', {}, 'fcsVerified', {}, 'mpduCount', {}, 'csi', {});
 bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
 
 % 復号統計 (診断用)
@@ -1100,18 +1104,50 @@ csiHE       = stackCSI(matched(isHE));
 timeSecHE   = allTimeSec(isHE);
 frameTypeHE = allFrameType(isHE);
 fcsHE       = allFcs(isHE);
+if isempty(matched)
+    uplinkHE  = logical([]);
+    bssColorHE = [];
+else
+    uplinkHE   = logical([matched.uplink]).';
+    uplinkHE   = uplinkHE(isHE);       % true=上り(STA->AP), false=下り(AP->STA)
+    bssColorHE = [matched.bssColor].';
+    bssColorHE = bssColorHE(isHE);
+end
 
 if ~isempty(matched)
     fprintf('  内訳: Non-HT=%d, HT=%d, VHT=%d, HE=%d\n', ...
         size(csiNonHT, 1), size(csiHT, 1), size(csiVHT, 1), size(csiHE, 1));
     totalMPDU = sum([matched.mpduCount]);
-    fprintf('  PPDU(電波上の送信単位)数=%d に対し、集約されたMPDU(データ単位)の合計=%d\n', ...
-        numel(matched), totalMPDU);
-    nUnverified = sum(~allFcs);
-    if nUnverified > 0
-        fprintf(['  ※うち %d 件は FCS 未検証 (ペイロードにビット誤りがあり、\n', ...
-                 '    MAC ヘッダのみから送信元を判定したもの)。CSI 自体は\n', ...
-                 '    プリアンブルから算出しており影響を受けません。\n'], nUnverified);
+    % MAC が読めた分だけで PPDU と MPDU の関係を見る
+    % (MAC未復号のものは MPDU 数が分からないので分母から外す)
+    macKnown = ~strcmp(allFrameType, '(MAC未復号)');
+    if any(macKnown)
+        fprintf(['  MACが読めた %d 件について、PPDU(電波上の送信単位)数に対する\n', ...
+                 '  集約されたMPDU(データ単位)の合計=%d\n'], sum(macKnown), totalMPDU);
+    end
+
+    nHeaderOnly = sum(~allFcs & macKnown);
+    if nHeaderOnly > 0
+        fprintf(['  ※%d 件は FCS 未検証 (ペイロードにビット誤りがあり、MAC ヘッダ\n', ...
+                 '    のみから送信元を判定したもの)。CSI 自体はプリアンブルから\n', ...
+                 '    算出しており影響を受けません。\n'], nHeaderOnly);
+    end
+
+    % --- 上り/下りの内訳 (HE-SIG-A の UL/DL ビット) ---
+    % 上りと下りでは送信している機器が違うので、電波の通り道 (= CSI) も
+    % 別物になる。混ぜて時系列にすると意味が壊れるため、必ず分けて扱うこと。
+    % このビットは HE-SIG-A にあり CRC で守られているので、MAC が読めなくても
+    % 信頼できる。
+    isHEMatched = strcmpi(allFormats, 'HE');
+    if any(isHEMatched)
+        upFlags = logical([matched.uplink]).';
+        nUp   = sum(isHEMatched & upFlags);
+        nDown = sum(isHEMatched & ~upFlags);
+        fprintf('  HE の向き: 下り(AP->STA)=%d件, 上り(STA->AP)=%d件\n', nDown, nUp);
+        if nUp > 0 && nDown > 0
+            fprintf(['    ※上りと下りは送信機が異なるため CSI も別物です。\n', ...
+                     '      解析時は保存した uplinkHE で分けてください。\n']);
+        end
     end
 end
 
@@ -1188,7 +1224,7 @@ saveVars = { ...
     'csiNonHT', 'timeSecNonHT', 'frameTypeNonHT', 'fcsNonHT', ...
     'csiHT', 'timeSecHT', 'frameTypeHT', 'fcsHT', ...
     'csiVHT', 'timeSecVHT', 'frameTypeVHT', 'fcsVHT', ...
-    'csiHE', 'timeSecHE', 'frameTypeHE', 'fcsHE', ...
+    'csiHE', 'timeSecHE', 'frameTypeHE', 'fcsHE', 'uplinkHE', 'bssColorHE', ...
     'subcarrierIndicesNonHT', 'subcarrierIndicesHT20', ...
     'subcarrierIndicesVHT20', 'subcarrierIndicesHE20', ...
     'targetSSIDOut', 'targetBSSIDOut', 'seenNetworks'};
@@ -1869,6 +1905,7 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
             'ssid',        '', ...
             'phyFormat',   'HE', ...
             'bssColor',    info.bssColor, ...
+            'uplink',      info.uplink, ...
             'fcsVerified', false, ...
             'mpduCount',   0, ...
             'csi',         heChanEst(:).');
@@ -1879,6 +1916,7 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
     entry = buildEntry(cfgMAC, payload, 'HE', heChanEst);
     if ~isempty(entry)
         entry.bssColor    = info.bssColor;
+        entry.uplink      = info.uplink;
         entry.fcsVerified = ~deagInfo.headerOnly;
         entry.mpduCount   = deagInfo.mpduCount;   % 0 = A-MPDU分解失敗
     end
@@ -2354,6 +2392,7 @@ function entry = buildEntry(cfgMAC, payload, phyFormat, chanEst)
         'ssid',        ssidStr, ...
         'phyFormat',   phyFormat, ...
         'bssColor',    -1, ...           % HE のみ。呼び出し側で HE-SIG-A の値を入れる
+        'uplink',      false, ...        % HE のみ。HE-SIG-A の UL/DL ビット
         'fcsVerified', true, ...         % HT/VHT のヘッダのみ復号時は呼び出し側で false
         'mpduCount',   1, ...            % 集約されている場合は呼び出し側で上書き
         'csi',         chanEst(:).');
