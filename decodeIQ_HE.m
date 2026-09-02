@@ -819,8 +819,8 @@ if stats.he > 0
 end
 
 fprintf('  MAC まで復号成功          : %d\n', stats.decodeOK);
-fprintf('  CSIのみ記録(HE, MAC未復号): %d\n', stats.csiOnly);
 fprintf('    うち Address2 無し(ACK/CTS等、BSSID判定不可): %d\n', stats.noAddr2);
+fprintf('  CSIのみ記録(HE, MAC未復号): %d  (BSS Color で帰属を試みます)\n', stats.csiOnly);
 fprintf('  復号エラー                : %d\n', stats.errors);
 
 % --- A-MPDU 分解の結果 (データ復号が機能しているかの判断材料) ---
@@ -839,11 +839,14 @@ if ~isempty(pktLog)
     fprintf('  [FCS 検証の内訳 (全BSSID)]\n');
     allFmt  = {pktLog.phyFormat};
     allFcsV = logical([pktLog.fcsVerified]);
+    allNoMAC = strcmp({pktLog.frameType}, '(MAC未復号)');
     for f = {'Non-HT', 'HT', 'VHT', 'HE'}
         sel = strcmpi(allFmt, f{1});
         if any(sel)
-            fprintf('    %-6s : 記録%d件 (FCS検証OK=%d, ヘッダのみ推定=%d)\n', ...
-                f{1}, sum(sel), sum(sel & allFcsV), sum(sel & ~allFcsV));
+            fprintf(['    %-6s : 記録%d件 (FCS検証OK=%d, ヘッダのみ推定=%d, ', ...
+                     'MAC未復号(CSIのみ)=%d)\n'], ...
+                f{1}, sum(sel), sum(sel & allFcsV), ...
+                sum(sel & ~allFcsV & ~allNoMAC), sum(sel & allNoMAC));
         end
     end
     fprintf(['    ※あるフォーマットで FCS検証OK が 0 件の場合、そのフォーマットの\n', ...
@@ -948,30 +951,53 @@ end
 % 6bit しかないので別々の BSS が同じ Color を使うことはあり得る。学習中に
 % 1つの Color が複数の BSSID に結びついた場合は、その Color での帰属を
 % 諦める (誤って別ネットワークの CSI を混ぜるより、取りこぼす方が安全)。
+% 学習には次の2つの条件を満たすパケットだけを使う。
+%   (a) FCS 検証まで通っている
+%       高MCSではビット誤りの残った MPDU が「MACヘッダのみ」の緩い妥当性検査を
+%       偶然通ることがあり、でたらめなアドレスを学習してしまう。FCS が通った
+%       ものだけに限れば、この誤学習を完全に排除できる。
+%   (b) 送信元(Address2)か宛先(Address1)のどちらかが、Beacon で SSID を
+%       確認済みの BSSID である
+%       ダウンリンクなら Address2、アップリンクなら Address1 が BSSID になる。
+%       Beacon 由来の BSSID に錨を下ろすことで、クライアントの MAC アドレスを
+%       誤って BSSID として登録することも防げる。
 allColors  = [pktLog.bssColor];
 colorToBSSID   = containers.Map('KeyType', 'double', 'ValueType', 'char');
+colorEvidence  = containers.Map('KeyType', 'double', 'ValueType', 'double');
 colorConflicts = containers.Map('KeyType', 'double', 'ValueType', 'logical');
 for k = 1:numel(pktLog)
     c = pktLog(k).bssColor;
-    if c < 0 || isempty(pktLog(k).bssid)
-        continue;   % HE以外、または送信元が分からなかったパケット
+    if c < 0 || ~pktLog(k).fcsVerified
+        continue;   % HE以外、または MAC を確証できていないパケット
     end
+
+    % Beacon で確認済みの BSSID に一致する方を採用する
+    bs = '';
+    if any(strcmp(knownBssidSet, pktLog(k).bssid))
+        bs = pktLog(k).bssid;
+    elseif any(strcmp(knownBssidSet, pktLog(k).addr1))
+        bs = pktLog(k).addr1;
+    end
+    if isempty(bs)
+        continue;   % どちらの向きでも既知の BSS に結びつかない
+    end
+
     if isKey(colorToBSSID, c)
-        if ~strcmp(colorToBSSID(c), pktLog(k).bssid)
-            % 同じ Color に別の BSSID。ただしアップリンク(送信元=クライアント)
-            % でも Color は AP と同じなので、Address1 が既知の BSSID なら矛盾
-            % ではない。ここでは安全側に倒して衝突として扱う。
-            if ~strcmp(pktLog(k).addr1, colorToBSSID(c))
-                colorConflicts(c) = true;
-            end
+        if ~strcmp(colorToBSSID(c), bs)
+            % 別々の BSS が同じ Color を使っている。6bit しかないので
+            % 起こり得る。この Color での帰属は諦める。
+            colorConflicts(c) = true;
+        else
+            colorEvidence(c) = colorEvidence(c) + 1;
         end
     else
-        colorToBSSID(c) = pktLog(k).bssid;
+        colorToBSSID(c) = bs;
+        colorEvidence(c) = 1;
     end
 end
 
 if colorToBSSID.Count > 0
-    fprintf('\nBSS Color と BSSID の対応 (MACが読めたパケットから学習):\n');
+    fprintf('\nBSS Color と BSSID の対応 (FCS検証済みパケットから学習):\n');
     cKeys = sort(cell2mat(keys(colorToBSSID)));
     for k = 1:numel(cKeys)
         bs = colorToBSSID(cKeys(k));
@@ -983,10 +1009,16 @@ if colorToBSSID.Count > 0
             end
         end
         conflict = isKey(colorConflicts, cKeys(k)) && colorConflicts(cKeys(k));
-        fprintf('  Color%-2d -> BSSID=%s%s%s\n', cKeys(k), bs, ...
+        fprintf('  Color%-2d -> BSSID=%s%s  (根拠 %d件)%s\n', cKeys(k), bs, ...
             ternary(~isempty(ss), sprintf('  SSID="%s"', ss), ''), ...
+            colorEvidence(cKeys(k)), ...
             ternary(conflict, '   <-- 複数のBSSIDと衝突。Colorでの帰属は行いません', ''));
     end
+elseif stats.csiOnly > 0
+    fprintf(['\nBSS Color と BSSID の対応を学習できませんでした。\n', ...
+             '  (FCS 検証まで通った HE パケットが 1 件も無いため)\n', ...
+             '  MAC未復号の HE パケット %d 件は、どの SSID にも帰属させられません。\n'], ...
+        stats.csiOnly);
 end
 
 matched = pktLog([]);   % 空の構造体配列
