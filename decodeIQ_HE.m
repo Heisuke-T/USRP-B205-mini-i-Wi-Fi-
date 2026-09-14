@@ -2387,8 +2387,20 @@ function hdr = parseMACHeaderFromOctets(oct)
     % 送信元 (Address2) が全0 / ブロードキャストのものは復号が壊れている。
     % また Address2 のグループビット (先頭オクテットの bit0) は送信元
     % アドレスでは必ず 0 になる。
-    if all(addr2 == 0) || all(addr2 == 255) || bitand(addr2(1), 1) == 1
-        hdr.reason = 'Address2が不正(全0/全1/グループビット)';
+    % 3つの条件を別々に記録する。特に「全0」が多い場合は、LDPC 復号が
+    % 収束せず全零符号語 (これは常に妥当な符号語なので、復号失敗時の
+    % 行き先になりやすい) を返している証拠になる。= 受信品質の問題であり、
+    % 復号器の実装ミスではない。
+    if all(addr2 == 0)
+        hdr.reason = 'Address2が全0(LDPCが全零符号語に落ちた可能性)';
+        return;
+    end
+    if all(addr2 == 255)
+        hdr.reason = 'Address2が全1';
+        return;
+    end
+    if bitand(addr2(1), 1) == 1
+        hdr.reason = 'Address2のグループビットが1(送信元アドレスではあり得ない)';
         return;
     end
 
