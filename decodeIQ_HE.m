@@ -391,6 +391,9 @@ heCodingCounts = containers.Map('KeyType', 'char', 'ValueType', 'double');
 heBSSColors    = containers.Map('KeyType', 'double', 'ValueType', 'double');
 heMCSOKCounts  = containers.Map('KeyType', 'double', 'ValueType', 'double');
 heSNRs         = [];  % HE パケットごとの受信SNR推定 [dB]
+heMPDUStatus   = containers.Map('KeyType', 'char', 'ValueType', 'double');
+heHdrReasons   = containers.Map('KeyType', 'char', 'ValueType', 'double');
+heMPDUBytes    = [];  % 取り出せた MPDU の長さ [byte]
 hePilotTracked = 0;   % HE-Data の位相追跡が実際に効いた件数
 hePilotTotal   = 0;   % HE-Data の復号まで到達した件数
 heSigParsed    = 0;   % HE-SIG-A の CRC と解釈を通った件数
@@ -584,6 +587,17 @@ while searchOffset + minPreambleLen <= numel(iq)
                     [deagStatusCnt, nonBinaryShown] = ...
                         recordDeag(deagStatusCnt, nonBinaryShown, 'HE', heInfo);
 
+                    % 「なぜ MPDU が読めなかったか」の切り分け用の集計
+                    for q = 1:numel(heInfo.mpduStatus)
+                        heMPDUStatus = bumpMap(heMPDUStatus, heInfo.mpduStatus{q});
+                    end
+                    for q = 1:numel(heInfo.hdrReason)
+                        heHdrReasons = bumpMap(heHdrReasons, heInfo.hdrReason{q});
+                    end
+                    if ~isempty(heInfo.mpduBytes)
+                        heMPDUBytes = [heMPDUBytes, heInfo.mpduBytes(:).']; %#ok<AGROW>
+                    end
+
                     % HE のサブキャリア番号は復号できたパケットから実測する
                     if ~heSubcResolved && ~isempty(heInfo.subcIdx)
                         subcarrierIndicesHE20 = heInfo.subcIdx(:).';
@@ -775,6 +789,27 @@ if stats.he > 0
     % 同じ BSS のパケットかどうかの二次的な手掛かりになる。
     printCountMapNum(heBSSColors, '    BSS Color       : ', 'Color%d=%d回  ');
     printCountMapChar(heRejects,  '    非対応の理由    : ');
+
+    % --- MPDU が読めなかった理由の内訳 ---------------------------------
+    % ここが切り分けの核心。
+    %   FCSFailed が大半      -> ペイロードにビット誤り。受信品質の問題。
+    %   それ以外が大半        -> ビットは正しいのに MATLAB が解釈できて
+    %                            いない (非対応のフレーム種別など)。
+    %                            この場合は復号器側で拾える。
+    printCountMapChar(heMPDUStatus, '    MPDU復号ステータス: ');
+    % 自前のヘッダ解析がどこで弾いたか。ビット誤りなら ProtocolVersion≠0 や
+    % Address2不正が多くなる。長さ不足が多いなら A-MPDU の切り出しがおかしい。
+    printCountMapChar(heHdrReasons,  '    MACヘッダ棄却理由 : ');
+    if ~isempty(heMPDUBytes)
+        edges = [0 24 100 500 1600 inf];
+        lbl   = {'<24B', '24-99B', '100-499B', '500-1599B', '>=1600B'};
+        fprintf('    MPDU長の分布      : ');
+        for q = 1:numel(lbl)
+            fprintf('%s=%d件  ', lbl{q}, ...
+                sum(heMPDUBytes >= edges(q) & heMPDUBytes < edges(q+1)));
+        end
+        fprintf('(中央値 %d B)\n', round(median(heMPDUBytes)));
+    end
 
     % --- 位相追跡が実際に効いたか ---
     % ここが 0 だと、A-MPDU の後半が位相回転で壊れたままになる。
@@ -1713,7 +1748,7 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
         'bwMHz', 0, 'nsts', 0, 'mcs', -1, 'coding', '', 'giUs', 0, ...
         'heltfType', 0, 'dcm', false, 'stbc', false, 'bssColor', -1, ...
         'uplink', false, 'lsigLen', 0, 'psduLen', 0, 'numSubcarriers', 0, ...
-        'pilotTracked', false, ...
+        'pilotTracked', false, 'mpduStatus', {{}}, 'hdrReason', {{}}, 'mpduBytes', [], ...
         'subcIdx', [], 'mpduCount', 0, 'deagStatus', '', ...
         'nonBinary', false, 'dataClass', '', 'dataRange', [0 0]);
 
@@ -1889,6 +1924,9 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
     info.nonBinary  = deagInfo.nonBinary;
     info.dataClass  = deagInfo.dataClass;
     info.dataRange  = deagInfo.dataRange;
+    info.mpduStatus = deagInfo.mpduStatus;
+    info.hdrReason  = deagInfo.hdrReason;
+    info.mpduBytes  = deagInfo.mpduBytes;
     if ~ok
         info.reason = sprintf('MPDU復号失敗(分解=%s,MPDU数=%d)', ...
             deagInfo.status, deagInfo.mpduCount);
@@ -2141,6 +2179,12 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
     ok = false;
     deagInfo = struct('status', 'N/A', 'mpduCount', 0, 'headerOnly', false, ...
         'nonBinary', false, 'dataClass', '', 'dataRange', [0 0]);
+    % 切り分け用の計測。「なぜ MPDU が読めなかったのか」を
+    % FCS の失敗なのか / MATLAB が非対応のフレーム種別なのか /
+    % そもそもヘッダが壊れているのか、に分けて記録する。
+    deagInfo.mpduStatus = {};   % wlanMPDUDecode が返したステータス
+    deagInfo.hdrReason  = {};   % 自前ヘッダ解析の棄却理由
+    deagInfo.mpduBytes  = [];   % 取り出せた MPDU の長さ [byte]
 
     mpduList = {};
     try
@@ -2160,19 +2204,21 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
     % 失敗するため、実際のデータ形式を判定して合わせる。
     wState = warning('off', 'all');
     for m = 1:numel(mpduList)
-        dfmt = mpduDataFormat(mpduList{m});
+        [dfmt, octPeek] = mpduDataFormat(mpduList{m});
         if isempty(dfmt)
             continue;   % 判別できない形式
         end
+        deagInfo.mpduBytes(end+1) = numel(octPeek);
         try
             [c, p, st] = wlanMPDUDecode(mpduList{m}, cfgFormat, 'DataFormat', dfmt);
+            deagInfo.mpduStatus{end+1} = char(string(st));
             if strcmpi(string(st), "Success")
                 warning(wState);
                 cfgMAC = c; payload = p; ok = true;
                 return;
             end
-        catch
-            % この MPDU は読み飛ばす
+        catch ME
+            deagInfo.mpduStatus{end+1} = ['例外: ' ME.identifier];
         end
     end
     warning(wState);
@@ -2224,6 +2270,7 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
             deagInfo.headerOnly = true;
             return;
         end
+        deagInfo.hdrReason{end+1} = hdr.reason;
     end
 end
 
@@ -2275,13 +2322,15 @@ function hdr = parseMACHeaderFromOctets(oct)
     % MPDU のオクテット列から MAC ヘッダ (Frame Control / Address1-3) を
     % 直接読む。FCS を検証しないため、内容が正しい保証は無い点に注意。
     hdr = struct('valid', false, 'FrameType', '', 'Address1', '', 'Address2', '', ...
-        'ManagementConfig', [], 'headerOnly', true);
+        'ManagementConfig', [], 'headerOnly', true, 'reason', '');
 
     if numel(oct) < 24
+        hdr.reason = sprintf('MPDUが%dバイトしかない(24バイト未満)', numel(oct));
         return;   % Address2 まで読めない
     end
     if any(oct < 0 | oct > 255 | mod(oct, 1) ~= 0)
-        return;   % オクテットとして解釈できない値が混じっている
+        hdr.reason = 'オクテット範囲外の値';
+        return;
     end
 
     fc0     = oct(1);
@@ -2291,7 +2340,8 @@ function hdr = parseMACHeaderFromOctets(oct)
     subtype = bitand(bitshift(fc0, -4), 15);
 
     if version ~= 0
-        return;   % プロトコルバージョンは 0 のはず。違えば復号が壊れている
+        hdr.reason = 'ProtocolVersion≠0';
+        return;
     end
 
     % ToDS/FromDS の組み合わせ検査。ToDS=1&FromDS=1 は 4アドレス形式
@@ -2300,14 +2350,17 @@ function hdr = parseMACHeaderFromOctets(oct)
     toDS   = bitand(fc1, 1);
     fromDS = bitand(bitshift(fc1, -1), 1);
     if toDS == 1 && fromDS == 1
+        hdr.reason = 'ToDS=1かつFromDS=1(4アドレス形式)';
         return;
     end
     if type == 0 && (toDS ~= 0 || fromDS ~= 0)
+        hdr.reason = '管理フレームなのにToDS/FromDS≠0';
         return;
     end
 
     % Address2 を持たないフレーム (ACK=1101, CTS=1100 の制御フレーム) は対象外
     if type == 1 && any(subtype == [12 13])
+        hdr.reason = 'ACK/CTS(Address2なし)';
         return;
     end
 
@@ -2324,7 +2377,8 @@ function hdr = parseMACHeaderFromOctets(oct)
         case 2
             typeName = 'Data';
         otherwise
-            return;   % type=3 は予約値
+            hdr.reason = 'Type=3(予約値)';
+            return;
     end
 
     addr1 = oct(5:10);
@@ -2334,6 +2388,7 @@ function hdr = parseMACHeaderFromOctets(oct)
     % また Address2 のグループビット (先頭オクテットの bit0) は送信元
     % アドレスでは必ず 0 になる。
     if all(addr2 == 0) || all(addr2 == 255) || bitand(addr2(1), 1) == 1
+        hdr.reason = 'Address2が不正(全0/全1/グループビット)';
         return;
     end
 
