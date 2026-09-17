@@ -24,7 +24,7 @@
 %    - ホストPC に接続された HDD (空き容量に注意。下記参照)
 %
 %  出力ファイル:
-%    <hddSavePath>/<yyyymmddHHMM>_raw.mat
+%    <hddSavePath>/<mmddHHMM>_raw.mat   (mmddHHMM = 月日時分)
 %      iq   … 受信 IQ サンプル (complex double 列ベクトル)
 %      meta … 中心周波数・サンプルレート・オーバーラン回数等の取得条件
 %
@@ -110,7 +110,9 @@ delete(testFile);
 estimatedBytes = captureDuration * sampleRate * 16;
 fprintf('保存予定サイズ: 約 %.2f GB (メモリも同量必要)\n', estimatedBytes / 1e9);
 
-timestamp  = datestr(now, 'yyyymmddHHMM');
+% ファイル名に使う時刻は mmddHHMM (月日時分)。年は入らないので、
+% 年まで含む完全な日時は meta.captureDatetimeFull に別途記録する。
+timestamp  = datestr(now, 'mmddHHMM');
 rawMatFile = fullfile(hddSavePath, [timestamp '_raw.mat']);
 
 %% ------------------------------------------------------------------------
@@ -219,7 +221,8 @@ meta.samplesPerFrame  = samplesPerFrame;
 meta.totalSamples     = totalSamplesCaptured;
 meta.overrunCount     = overrunCount;
 meta.elapsedCapture   = elapsedCapture;         % [s] 実際に要した時間
-meta.captureDatetime  = timestamp;              % 'yyyymmddHHMM'
+meta.captureDatetime     = timestamp;   % 'mmddHHMM' (ファイル名と同じ)
+meta.captureDatetimeFull = datestr(now, 'yyyy-mm-dd HH:MM:SS');   % 年を含む完全な日時
 meta.matlabVersion    = version;
 
 % IQ が 2GB を超え得るため -v7.3 (HDF5 ベース) で保存する

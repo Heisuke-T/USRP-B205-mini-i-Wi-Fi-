@@ -1,4 +1,4 @@
-%% captureIQ_long.m
+%% captureIQ_single.m
 % =========================================================================
 %  [第1段・長時間版] 生 IQ をディスクへ逐次書き出しながら長時間キャプチャする
 % -------------------------------------------------------------------------
@@ -31,13 +31,13 @@
 %      最初のフレームで判定して書き出し精度と倍率を決めている。
 %
 %  出力ファイル:
-%    [1] <hddSavePath>/<yyyymmddHHMM>_raw.bin
+%    [1] <hddSavePath>/<mmddHHMM>_raw.bin   (mmddHHMM = 月日時分)
 %          I,Q を交互に並べたべた書き (I0,Q0,I1,Q1,...)。通常は int16。
 %          120 秒で約 9.6 GB
-%    [2] <hddSavePath>/<yyyymmddHHMM>_rawmeta.mat
+%    [2] <hddSavePath>/<mmddHHMM>_rawmeta.mat
 %          変数 meta … 取得条件・オーバーラン回数・書き込み統計
 %    [3] writeSegments = true のとき
-%        <hddSavePath>/<yyyymmddHHMM>_seg01_raw.mat, _seg02_raw.mat, ...
+%        <hddSavePath>/<mmddHHMM>_seg01_raw.mat, _seg02_raw.mat, ...
 %          [1] を segmentDuration 秒ごとに分割し、captureIQ.m と同じ形式
 %          (complex double の iq + meta) に変換したもの。
 %          既存の decodeIQ_*.m / decode_VHT_v2.m がそのまま読める。
@@ -45,7 +45,7 @@
 %  なぜ分割するのか:
 %    復号側 (decodeIQ_*.m) も iq をまるごと double でメモリに載せるため、
 %    120 秒を1ファイルにすると復号時に 38.4 GB 必要になり同じ壁にぶつかる。
-%    10 秒ごとに分けておけば 1 ファイル 3.2 GB で処理できる。
+%    5 秒ごとに分けておけば 1 ファイル 1.6 GB で処理できる。
 %
 %    分割は受信の「後」に行うので、受信そのものは 120 秒間途切れない。
 %    各セグメントの meta.segmentStartTimeSec にキャプチャ開始からの
@@ -113,7 +113,7 @@ if ~exist(hddSavePath, 'dir')
     fprintf('保存先フォルダが存在しないため作成します: %s\n', hddSavePath);
     [ok, msg] = mkdir(hddSavePath);
     if ~ok
-        error('captureIQ_long:mkdirFailed', ...
+        error('captureIQ_single:mkdirFailed', ...
             'HDD 保存先フォルダを作成できませんでした (%s): %s', hddSavePath, msg);
     end
 end
@@ -121,7 +121,7 @@ end
 testFile = fullfile(hddSavePath, '.write_test.tmp');
 fidTest  = fopen(testFile, 'w');
 if fidTest == -1
-    error('captureIQ_long:hddNotWritable', ...
+    error('captureIQ_single:hddNotWritable', ...
         'HDD 保存先に書き込みできません: %s', hddSavePath);
 end
 fclose(fidTest);
@@ -151,17 +151,17 @@ try
     freeBytes = double(java.io.File(hddSavePath).getFreeSpace());
     fprintf('  保存先の空き容量       : %6.2f GB\n', freeBytes / 1e9);
     if freeBytes < totalBytes * 1.1
-        error('captureIQ_long:notEnoughSpace', ...
+        error('captureIQ_single:notEnoughSpace', ...
             ['保存先の空き容量が不足しています。\n', ...
              '  必要: %.2f GB / 空き: %.2f GB\n', ...
              'captureDuration を短くするか、writeSegments を false にしてください。'], ...
             totalBytes / 1e9, freeBytes / 1e9);
     end
 catch ME
-    if strcmp(ME.identifier, 'captureIQ_long:notEnoughSpace')
+    if strcmp(ME.identifier, 'captureIQ_single:notEnoughSpace')
         rethrow(ME);
     end
-    warning('captureIQ_long:freeSpaceUnknown', ...
+    warning('captureIQ_single:freeSpaceUnknown', ...
         '空き容量を確認できませんでした。手動で確認してください。');
 end
 
@@ -172,7 +172,9 @@ if writeSegments
         segPeakBytes / 1e9, segmentDuration);
 end
 
-timestamp   = datestr(now, 'yyyymmddHHMM');
+% ファイル名に使う時刻は mmddHHMM (月日時分)。年は入らないので、
+% 年まで含む完全な日時は meta.captureDatetimeFull に別途記録する。
+timestamp   = datestr(now, 'mmddHHMM');
 binFile     = fullfile(hddSavePath, [timestamp '_raw.bin']);
 metaFile    = fullfile(hddSavePath, [timestamp '_rawmeta.mat']);
 
@@ -183,7 +185,7 @@ radioInfo = [];
 try
     radioInfo = findsdru();
     if isempty(radioInfo)
-        warning('captureIQ_long:noRadio', ...
+        warning('captureIQ_single:noRadio', ...
             'USRP 機器が検出されませんでした。USB 接続と電源を確認してください。');
     else
         fprintf('\n検出された USRP 機器:\n');
@@ -193,11 +195,11 @@ try
         end
     end
 catch ME
-    warning('captureIQ_long:findsdruFailed', 'findsdru の実行に失敗しました: %s', ME.message);
+    warning('captureIQ_single:findsdruFailed', 'findsdru の実行に失敗しました: %s', ME.message);
 end
 
 if isempty(usrpSerialNum)
-    error('captureIQ_long:noSerialNum', ...
+    error('captureIQ_single:noSerialNum', ...
         'usrpSerialNum を指定してください (findsdru の表示を参照)。');
 end
 
@@ -253,7 +255,7 @@ rawScaleFactor = 1;    % double へ戻すときに掛ける倍率
 fidBin = fopen(binFile, 'w');
 if fidBin == -1
     release(rx);
-    error('captureIQ_long:binOpenFailed', ...
+    error('captureIQ_single:binOpenFailed', ...
         '出力ファイルを開けませんでした: %s', binFile);
 end
 
@@ -289,7 +291,7 @@ try
                 otherwise
                     fclose(fidBin);
                     release(rx);
-                    error('captureIQ_long:unsupportedType', ...
+                    error('captureIQ_single:unsupportedType', ...
                         '想定外のデータ型です: %s', class(iqData));
             end
             reqMBs = sampleRate * bytesPerSample / 1e6;
@@ -342,7 +344,7 @@ release(rx);
 fclose(fidBin);
 
 if isempty(rawPrecision)
-    error('captureIQ_long:noSamples', ...
+    error('captureIQ_single:noSamples', ...
         ['1フレームも受信できませんでした。USRP の接続と設定を確認してください。\n', ...
          '生成された %s は空です。'], binFile);
 end
@@ -394,7 +396,8 @@ meta.overrunCount     = overrunCount;
 meta.elapsedCapture   = elapsedCapture;         % [s]
 meta.writeSecTotal    = writeSecTotal;          % [s]
 meta.writeSecMax      = writeSecMax;            % [s]
-meta.captureDatetime  = timestamp;              % 'yyyymmddHHMM'
+meta.captureDatetime     = timestamp;   % 'mmddHHMM' (ファイル名と同じ)
+meta.captureDatetimeFull = datestr(now, 'yyyy-mm-dd HH:MM:SS');   % 年を含む完全な日時
 meta.matlabVersion    = version;
 
 save(metaFile, 'meta');
@@ -416,7 +419,7 @@ if writeSegments
 
     fidIn = fopen(binFile, 'r');
     if fidIn == -1
-        error('captureIQ_long:binOpenFailedForRead', ...
+        error('captureIQ_single:binOpenFailedForRead', ...
             '生データを開けませんでした: %s', binFile);
     end
 
