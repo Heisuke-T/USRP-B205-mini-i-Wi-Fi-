@@ -100,11 +100,16 @@ usrpSerialNum   = '3240497';
 % true にすると、キャプチャ後に .bin を分割して captureIQ.m と同じ形式の
 % *_raw.mat を書き出す。既存の decodeIQ_*.m をそのまま使いたい場合は true。
 writeSegments   = true;
-segmentDuration = 5.0;          % [s] 1セグメントの長さ。
+segmentDuration = 5.0;          % [s] 1セグメントが担当する長さ。
                                  %     5s = complex double で 1.6 GB、
                                  %     変換中のピークで約 3.2 GB 必要。
                                  %     搭載メモリに合わせて調整すること
                                  %     (16GB 搭載なら 5〜10s が妥当)。
+segmentOverlap  = 0.01;         % [s] セグメント末尾に付ける重なり。
+                                 %     境界にまたがるパケットを取りこぼさない
+                                 %     ため。802.11 の最大 PPDU 長は 5.484 ms
+                                 %     なので、それより長ければ十分
+                                 %     (既定 10 ms = 20万サンプル)。
 
 %% ------------------------------------------------------------------------
 %  2. 保存先の準備と容量の確認
@@ -409,12 +414,24 @@ fprintf('\nメタデータを保存しました: %s\n', metaFile);
 % .bin を segmentDuration ごとに読み出し、captureIQ.m と同じ変数構成
 % (complex double の iq + meta) の *_raw.mat として書き出す。
 % ここはメモリに1セグメント分しか載せないので、長時間でも破綻しない。
+%
+% 境界にまたがるパケットの扱い:
+%   各セグメントを独立に復号すると、境界をまたぐパケットはどちらでも
+%   取れない (前半では末尾でデータが切れ、後半にはプリアンブルが無い)。
+%   そこで各セグメントの末尾に segmentOverlap 秒ぶんの重なりを付ける。
+%   802.11 の最大 PPDU 長は 5.484 ms なので、それより長く取れば
+%   「自分の担当区間内で始まったパケット」は必ず丸ごと含まれる。
+%
+%   重なり部分で始まるパケットは次のセグメントの担当なので、両方に現れる。
+%   マージ時は timeSec < segmentCoreDuration のものだけ採用すれば
+%   重複も欠落も無く 120 秒を繋げられる (mergeCSI.m がこれを行う)。
 if writeSegments
-    segSamples = round(segmentDuration * sampleRate);
-    numSegs    = ceil(totalSamplesCaptured / segSamples);
+    segSamples     = round(segmentDuration * sampleRate);
+    overlapSamples = round(segmentOverlap * sampleRate);
+    numSegs        = ceil(totalSamplesCaptured / segSamples);
 
-    fprintf('\n[分割] %d 個のセグメントに分割します (1個 %.1f s)...\n', ...
-        numSegs, segmentDuration);
+    fprintf('\n[分割] %d 個のセグメントに分割します (1個 %.1f s + 重なり %.0f ms)...\n', ...
+        numSegs, segmentDuration, segmentOverlap * 1e3);
     splitTic = tic;
 
     fidIn = fopen(binFile, 'r');
@@ -427,7 +444,12 @@ if writeSegments
     try
         for s = 1:numSegs
             startSample = (s - 1) * segSamples;
-            nRead = min(segSamples, totalSamplesCaptured - startSample);
+            % 担当区間 + 重なり。ただしデータ末尾は超えない。
+            nRead = min(segSamples + overlapSamples, ...
+                        totalSamplesCaptured - startSample);
+
+            % 重なりの分だけ戻って読むので、毎回読み出し位置を指定する
+            fseek(fidIn, startSample * bytesPerSample, 'bof');
 
             % 2 x nRead として読む (列が [I;Q] の組)。書き出したときと
             % 同じ精度を指定する。
@@ -452,6 +474,10 @@ if writeSegments
             segMeta.segmentCount        = numSegs;
             segMeta.segmentStartSample  = startSample;
             segMeta.segmentStartTimeSec = startSample / sampleRate;
+            % このセグメントが「担当」する長さ。これを超える時刻のパケットは
+            % 重なり部分のもので、次のセグメントの担当。マージ時に使う。
+            segMeta.segmentCoreDuration = min(segmentDuration, nActual / sampleRate);
+            segMeta.segmentOverlapSec   = segmentOverlap;
             segMeta.totalSamples        = nActual;
             segMeta.captureDuration     = nActual / sampleRate;
             segMeta.sourceBinFile       = binFile;
@@ -483,10 +509,11 @@ if writeSegments
     fclose(fidIn);
 
     fprintf('[分割] 完了 (%.1f s)\n', toc(splitTic));
-    fprintf(['\n次に decodeIQ_VHT.m / decode_VHT_v2.m 等で各セグメントを\n', ...
-             '復号してください。inputRawFile にセグメントのパスを指定します。\n', ...
-             '複数セグメントの CSI を時系列で繋ぐ場合は、各セグメントの\n', ...
-             'meta.segmentStartTimeSec を timeSec に足してください。\n']);
+    fprintf(['\n次の手順:\n', ...
+             '  1. decodeIQ_VHT.m / decode_VHT_v2.m 等で各セグメントを復号する\n', ...
+             '     (inputRawFile にセグメントのパスを指定)\n', ...
+             '  2. mergeCSI.m で全セグメントの CSI を1本の時系列に繋ぐ\n', ...
+             '     (時刻のオフセット加算と、重なり部分の重複除去を行う)\n']);
 else
     fprintf(['\n生データ (.bin) のみ保存しました。decodeIQ_*.m は *_raw.mat を\n', ...
              '前提としているため、そのままでは読めません。writeSegments を\n', ...
