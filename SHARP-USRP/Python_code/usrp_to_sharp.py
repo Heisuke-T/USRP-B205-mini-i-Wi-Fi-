@@ -334,9 +334,9 @@ def convert(in_path, out_path, fmt=None, fcs_only=False, verbose=True):
                   f'{stats["min_interval_ms"]:.2f}..'
                   f'{stats["max_interval_ms"]:.2f} ms, '
                   f'変動係数 {stats["cv"]:.2f})')
-            if stats['cv'] > 0.2:
-                print('  注意: パケット間隔のばらつきが大きく、等間隔サンプリングを')
-                print('        前提とする Doppler 解析にはリサンプリングが必要です。')
+            if stats['cv'] > 0.3:
+                print('  注意: パケット間隔のばらつきが大きめです。Doppler 計算では')
+                print('        --resample nudft も試して結果を比べてください。')
                 print('        (位相サニタイゼーション自体はパケット単位処理のため影響なし)')
         print(f'出力: {out_path}')
 
