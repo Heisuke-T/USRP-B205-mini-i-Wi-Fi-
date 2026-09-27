@@ -58,10 +58,9 @@
 %      あります。
 %
 %  既知の簡略化 (復号率が伸びないときに見直す箇所):
-%    - パイロットによる残留位相誤差の追跡 (wlanHETrackPilotError) は
-%      行っていません。精CFO補正後の残留位相回転が小さいことを前提として
-%      います。長いパケットほど効いてくるので、末尾側だけ FCS が通らない
-%      ようなら導入を検討してください。
+%    - 位相追跡は wlanHETrackPilotError による共通位相誤差 (CPE) の補正
+%      までです。サブキャリアごとに傾く成分 (SFO によるタイミングドリフト)
+%      までは追い切れないため、非常に長いパケットの末尾では誤差が残ります。
 %    - 雑音分散は L-LTF から求めた 1 つの値をすべてのフィールドに使って
 %      います。HE-Data はサブキャリア間隔が 1/4 (78.125kHz) なので厳密には
 %      スケールが一致しません。「HE-SIG-A は解釈できるのに HE-Data の FCS が
@@ -99,6 +98,10 @@
 %      csiHT    / timeSecHT    / frameTypeHT    / fcsHT
 %      csiVHT   / timeSecVHT   / frameTypeVHT   / fcsVHT
 %      csiHE    / timeSecHE    / frameTypeHE    / fcsHE
+%      uplinkHE   … [パケット数 x 1] true=上り(STA->AP), false=下り(AP->STA)
+%                   HE-SIG-A の UL/DL ビット由来。上りと下りは送信機が違う
+%                   ので CSI も別物。解析時は必ず分けること。
+%      bssColorHE … [パケット数 x 1] HE-SIG-A の BSS Color
 %      subcarrierIndicesNonHT … [1 x 52]   Non-HT の使用サブキャリア番号
 %      subcarrierIndicesHT20  … [1 x 52]   HT-20MHz の使用サブキャリア番号
 %      subcarrierIndicesVHT20 … [1 x 56]   VHT-20MHz の使用サブキャリア番号
@@ -118,10 +121,23 @@
 %      アップリンクは Address1 が BSSID になるため)。
 %
 %  処理時間の目安:
-%    実測でキャプチャ 1 秒あたり 300〜2400 秒 (電波の混雑度に強く依存)。
-%    HE は LDPC が既定で、パケットも長くなりがちなので VHT より遅くなる
-%    傾向があります。まずは captureDuration を短く (1s 程度) して動作確認
-%    することを推奨します。
+%    電波の混雑度に強く依存します。まずは captureDuration を短く (1s 程度)
+%    して動作確認することを推奨します。
+%
+%    復号が遅いときの主な要因は次の3つです。
+%      1) キャプチャ長そのもの
+%         パケット検出は全サンプルを走査するので、キャプチャが長いほど
+%         比例して時間がかかります。
+%      2) HE のデータ復号 (LDPC)
+%         HE は LDPC が既定で、MATLAB の LDPC 復号は反復計算のため
+%         BCC (Viterbi) より大幅に遅くなります。さらに HE は A-MPDU で
+%         数万バイトまとめて送るのでパケット 1 個が長くなります。
+%         decodeIQ_VHT.m は HE パケットを検出だけして読み捨てていたので、
+%         同じ電波を復号しても本スクリプトの方が遅くなるのは正常です。
+%      3) 誤検出パケットの復号試行
+%         pktDetThreshold を下げすぎると雑音を拾って復号を試み続けます。
+%         復号サマリの「パケット検出数」に対して「MAC まで復号成功」が
+%         極端に少ない場合は、しきい値を上げる方が速くなります。
 % =========================================================================
 
 clear; clc;
@@ -151,7 +167,7 @@ hddSavePath = 'D:\IQ_csi';
 usbSavePath = '';
 
 % --- 抽出したい Wi-Fi の SSID --------------------------------------------
-targetSSID = 'OpenWrt-A';
+targetSSID = 'WAX202';
 
 % --- 復号パラメータ ------------------------------------------------------
 chanBW          = 'CBW20';      % WLAN Toolbox のチャネル帯域幅指定
@@ -161,6 +177,17 @@ pktDetThreshold = 0.5;          % wlanPacketDetect のしきい値 (0〜1)
                                  % 復号時間も伸びる
 verboseErrors   = false;        % true にすると復号エラーを毎回表示する
                                  % (通常は最後に集計のみ表示)
+
+% --- MAC が読めなかった HE パケットを BSS Color で拾うか --------------------
+%     高い MCS (1024QAM 等) では受信SNRが少し足りないだけでデータ部の FCS が
+%     通らなくなるが、CSI はプリアンブル (HE-LTF) から算出しているので影響を
+%     受けない。HE-SIG-A の BSS Color は CRC を通ったうえで読めるため、
+%     MAC が読めたパケットから Color -> BSSID を学習しておけば、読めなかった
+%     パケットも同じ BSS のものとして CSI を残せる。
+%     ※ Color は 6bit しかないため、近隣に同じ Color の BSS があると混ざる
+%       可能性がある。厳密に MAC で確認できたものだけが欲しい場合は false に
+%       する (その場合 fcsVerified が false の HE 記録は出力されない)。
+useBSSColorFallback = true;
 
 %% ------------------------------------------------------------------------
 %  2. 生IQファイルの読み込み
@@ -246,6 +273,27 @@ else
          '  Non-HT / HT / VHT のみ復号して続行します。'], strjoin(missingFuncs, ', '));
 end
 
+% --- 受信レベルの確認 ------------------------------------------------------
+% ADC が飽和していると、BPSK/QPSK のプリアンブルや SIG フィールドは通るのに
+% 高次QAM (64QAM以上) のデータ部だけが壊れる、という症状が出る。HE は
+% MCS8〜11 で 1024QAM まで使うため、ここの確認が効く。
+% 全サンプルを評価するとメモリを大量に使うので、間引いて概算する。
+levelStep   = max(1, floor(numel(iq) / 5e6));
+levelSample = iq(1:levelStep:end);
+peakLevel   = max(max(abs(real(levelSample))), max(abs(imag(levelSample))));
+rmsLevel    = sqrt(mean(abs(levelSample).^2));
+satRatio    = mean(abs(real(levelSample)) > 0.99 * peakLevel | ...
+                   abs(imag(levelSample)) > 0.99 * peakLevel);
+clear levelSample;
+fprintf('  受信レベル      : ピーク %.4f, RMS %.5f (PAPR %.1f dB)\n', ...
+    peakLevel, rmsLevel, 20*log10(peakLevel / max(rmsLevel, eps)));
+if satRatio > 1e-4
+    fprintf(['  ※サンプルの %.3f%% がピーク付近に張り付いています。ADC が飽和\n', ...
+             '    している可能性が高いです。飽和すると BPSK/QPSK は通るのに\n', ...
+             '    64QAM 以上だけが壊れるため、captureIQ.m の gain を 10 dB 程度\n', ...
+             '    下げて取り直してください。\n'], satRatio * 100);
+end
+
 %% ------------------------------------------------------------------------
 %  3. 出力先の準備 (HDD と USB メモリの両方)
 %  ------------------------------------------------------------------------
@@ -311,13 +359,13 @@ subcarrierIndicesVHT20 = [-28:-1, 1:28];    % VHT    CBW20 (56本)
 subcarrierIndicesHE20  = [-122:-2, 2:122];  % HE     CBW20 (242本)
 
 pktLog = struct('timeSec', {}, 'bssid', {}, 'addr1', {}, 'frameType', {}, 'ssid', {}, ...
-    'phyFormat', {}, 'fcsVerified', {}, 'mpduCount', {}, 'csi', {});
+    'phyFormat', {}, 'bssColor', {}, 'uplink', {}, 'fcsVerified', {}, 'mpduCount', {}, 'csi', {});
 bssidToSSID = containers.Map('KeyType', 'char', 'ValueType', 'char');
 
 % 復号統計 (診断用)
 stats = struct('detected', 0, 'timingSkip', 0, 'nonHT', 0, 'ht', 0, 'vht', 0, ...
     'he', 0, 'htGF', 0, 'other', 0, 'htUnsupported', 0, 'vhtUnsupported', 0, ...
-    'heUnsupported', 0, 'decodeOK', 0, 'noAddr2', 0, 'errors', 0);
+    'heUnsupported', 0, 'decodeOK', 0, 'csiOnly', 0, 'noAddr2', 0, 'errors', 0);
 errMsgs       = containers.Map('KeyType', 'char', 'ValueType', 'double');
 deagStatusCnt = containers.Map('KeyType', 'char', 'ValueType', 'double');
 nonBinaryShown = false;  % 非0/1データを検出した旨を一度だけ表示するためのフラグ
@@ -341,6 +389,13 @@ heNSTSCounts   = containers.Map('KeyType', 'double', 'ValueType', 'double');
 heBWCounts     = containers.Map('KeyType', 'double', 'ValueType', 'double');
 heCodingCounts = containers.Map('KeyType', 'char', 'ValueType', 'double');
 heBSSColors    = containers.Map('KeyType', 'double', 'ValueType', 'double');
+heMCSOKCounts  = containers.Map('KeyType', 'double', 'ValueType', 'double');
+heSNRs         = [];  % HE パケットごとの受信SNR推定 [dB]
+heMPDUStatus   = containers.Map('KeyType', 'char', 'ValueType', 'double');
+heHdrReasons   = containers.Map('KeyType', 'char', 'ValueType', 'double');
+heMPDUBytes    = [];  % 取り出せた MPDU の長さ [byte]
+hePilotTracked = 0;   % HE-Data の位相追跡が実際に効いた件数
+hePilotTotal   = 0;   % HE-Data の復号まで到達した件数
 heSigParsed    = 0;   % HE-SIG-A の CRC と解釈を通った件数
 heDetailShown  = 0;   % 内訳を表示した HE パケット数
 heDetailMax    = 5;   % 内訳を表示する最大件数
@@ -348,6 +403,18 @@ heSubcResolved = false;  % subcarrierIndicesHE20 を実測値で上書き済み�
 
 minPreambleLen = 560;   % L-STF..L-SIG + 2シンボル (レガシーのフォーマット検出まで)
 searchOffset = 0;
+
+% 1パケットの復号に切り出す最大長。
+%   802.11 は 1 つの PPDU の継続時間を 5.484 ms 以下と定めている
+%   (aPPDUMaxTime)。20 MSps なら約 11 万サンプルなので、6 ms 分あれば
+%   どんなパケットでも全体が収まる。
+%
+%   ここを区切るのは速度のためで、効果は非常に大きい。区切らずに
+%   iq(pktStart+1:end) を渡すと、パケット 1 個ごとに「残りのIQ全部」
+%   (5秒キャプチャなら 1 億サンプル = 1.6 GB) をコピーして、その全要素に
+%   CFO補正の複素指数を掛ける処理が 2 回走る。実際に使うのは先頭の
+%   数万サンプルだけなので、大半が完全な無駄になる。
+maxPPDULen = round(6e-3 * sampleRate);
 
 fprintf('\nオフライン復号を開始します...\n');
 decodeTic = tic;
@@ -397,7 +464,12 @@ while searchOffset + minPreambleLen <= numel(iq)
         end
 
         % --- 精CFO推定・補正 (L-LTF) ---
-        pkt     = applyCFO(iq(pktStart+1:end), sampleRate, -coarseCFO);
+        %     1 PPDU 分 (最大 maxPPDULen サンプル) だけを切り出して補正する。
+        %     この窓に収まりきらない = 規格上の最大PPDU長を超えるパケットは
+        %     復号側で「サンプル不足」と判定され読み捨てられるが、それは
+        %     誤検出なので問題ない。
+        pktEnd  = min(numel(iq), pktStart + maxPPDULen);
+        pkt     = applyCFO(iq(pktStart+1:pktEnd), sampleRate, -coarseCFO);
         fineCFO = wlanFineCFOEstimate(pkt(161:320), chanBW);
         pkt     = applyCFO(pkt, sampleRate, -fineCFO);
 
@@ -498,6 +570,10 @@ while searchOffset + minPreambleLen <= numel(iq)
 
                     if heInfo.sigaParsed
                         heSigParsed  = heSigParsed + 1;
+                        % 受信SNRの概算 (L-LTF のチャネル推定電力 / 雑音分散)。
+                        % どのMCSまで復号できる見込みがあるかの判断に使う。
+                        heSNRs(end+1) = 10 * log10( ...
+                            mean(abs(lltfChanEst(:)).^2) / max(noiseEst, eps)); %#ok<SAGROW>
                         heMCSCounts  = bumpMap(heMCSCounts, heInfo.mcs);
                         heNSTSCounts = bumpMap(heNSTSCounts, heInfo.nsts);
                         heBWCounts   = bumpMap(heBWCounts, heInfo.bwMHz);
@@ -510,6 +586,17 @@ while searchOffset + minPreambleLen <= numel(iq)
                     end
                     [deagStatusCnt, nonBinaryShown] = ...
                         recordDeag(deagStatusCnt, nonBinaryShown, 'HE', heInfo);
+
+                    % 「なぜ MPDU が読めなかったか」の切り分け用の集計
+                    for q = 1:numel(heInfo.mpduStatus)
+                        heMPDUStatus = bumpMap(heMPDUStatus, heInfo.mpduStatus{q});
+                    end
+                    for q = 1:numel(heInfo.hdrReason)
+                        heHdrReasons = bumpMap(heHdrReasons, heInfo.hdrReason{q});
+                    end
+                    if ~isempty(heInfo.mpduBytes)
+                        heMPDUBytes = [heMPDUBytes, heInfo.mpduBytes(:).']; %#ok<AGROW>
+                    end
 
                     % HE のサブキャリア番号は復号できたパケットから実測する
                     if ~heSubcResolved && ~isempty(heInfo.subcIdx)
@@ -532,9 +619,23 @@ while searchOffset + minPreambleLen <= numel(iq)
                             heInfo.deagStatus, heInfo.mpduCount);
                     end
 
+                    % HE-Data の復号まで到達したものについて、位相追跡が
+                    % 実際に効いたかを数える (棄却されたものも含めて数える)
+                    if heInfo.numSubcarriers > 0
+                        hePilotTotal = hePilotTotal + 1;
+                        if heInfo.pilotTracked
+                            hePilotTracked = hePilotTracked + 1;
+                        end
+                    end
+
                     if ~isempty(heInfo.reason)
                         stats.heUnsupported = stats.heUnsupported + 1;
                         heRejects = bumpMap(heRejects, heInfo.reason);
+                    elseif st > 0 && heInfo.sigaParsed
+                        % MAC まで到達できたものだけを MCS 別に数える。
+                        % 上の「MCS の内訳」(SIG-A が読めた全件) と見比べると、
+                        % どの変調方式で復号が破綻しているかが分かる。
+                        heMCSOKCounts = bumpMap(heMCSOKCounts, heInfo.mcs);
                     end
                 end
 
@@ -554,7 +655,13 @@ while searchOffset + minPreambleLen <= numel(iq)
             continue;
         end
 
-        if st > 0
+        if st == 2
+            % MAC は読めなかったが CSI は取れている HE パケット。
+            % 後段で BSS Color を手掛かりに対象SSIDへ帰属させる。
+            stats.csiOnly = stats.csiOnly + 1;
+            entry.timeSec = pktStart / sampleRate;
+            pktLog(end+1) = entry; %#ok<SAGROW>
+        elseif st > 0
             stats.decodeOK = stats.decodeOK + 1;
 
             if isempty(entry)
@@ -656,6 +763,13 @@ if stats.he > 0
     fprintf('    HE-SIG-A 解釈成功: %d 件 (検出 %d 件中)\n', heSigParsed, stats.he);
     printCountMapNum(heBWCounts,   '    送信帯域幅の内訳: ', '%dMHz=%d回  ');
     printCountMapNum(heMCSCounts,  '    MCS の内訳      : ', 'MCS%d=%d回  ');
+    printCountMapNum(heMCSOKCounts, '    うち復号成功    : ', 'MCS%d=%d回  ');
+    if heMCSCounts.Count > 0 && heMCSOKCounts.Count == 0
+        fprintf(['    ※SIG-A は読めているのに MAC まで到達したものが 0 件です。\n', ...
+                 '      プリアンブルは復号できているので受信自体は成立しており、\n', ...
+                 '      データ部の変調が受信品質に対して重すぎる (高MCS)、\n', ...
+                 '      または ADC が飽和している可能性が高いです。\n']);
+    end
     printCountMapChar(heCodingCounts, '    符号化方式      : ');
     if heNSTSCounts.Count > 0
         nKeys = cell2mat(keys(heNSTSCounts));
@@ -675,6 +789,68 @@ if stats.he > 0
     % 同じ BSS のパケットかどうかの二次的な手掛かりになる。
     printCountMapNum(heBSSColors, '    BSS Color       : ', 'Color%d=%d回  ');
     printCountMapChar(heRejects,  '    非対応の理由    : ');
+
+    % --- MPDU が読めなかった理由の内訳 ---------------------------------
+    % ここが切り分けの核心。
+    %   FCSFailed が大半      -> ペイロードにビット誤り。受信品質の問題。
+    %   それ以外が大半        -> ビットは正しいのに MATLAB が解釈できて
+    %                            いない (非対応のフレーム種別など)。
+    %                            この場合は復号器側で拾える。
+    printCountMapChar(heMPDUStatus, '    MPDU復号ステータス: ');
+    % 自前のヘッダ解析がどこで弾いたか。ビット誤りなら ProtocolVersion≠0 や
+    % Address2不正が多くなる。長さ不足が多いなら A-MPDU の切り出しがおかしい。
+    printCountMapChar(heHdrReasons,  '    MACヘッダ棄却理由 : ');
+    if ~isempty(heMPDUBytes)
+        edges = [0 24 100 500 1600 inf];
+        lbl   = {'<24B', '24-99B', '100-499B', '500-1599B', '>=1600B'};
+        fprintf('    MPDU長の分布      : ');
+        for q = 1:numel(lbl)
+            fprintf('%s=%d件  ', lbl{q}, ...
+                sum(heMPDUBytes >= edges(q) & heMPDUBytes < edges(q+1)));
+        end
+        fprintf('(中央値 %d B)\n', round(median(heMPDUBytes)));
+    end
+
+    % --- 位相追跡が実際に効いたか ---
+    % ここが 0 だと、A-MPDU の後半が位相回転で壊れたままになる。
+    if hePilotTotal > 0
+        fprintf('    位相追跡(HE-Data): %d/%d 件に適用', hePilotTracked, hePilotTotal);
+        if hePilotTracked == 0
+            fprintf('  <-- 効いていません。上の警告を確認してください\n');
+        else
+            fprintf('\n');
+        end
+    end
+
+    % --- 受信SNRと、観測されたMCSの所要SNRの比較 ---
+    % これが最終的な判断材料。SNRが所要値に届いていなければ、
+    % 復号器を改良しても復号率は上がらない。
+    if ~isempty(heSNRs)
+        sortedSNR = sort(heSNRs);
+        medSNR    = sortedSNR(max(1, round(0.50 * numel(sortedSNR))));
+        loSNR     = sortedSNR(max(1, round(0.10 * numel(sortedSNR))));
+        hiSNR     = sortedSNR(max(1, round(0.90 * numel(sortedSNR))));
+        fprintf('    受信SNR推定     : 中央値 %.1f dB (下位10%% %.1f dB / 上位10%% %.1f dB)\n', ...
+            medSNR, loSNR, hiSNR);
+
+        % 最も多かった MCS の所要SNRと比べる
+        mcsKeys   = cell2mat(keys(heMCSCounts));
+        mcsVals   = cell2mat(values(heMCSCounts));
+        [~, iMax] = max(mcsVals);
+        domMCS    = mcsKeys(iMax);
+        reqSNR    = heRequiredSNR(domMCS);
+        fprintf('    最多MCS%d の所要SNR: 約 %d dB (%s)', domMCS, reqSNR, heModulationName(domMCS));
+        if medSNR < reqSNR
+            fprintf('  <-- %.1f dB 不足\n', reqSNR - medSNR);
+            fprintf(['      受信品質に対して変調が重すぎます。復号器側では改善\n', ...
+                     '      できないので、送信側の MCS を下げてください。\n', ...
+                     '      (PicoScenes で送信するなら MCS を 0〜4 に固定する、\n', ...
+                     '       AP が送信側なら iperf3 の向きを逆にして PicoScenes を\n', ...
+                     '       送信側にする、アンテナを近づける、等)\n']);
+        else
+            fprintf('  (SNRは足りている)\n');
+        end
+    end
     if heSigParsed == 0 && stats.he > 0
         fprintf(['    ※HE-SIG-A を1件も解釈できていません。受信SNR不足か、\n', ...
                  '      HE パケットが 40/80MHz で送信されている可能性があります。\n']);
@@ -683,6 +859,7 @@ end
 
 fprintf('  MAC まで復号成功          : %d\n', stats.decodeOK);
 fprintf('    うち Address2 無し(ACK/CTS等、BSSID判定不可): %d\n', stats.noAddr2);
+fprintf('  CSIのみ記録(HE, MAC未復号): %d  (BSS Color で帰属を試みます)\n', stats.csiOnly);
 fprintf('  復号エラー                : %d\n', stats.errors);
 
 % --- A-MPDU 分解の結果 (データ復号が機能しているかの判断材料) ---
@@ -701,11 +878,14 @@ if ~isempty(pktLog)
     fprintf('  [FCS 検証の内訳 (全BSSID)]\n');
     allFmt  = {pktLog.phyFormat};
     allFcsV = logical([pktLog.fcsVerified]);
+    allNoMAC = strcmp({pktLog.frameType}, '(MAC未復号)');
     for f = {'Non-HT', 'HT', 'VHT', 'HE'}
         sel = strcmpi(allFmt, f{1});
         if any(sel)
-            fprintf('    %-6s : 記録%d件 (FCS検証OK=%d, ヘッダのみ推定=%d)\n', ...
-                f{1}, sum(sel), sum(sel & allFcsV), sum(sel & ~allFcsV));
+            fprintf(['    %-6s : 記録%d件 (FCS検証OK=%d, ヘッダのみ推定=%d, ', ...
+                     'MAC未復号(CSIのみ)=%d)\n'], ...
+                f{1}, sum(sel), sum(sel & allFcsV), ...
+                sum(sel & ~allFcsV & ~allNoMAC), sum(sel & allNoMAC));
         end
     end
     fprintf(['    ※あるフォーマットで FCS検証OK が 0 件の場合、そのフォーマットの\n', ...
@@ -798,7 +978,90 @@ for k = 1:numel(seenNetworks)
     end
 end
 
+% --- BSS Color と BSSID の対応を学習する ------------------------------------
+% HE-SIG-A の BSS Color は CRC を通ったうえで得られる 6bit の BSS 識別子で、
+% MAC ヘッダが読めなくても分かる。高MCS (1024QAM 等) では受信SNRが少し
+% 足りないだけでデータ部の FCS が通らなくなるが、CSI はプリアンブル
+% (HE-LTF) から算出しているので影響を受けない。そこで
+%   「MAC が読めたパケット」から Color -> BSSID の対応を学習し、
+%   「MAC が読めなかったパケット」を Color 一致で同じ BSS に帰属させる
+% ことで、CSI を捨てずに済ませる。
+%
+% 6bit しかないので別々の BSS が同じ Color を使うことはあり得る。学習中に
+% 1つの Color が複数の BSSID に結びついた場合は、その Color での帰属を
+% 諦める (誤って別ネットワークの CSI を混ぜるより、取りこぼす方が安全)。
+% 学習には次の2つの条件を満たすパケットだけを使う。
+%   (a) FCS 検証まで通っている
+%       高MCSではビット誤りの残った MPDU が「MACヘッダのみ」の緩い妥当性検査を
+%       偶然通ることがあり、でたらめなアドレスを学習してしまう。FCS が通った
+%       ものだけに限れば、この誤学習を完全に排除できる。
+%   (b) 送信元(Address2)か宛先(Address1)のどちらかが、Beacon で SSID を
+%       確認済みの BSSID である
+%       ダウンリンクなら Address2、アップリンクなら Address1 が BSSID になる。
+%       Beacon 由来の BSSID に錨を下ろすことで、クライアントの MAC アドレスを
+%       誤って BSSID として登録することも防げる。
+allColors  = [pktLog.bssColor];
+colorToBSSID   = containers.Map('KeyType', 'double', 'ValueType', 'char');
+colorEvidence  = containers.Map('KeyType', 'double', 'ValueType', 'double');
+colorConflicts = containers.Map('KeyType', 'double', 'ValueType', 'logical');
+for k = 1:numel(pktLog)
+    c = pktLog(k).bssColor;
+    if c < 0 || ~pktLog(k).fcsVerified
+        continue;   % HE以外、または MAC を確証できていないパケット
+    end
+
+    % Beacon で確認済みの BSSID に一致する方を採用する
+    bs = '';
+    if any(strcmp(knownBssidSet, pktLog(k).bssid))
+        bs = pktLog(k).bssid;
+    elseif any(strcmp(knownBssidSet, pktLog(k).addr1))
+        bs = pktLog(k).addr1;
+    end
+    if isempty(bs)
+        continue;   % どちらの向きでも既知の BSS に結びつかない
+    end
+
+    if isKey(colorToBSSID, c)
+        if ~strcmp(colorToBSSID(c), bs)
+            % 別々の BSS が同じ Color を使っている。6bit しかないので
+            % 起こり得る。この Color での帰属は諦める。
+            colorConflicts(c) = true;
+        else
+            colorEvidence(c) = colorEvidence(c) + 1;
+        end
+    else
+        colorToBSSID(c) = bs;
+        colorEvidence(c) = 1;
+    end
+end
+
+if colorToBSSID.Count > 0
+    fprintf('\nBSS Color と BSSID の対応 (FCS検証済みパケットから学習):\n');
+    cKeys = sort(cell2mat(keys(colorToBSSID)));
+    for k = 1:numel(cKeys)
+        bs = colorToBSSID(cKeys(k));
+        ss = '';
+        for j = 1:numel(seenNetworks)
+            if strcmp(seenNetworks(j).bssid, bs)
+                ss = seenNetworks(j).ssid;
+                break;
+            end
+        end
+        conflict = isKey(colorConflicts, cKeys(k)) && colorConflicts(cKeys(k));
+        fprintf('  Color%-2d -> BSSID=%s%s  (根拠 %d件)%s\n', cKeys(k), bs, ...
+            ternary(~isempty(ss), sprintf('  SSID="%s"', ss), ''), ...
+            colorEvidence(cKeys(k)), ...
+            ternary(conflict, '   <-- 複数のBSSIDと衝突。Colorでの帰属は行いません', ''));
+    end
+elseif stats.csiOnly > 0
+    fprintf(['\nBSS Color と BSSID の対応を学習できませんでした。\n', ...
+             '  (FCS 検証まで通った HE パケットが 1 件も無いため)\n', ...
+             '  MAC未復号の HE パケット %d 件は、どの SSID にも帰属させられません。\n'], ...
+        stats.csiOnly);
+end
+
 matched = pktLog([]);   % 空の構造体配列
+nByColor = 0;
 
 if isempty(targetBSSID)
     warning('decodeIQ_HE:ssidNotFound', ...
@@ -807,9 +1070,33 @@ if isempty(targetBSSID)
          'SSID の綴り・電波状況を確認する、などをお試しください。'], targetSSID);
 else
     isMatch = strcmp(allBssid, targetBSSID) | strcmp(allAddr1, targetBSSID);
+
+    % 対象 BSSID に対応する BSS Color を求め、MACが読めなかったパケットを拾う
+    if useBSSColorFallback
+        targetColors = [];
+        cKeys = cell2mat(keys(colorToBSSID));
+        for k = 1:numel(cKeys)
+            if strcmp(colorToBSSID(cKeys(k)), targetBSSID) && ...
+                    ~(isKey(colorConflicts, cKeys(k)) && colorConflicts(cKeys(k)))
+                targetColors(end+1) = cKeys(k); %#ok<SAGROW>
+            end
+        end
+        if ~isempty(targetColors)
+            noMAC     = cellfun(@isempty, allBssid);
+            byColor   = noMAC & ismember(allColors, targetColors);
+            nByColor  = sum(byColor);
+            isMatch   = isMatch | byColor;
+        end
+    end
+
     matched = pktLog(isMatch);
     fprintf('\n対象 SSID "%s" (BSSID=%s) のパケット数: %d (アップリンク+ダウンリンク)\n', ...
         targetSSID, targetBSSID, numel(matched));
+    if nByColor > 0
+        fprintf(['  うち %d 件は MAC ヘッダが読めず、HE-SIG-A の BSS Color 一致で\n', ...
+                 '  帰属させたものです (CSI はプリアンブル由来なので有効。\n', ...
+                 '  fcsVerified = false、frameType = "(MAC未復号)" が目印)。\n'], nByColor);
+    end
 end
 
 % --- フォーマット別に [パケット数 x サブキャリア数] の行列へまとめる ---
@@ -852,18 +1139,50 @@ csiHE       = stackCSI(matched(isHE));
 timeSecHE   = allTimeSec(isHE);
 frameTypeHE = allFrameType(isHE);
 fcsHE       = allFcs(isHE);
+if isempty(matched)
+    uplinkHE  = logical([]);
+    bssColorHE = [];
+else
+    uplinkHE   = logical([matched.uplink]).';
+    uplinkHE   = uplinkHE(isHE);       % true=上り(STA->AP), false=下り(AP->STA)
+    bssColorHE = [matched.bssColor].';
+    bssColorHE = bssColorHE(isHE);
+end
 
 if ~isempty(matched)
     fprintf('  内訳: Non-HT=%d, HT=%d, VHT=%d, HE=%d\n', ...
         size(csiNonHT, 1), size(csiHT, 1), size(csiVHT, 1), size(csiHE, 1));
     totalMPDU = sum([matched.mpduCount]);
-    fprintf('  PPDU(電波上の送信単位)数=%d に対し、集約されたMPDU(データ単位)の合計=%d\n', ...
-        numel(matched), totalMPDU);
-    nUnverified = sum(~allFcs);
-    if nUnverified > 0
-        fprintf(['  ※うち %d 件は FCS 未検証 (ペイロードにビット誤りがあり、\n', ...
-                 '    MAC ヘッダのみから送信元を判定したもの)。CSI 自体は\n', ...
-                 '    プリアンブルから算出しており影響を受けません。\n'], nUnverified);
+    % MAC が読めた分だけで PPDU と MPDU の関係を見る
+    % (MAC未復号のものは MPDU 数が分からないので分母から外す)
+    macKnown = ~strcmp(allFrameType, '(MAC未復号)');
+    if any(macKnown)
+        fprintf(['  MACが読めた %d 件について、PPDU(電波上の送信単位)数に対する\n', ...
+                 '  集約されたMPDU(データ単位)の合計=%d\n'], sum(macKnown), totalMPDU);
+    end
+
+    nHeaderOnly = sum(~allFcs & macKnown);
+    if nHeaderOnly > 0
+        fprintf(['  ※%d 件は FCS 未検証 (ペイロードにビット誤りがあり、MAC ヘッダ\n', ...
+                 '    のみから送信元を判定したもの)。CSI 自体はプリアンブルから\n', ...
+                 '    算出しており影響を受けません。\n'], nHeaderOnly);
+    end
+
+    % --- 上り/下りの内訳 (HE-SIG-A の UL/DL ビット) ---
+    % 上りと下りでは送信している機器が違うので、電波の通り道 (= CSI) も
+    % 別物になる。混ぜて時系列にすると意味が壊れるため、必ず分けて扱うこと。
+    % このビットは HE-SIG-A にあり CRC で守られているので、MAC が読めなくても
+    % 信頼できる。
+    isHEMatched = strcmpi(allFormats, 'HE');
+    if any(isHEMatched)
+        upFlags = logical([matched.uplink]).';
+        nUp   = sum(isHEMatched & upFlags);
+        nDown = sum(isHEMatched & ~upFlags);
+        fprintf('  HE の向き: 下り(AP->STA)=%d件, 上り(STA->AP)=%d件\n', nDown, nUp);
+        if nUp > 0 && nDown > 0
+            fprintf(['    ※上りと下りは送信機が異なるため CSI も別物です。\n', ...
+                     '      解析時は保存した uplinkHE で分けてください。\n']);
+        end
     end
 end
 
@@ -921,6 +1240,9 @@ csiMeta.pktDetThreshold  = pktDetThreshold;
 csiMeta.overrunCount     = overrunCount;
 csiMeta.decodeStats      = stats;
 csiMeta.heSupported      = heAvailable;       % HE 復号が有効だったか
+csiMeta.useBSSColorFallback = useBSSColorFallback;
+csiMeta.numByBSSColor    = nByColor;          % BSS Color 一致で帰属させた件数
+csiMeta.bssColorMap      = colorToBSSID;      % 学習した Color -> BSSID
 csiMeta.captureDatetime  = timestamp;         % キャプチャ時刻
 csiMeta.decodeDatetime   = datestr(now, 'yyyymmddHHMM');   % 復号を行った時刻
 csiMeta.sourceRawFile    = inputRawFile;      % どの生IQから作られたか
@@ -937,7 +1259,7 @@ saveVars = { ...
     'csiNonHT', 'timeSecNonHT', 'frameTypeNonHT', 'fcsNonHT', ...
     'csiHT', 'timeSecHT', 'frameTypeHT', 'fcsHT', ...
     'csiVHT', 'timeSecVHT', 'frameTypeVHT', 'fcsVHT', ...
-    'csiHE', 'timeSecHE', 'frameTypeHE', 'fcsHE', ...
+    'csiHE', 'timeSecHE', 'frameTypeHE', 'fcsHE', 'uplinkHE', 'bssColorHE', ...
     'subcarrierIndicesNonHT', 'subcarrierIndicesHT20', ...
     'subcarrierIndicesVHT20', 'subcarrierIndicesHE20', ...
     'targetSSIDOut', 'targetBSSIDOut', 'seenNetworks'};
@@ -1426,6 +1748,7 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
         'bwMHz', 0, 'nsts', 0, 'mcs', -1, 'coding', '', 'giUs', 0, ...
         'heltfType', 0, 'dcm', false, 'stbc', false, 'bssColor', -1, ...
         'uplink', false, 'lsigLen', 0, 'psduLen', 0, 'numSubcarriers', 0, ...
+        'pilotTracked', false, 'mpduStatus', {{}}, 'hdrReason', {{}}, 'mpduBytes', [], ...
         'subcIdx', [], 'mpduCount', 0, 'deagStatus', '', ...
         'nonBinary', false, 'dataClass', '', 'dataRange', [0 0]);
 
@@ -1463,9 +1786,15 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
     % HE PPDU の L-SIG / RL-SIG / HE-SIG-A は 20MHz あたり 56 本の
     % サブキャリア (レガシーの 52 本 + 両端に 4 本) で送られる。
     % L-LTF の推定値は 52 本しか無いので、追加の 4 本を含む推定値を作る。
+    % 復号したパラメータを入れていく器。PPDU形式と帯域幅だけ先に確定させ、
+    % 残りは L-SIG と HE-SIG-A の中身で順に埋めていく。
+    cfgRx = wlanHERecoveryConfig('PacketFormat', char(fmtStr), ...
+        'ChannelBandwidth', chanBW);
+
     lsigDemod    = wlanHEDemodulate(pkt(321:480), 'L-SIG', chanBW);   % L-SIG + RL-SIG
     preInfo      = wlanHEOFDMInfo('L-SIG', chanBW);
     chanEstPreHE = preHEChannelEstimateCompat(lsigDemod, lltfChanEst, chanBW);
+    lsigDemod    = heTrackPilotErrorCompat(lsigDemod, chanEstPreHE, cfgRx, 'L-SIG');
 
     [eqLSIG, csiLSIG] = heEqualizeCompat(lsigDemod(preInfo.DataIndices, :, :), ...
         chanEstPreHE(preInfo.DataIndices, :), noiseEst, chanBW, 'L-SIG');
@@ -1482,6 +1811,7 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
     % L-SIG と同じ chanEstPreHE を使う。
     sigaDemod = wlanHEDemodulate(pkt(481 : 480 + sigaSyms * 80), 'HE-SIG-A', chanBW);
     sigaInfo  = wlanHEOFDMInfo('HE-SIG-A', chanBW);
+    sigaDemod = heTrackPilotErrorCompat(sigaDemod, chanEstPreHE, cfgRx, 'HE-SIG-A');
     [eqSIGA, csiSIGA] = heEqualizeCompat(sigaDemod(sigaInfo.DataIndices, :, :), ...
         chanEstPreHE(sigaInfo.DataIndices, :), noiseEst, chanBW, 'HE-SIG-A');
 
@@ -1494,15 +1824,7 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
 
     % --- HE-SIG-A のビット解釈 (WLAN Toolbox に任せる) ---
     % L-SIG LENGTH はデータ部のシンボル数の算出に必要なので、解釈前に渡す。
-    try
-        cfgRx = wlanHERecoveryConfig('PacketFormat', char(fmtStr), ...
-            'ChannelBandwidth', chanBW, 'LSIGLength', info.lsigLen);
-    catch
-        % 古い版では LSIGLength を構築時に渡せないことがあるので後から設定する
-        cfgRx = wlanHERecoveryConfig('PacketFormat', char(fmtStr), ...
-            'ChannelBandwidth', chanBW);
-        cfgRx.LSIGLength = info.lsigLen;
-    end
+    cfgRx.LSIGLength = info.lsigLen;
 
     [cfgRx, failInterp] = interpretHESIGABits(cfgRx, sigaBits);
     if failInterp
@@ -1587,6 +1909,7 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
     % 効くため、「HE-SIG-A は解釈できるのに HE-Data の FCS が通らない」
     % 場合はここを最初に疑うとよい (HE-LTF から雑音を推定し直す)。
     demodData = wlanHEDemodulate(pkt(ind.HEData(1):ind.HEData(2)), 'HE-Data', cfgRx);
+    [demodData, info.pilotTracked] = heTrackPilotErrorCompat(demodData, heChanEst, cfgRx, 'HE-Data');
     [eqData, csiData] = heEqualizeCompat(demodData(ofdmInfo.DataIndices, :, :), ...
         heChanEst(ofdmInfo.DataIndices, :, :), noiseEst, cfgRx, 'HE-Data');
     rxPSDU = heDataBitRecoverCompat(eqData, noiseEst, csiData, cfgRx);
@@ -1601,15 +1924,37 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
     info.nonBinary  = deagInfo.nonBinary;
     info.dataClass  = deagInfo.dataClass;
     info.dataRange  = deagInfo.dataRange;
+    info.mpduStatus = deagInfo.mpduStatus;
+    info.hdrReason  = deagInfo.hdrReason;
+    info.mpduBytes  = deagInfo.mpduBytes;
     if ~ok
         info.reason = sprintf('MPDU復号失敗(分解=%s,MPDU数=%d)', ...
             deagInfo.status, deagInfo.mpduCount);
-        status = 0;
+
+        % MAC ヘッダは読めなかったが、CSI は HE-LTF から既に得られている。
+        % HE-SIG-A の BSS Color は CRC を通っており、どの BSS のパケットかを
+        % 示すので、これを手掛かりに後段で対象SSIDへ帰属させられる。
+        % CSI を捨てないよう「CSIのみ」の記録として返す (status=2)。
+        entry = struct( ...
+            'timeSec',     0, ...
+            'bssid',       '', ...        % 送信元不明
+            'addr1',       '', ...
+            'frameType',   '(MAC未復号)', ...
+            'ssid',        '', ...
+            'phyFormat',   'HE', ...
+            'bssColor',    info.bssColor, ...
+            'uplink',      info.uplink, ...
+            'fcsVerified', false, ...
+            'mpduCount',   0, ...
+            'csi',         heChanEst(:).');
+        status = 2;
         return;
     end
 
     entry = buildEntry(cfgMAC, payload, 'HE', heChanEst);
     if ~isempty(entry)
+        entry.bssColor    = info.bssColor;
+        entry.uplink      = info.uplink;
         entry.fcsVerified = ~deagInfo.headerOnly;
         entry.mpduCount   = deagInfo.mpduCount;   % 0 = A-MPDU分解失敗
     end
@@ -1642,6 +1987,76 @@ function chanEst = preHEChannelEstimateCompat(lsigDemod, lltfChanEst, chanBW)
     end
     nEdge   = floor((nPre - nL) / 2);
     chanEst = [repmat(h(1), nEdge, 1); h; repmat(h(end), nPre - nL - nEdge, 1)];
+end
+
+function snrDb = heRequiredSNR(mcs)
+    % HE (20MHz, NSS=1) で MCS ごとにおおよそ必要な受信SNR [dB]。
+    % IEEE 802.11ax の受信感度規定から導いた目安で、実装や環境で数dB動く。
+    % 「復号できないのが受信品質のせいか、処理のせいか」を切り分ける用途。
+    table = [2 5 9 11 15 18 20 25 29 31 34 37];   % MCS0..MCS11
+    if mcs >= 0 && mcs <= 11
+        snrDb = table(mcs + 1);
+    else
+        snrDb = NaN;
+    end
+end
+
+function name = heModulationName(mcs)
+    % MCS 番号に対応する変調方式と符号化率
+    names = {'BPSK 1/2', 'QPSK 1/2', 'QPSK 3/4', '16QAM 1/2', '16QAM 3/4', ...
+             '64QAM 2/3', '64QAM 3/4', '64QAM 5/6', '256QAM 3/4', '256QAM 5/6', ...
+             '1024QAM 3/4', '1024QAM 5/6'};
+    if mcs >= 0 && mcs <= 11
+        name = names{mcs + 1};
+    else
+        name = '不明';
+    end
+end
+
+function [sym, applied] = heTrackPilotErrorCompat(sym, chanEst, cfg, field)
+    % パイロットサブキャリアを使って残留位相誤差 (CPE) と振幅誤差を補正する。
+    %
+    % なぜ必要か:
+    %   精CFO推定 (wlanFineCFOEstimate) は L-LTF の 8us だけを見るので、
+    %   数百 Hz 程度の残差が残る。さらに送受信のサンプリングクロック差
+    %   (SFO) もある。どちらも「時間が経つほど位相が回る」誤差なので、
+    %   プリアンブルや SIG フィールド (先頭 40us) では無視できても、
+    %   A-MPDU で数 ms 続く HE-Data の後半では位相が数ラジアン回ってしまう。
+    %   残留 CFO が 200 Hz でも 2ms 後には約14度回り、64QAM 以上は壊れる。
+    %
+    % sym は data+pilot 両方のサブキャリアを含む [Nst x Nsym x Nr] を渡すこと
+    % (等化のために data だけ取り出す前に呼ぶ)。
+    %
+    % 失敗したフィールドだけを個別に無効化する点が重要。まとめて無効化すると、
+    % 先頭の L-SIG で失敗しただけで、本当に効かせたい HE-Data の補正まで
+    % 止まってしまう。
+    persistent disabledFields
+    if isempty(disabledFields)
+        disabledFields = containers.Map('KeyType', 'char', 'ValueType', 'logical');
+    end
+
+    key = char(string(field));
+    if isKey(disabledFields, key) && disabledFields(key)
+        applied = false;
+        return;
+    end
+
+    try
+        sym = wlanHETrackPilotError(sym, chanEst, cfg, field);
+        applied = true;
+    catch ME
+        % 補正できなくても復号自体は続行できるので、そのフィールドについて
+        % 一度だけ警告し、以降は追跡なしで進む
+        % (毎パケット例外を出すと非常に遅くなる)。
+        disabledFields(key) = true;
+        applied = false;
+        warning('decodeIQ_HE:noPilotTracking', ...
+            ['%s の位相追跡を行えません: %s\n', ...
+             '  このフィールドは補正なしで進みます。HE-Data で出ている場合、\n', ...
+             '  長い A-MPDU の復号率が大きく下がります。\n', ...
+             '  wlanHETrackPilotError は R2019b 以降の WLAN Toolbox に含まれます。'], ...
+            key, ME.message);
+    end
 end
 
 function [eqSym, csi] = heEqualizeCompat(sym, chEst, noiseEst, cfg, field)
@@ -1764,6 +2179,12 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
     ok = false;
     deagInfo = struct('status', 'N/A', 'mpduCount', 0, 'headerOnly', false, ...
         'nonBinary', false, 'dataClass', '', 'dataRange', [0 0]);
+    % 切り分け用の計測。「なぜ MPDU が読めなかったのか」を
+    % FCS の失敗なのか / MATLAB が非対応のフレーム種別なのか /
+    % そもそもヘッダが壊れているのか、に分けて記録する。
+    deagInfo.mpduStatus = {};   % wlanMPDUDecode が返したステータス
+    deagInfo.hdrReason  = {};   % 自前ヘッダ解析の棄却理由
+    deagInfo.mpduBytes  = [];   % 取り出せた MPDU の長さ [byte]
 
     mpduList = {};
     try
@@ -1783,19 +2204,21 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
     % 失敗するため、実際のデータ形式を判定して合わせる。
     wState = warning('off', 'all');
     for m = 1:numel(mpduList)
-        dfmt = mpduDataFormat(mpduList{m});
+        [dfmt, octPeek] = mpduDataFormat(mpduList{m});
         if isempty(dfmt)
             continue;   % 判別できない形式
         end
+        deagInfo.mpduBytes(end+1) = numel(octPeek);
         try
             [c, p, st] = wlanMPDUDecode(mpduList{m}, cfgFormat, 'DataFormat', dfmt);
+            deagInfo.mpduStatus{end+1} = char(string(st));
             if strcmpi(string(st), "Success")
                 warning(wState);
                 cfgMAC = c; payload = p; ok = true;
                 return;
             end
-        catch
-            % この MPDU は読み飛ばす
+        catch ME
+            deagInfo.mpduStatus{end+1} = ['例外: ' ME.identifier];
         end
     end
     warning(wState);
@@ -1847,6 +2270,7 @@ function [cfgMAC, payload, ok, deagInfo] = decodeAggregatedPSDU(rxPSDU, cfgForma
             deagInfo.headerOnly = true;
             return;
         end
+        deagInfo.hdrReason{end+1} = hdr.reason;
     end
 end
 
@@ -1898,13 +2322,15 @@ function hdr = parseMACHeaderFromOctets(oct)
     % MPDU のオクテット列から MAC ヘッダ (Frame Control / Address1-3) を
     % 直接読む。FCS を検証しないため、内容が正しい保証は無い点に注意。
     hdr = struct('valid', false, 'FrameType', '', 'Address1', '', 'Address2', '', ...
-        'ManagementConfig', [], 'headerOnly', true);
+        'ManagementConfig', [], 'headerOnly', true, 'reason', '');
 
     if numel(oct) < 24
+        hdr.reason = sprintf('MPDUが%dバイトしかない(24バイト未満)', numel(oct));
         return;   % Address2 まで読めない
     end
     if any(oct < 0 | oct > 255 | mod(oct, 1) ~= 0)
-        return;   % オクテットとして解釈できない値が混じっている
+        hdr.reason = 'オクテット範囲外の値';
+        return;
     end
 
     fc0     = oct(1);
@@ -1914,7 +2340,8 @@ function hdr = parseMACHeaderFromOctets(oct)
     subtype = bitand(bitshift(fc0, -4), 15);
 
     if version ~= 0
-        return;   % プロトコルバージョンは 0 のはず。違えば復号が壊れている
+        hdr.reason = 'ProtocolVersion≠0';
+        return;
     end
 
     % ToDS/FromDS の組み合わせ検査。ToDS=1&FromDS=1 は 4アドレス形式
@@ -1923,14 +2350,17 @@ function hdr = parseMACHeaderFromOctets(oct)
     toDS   = bitand(fc1, 1);
     fromDS = bitand(bitshift(fc1, -1), 1);
     if toDS == 1 && fromDS == 1
+        hdr.reason = 'ToDS=1かつFromDS=1(4アドレス形式)';
         return;
     end
     if type == 0 && (toDS ~= 0 || fromDS ~= 0)
+        hdr.reason = '管理フレームなのにToDS/FromDS≠0';
         return;
     end
 
     % Address2 を持たないフレーム (ACK=1101, CTS=1100 の制御フレーム) は対象外
     if type == 1 && any(subtype == [12 13])
+        hdr.reason = 'ACK/CTS(Address2なし)';
         return;
     end
 
@@ -1947,7 +2377,8 @@ function hdr = parseMACHeaderFromOctets(oct)
         case 2
             typeName = 'Data';
         otherwise
-            return;   % type=3 は予約値
+            hdr.reason = 'Type=3(予約値)';
+            return;
     end
 
     addr1 = oct(5:10);
@@ -1956,7 +2387,20 @@ function hdr = parseMACHeaderFromOctets(oct)
     % 送信元 (Address2) が全0 / ブロードキャストのものは復号が壊れている。
     % また Address2 のグループビット (先頭オクテットの bit0) は送信元
     % アドレスでは必ず 0 になる。
-    if all(addr2 == 0) || all(addr2 == 255) || bitand(addr2(1), 1) == 1
+    % 3つの条件を別々に記録する。特に「全0」が多い場合は、LDPC 復号が
+    % 収束せず全零符号語 (これは常に妥当な符号語なので、復号失敗時の
+    % 行き先になりやすい) を返している証拠になる。= 受信品質の問題であり、
+    % 復号器の実装ミスではない。
+    if all(addr2 == 0)
+        hdr.reason = 'Address2が全0(LDPCが全零符号語に落ちた可能性)';
+        return;
+    end
+    if all(addr2 == 255)
+        hdr.reason = 'Address2が全1';
+        return;
+    end
+    if bitand(addr2(1), 1) == 1
+        hdr.reason = 'Address2のグループビットが1(送信元アドレスではあり得ない)';
         return;
     end
 
@@ -2014,6 +2458,8 @@ function entry = buildEntry(cfgMAC, payload, phyFormat, chanEst)
         'frameType',   frameType, ...
         'ssid',        ssidStr, ...
         'phyFormat',   phyFormat, ...
+        'bssColor',    -1, ...           % HE のみ。呼び出し側で HE-SIG-A の値を入れる
+        'uplink',      false, ...        % HE のみ。HE-SIG-A の UL/DL ビット
         'fcsVerified', true, ...         % HT/VHT のヘッダのみ復号時は呼び出し側で false
         'mpduCount',   1, ...            % 集約されている場合は呼び出し側で上書き
         'csi',         chanEst(:).');
