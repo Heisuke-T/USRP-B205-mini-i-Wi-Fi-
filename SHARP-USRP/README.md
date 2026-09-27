@@ -141,6 +141,32 @@ python3 CSI_phase_sanitization_signal_reconstruction.py ./phase_processing/ ./pr
 SISO・アンテナ1本なので `nss=1`, `ncore=1` を指定する
 (オリジナルの SHARP は Nexmon の 4 コア構成で `ncore=4` だった)。
 
+### 複数ファイルを一括で処理する (手順0〜5)
+
+夜間に流しっぱなしにする用途。ワイルドカードで複数指定できる。
+
+```powershell
+cd SHARP-USRP\Python_code
+python run_batch.py "D:\IQ_csi\0927*_WAX202_CSI.mat"
+```
+
+これだけで、各ファイルについて 変換 → 前処理 → 多重波推定 → 再構成 →
+ドップラー計算 → 描画 まで通り、`plots/` に PNG が出る。
+
+夜間実行を想定した作り:
+
+| | |
+|---|---|
+| 1 件が失敗しても | 残りを処理し続け、最後に成否の一覧を出す |
+| 画面を閉じても | `batch_<日時>.log` に経過が残る |
+| 再実行すると | PNG がある分は飛ばす (`--redo` でやり直し) |
+
+所要時間の目安は **4956 パケットで約 5 分**（ほぼ全て手順2 の多重波推定）。
+パケット数にほぼ比例する。
+
+主なオプションは `run_phase_sanitization.py` と `CSI_doppler_computation.py`
+のものを引き継いでいる (`--label`, `--resample`, `--fc`, `--sample_length` など)。
+
 ### ドップラーマップを出す (手順4〜5)
 
 ```bash
@@ -457,7 +483,8 @@ SHARP-USRP/
     ├── CSI_phase_sanitization_signal_reconstruction.py   手順3
     ├── CSI_doppler_computation.py  手順4: ドップラースペクトル
     ├── CSI_doppler_plot.py         手順5: ドップラーマップの描画
-    ├── run_phase_sanitization.py   手順0〜3の一括実行
+    ├── run_phase_sanitization.py   手順0〜3の一括実行 (1ファイル)
+    ├── run_batch.py                手順0〜5の一括実行 (複数ファイル)
     ├── optimization_utility.py     SHARP 由来 (無変更)
     ├── pipeline_meta.py            段間の設定引き継ぎ
     └── tests/
