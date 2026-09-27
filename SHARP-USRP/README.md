@@ -235,6 +235,64 @@ usrpCSItoSHARP('CSI/202608191054_OpenWrt-A_CSI.mat', ...
 > `scipy.io.loadmat` は v7.3 (HDF5) を読めないため、ここを `-v7.3` にすると
 > 手順1 で失敗する。
 
+## 大きいデータの扱い
+
+デコーダの出力は 30 秒のキャプチャで 50MB を超え、長いものは 300MB 近くになる。
+GitHub は 1 ファイル 100MB で拒否、50MB で警告を出すため、生データをそのまま
+リポジトリに置くことはできない。
+
+SHARP / SHARPax 本家も同じ方針で、`input_files/` は空のまま、データセットは外部
+(パドヴァ大のリポジトリ / IEEE DataPort) に置いている。**コードは Git、データは外部**
+というのがこの分野の標準である。
+
+### 方針
+
+| 用途 | 置き場所 |
+|---|---|
+| 生データの保管 | OneDrive / Google Drive / 大学のストレージ |
+| 日常の解析 | データがある PC でローカル実行 (下記) |
+| 共有・検証用の標本 | `slimCSI.m` で縮小してリポジトリへ |
+| 論文公開時 | Zenodo / IEEE DataPort |
+
+### 自分の PC で動かす
+
+パイプラインはデータのある場所で動かせばよい。パスは任意の場所を指定できる。
+
+```powershell
+cd <repo>\SHARP-USRP\Python_code
+python run_phase_sanitization.py "D:\IQ_csi\09272233_WAX202_CSI.mat" --name run2233
+python CSI_doppler_computation.py ./processed_phase/ . ./doppler_traces/ 10 10 31 1 -1.5
+python CSI_doppler_plot.py ./doppler_traces/ ./plots/
+```
+
+初回のみ: `pip install numpy scipy osqp h5py matplotlib`
+
+### 標本を作る (slimCSI.m)
+
+デコーダ出力の容量の内訳は、実測 (55.8MB, HE 4956 パケット) で次のとおり:
+
+| 変数 | サイズ | 標本に必要か |
+|---|---|---|
+| `csiHE` | 18.4 MB | 必要 |
+| `csi` | 18.4 MB | 不要 (`csiHE` の重複。`ResultCSI.m` 互換のための二重保存) |
+| `csiNonHT` | 8.4 MB | 不要 (SHARP の処理では使わない) |
+
+`slimCSI.m` は使う形式ひとつ分だけを残し、CSI を `single` 精度に落とす。
+
+```matlab
+addpath('SHARP-USRP/matlab');
+slimCSI('D:\IQ_csi\09272233_WAX202_CSI.mat', 'CSI_ax\09272233_sample.mat');
+
+% 長時間キャプチャから先頭 8000 パケットだけ抜く場合
+slimCSI('D:\IQ_csi\09272233_WAX202_CSI.mat', 'CSI_ax\09272233_sample.mat', ...
+        'MaxPackets', 8000);
+```
+
+実測で **55.8MB → 8.8MB (84% 削減)**。縮小後のファイルから手順0 を通した結果は、
+元ファイルからの結果と一致する (差は `single` の丸め誤差のみ、相対 8.9e-8)。
+
+出力は `-v7` 形式なので、Python 側は `h5py` 無しでも読める。
+
 ## 規格ごとの構成
 
 ```bash
@@ -389,7 +447,8 @@ SHARP-USRP/
 ├── README.md
 ├── LICENSE                     GPL v3 (SHARP の派生のため)
 ├── matlab/
-│   └── usrpCSItoSHARP.m        手順0 の MATLAB 版
+│   ├── usrpCSItoSHARP.m        手順0 の MATLAB 版
+│   └── slimCSI.m               .mat を解析に必要な変数だけに縮小
 └── Python_code/
     ├── wifi_config.py          規格ごとの OFDM 構成定義
     ├── usrp_to_sharp.py        手順0: 形式変換
