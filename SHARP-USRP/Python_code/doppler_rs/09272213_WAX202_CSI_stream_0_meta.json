@@ -1,0 +1,21 @@
+{
+  "source": "09272213_WAX202_CSI_stream_0.mat",
+  "shape": [
+    5125,
+    100
+  ],
+  "Tc": 0.005786699999998035,
+  "fc": 5180000000.0,
+  "n_fft": 100,
+  "sample_length": 31,
+  "sliding": 1,
+  "noise_level": -1.5,
+  "delta_v_bin": 0.10008304891402281,
+  "delta_v_resolution": 0.32284854488394454,
+  "v_max": 5.00415244570114,
+  "n_subcarriers": 245,
+  "resample_mode": "none",
+  "remove_static": true,
+  "interval_cv": 0.09893531193086993,
+  "resample": null
+}
