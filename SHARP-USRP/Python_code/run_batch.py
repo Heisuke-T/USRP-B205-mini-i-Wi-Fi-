@@ -70,6 +70,7 @@ class _DopplerArgs:
         self.resample = a.resample
         self.cv_warn_threshold = 0.3
         self.subcarrier_range = None
+        self.remove_static = a.remove_static
 
 
 def expand_inputs(patterns):
@@ -192,6 +193,9 @@ def main():
     parser.add_argument('--n_fft', type=int, default=100)
     parser.add_argument('--resample', choices=['none', 'nudft', 'interp'],
                         default='none')
+    parser.add_argument('--remove_static', action='store_true',
+                        help='窓内の時間平均 (静止経路) を引く。直接波が強く'
+                             '動きが埋もれる場合に使う')
     # 置き場所
     parser.add_argument('--input_dir', default='./input_files/')
     parser.add_argument('--work_dir', default='./phase_processing/')
