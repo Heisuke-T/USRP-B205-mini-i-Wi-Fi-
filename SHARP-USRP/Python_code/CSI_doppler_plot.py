@@ -36,7 +36,7 @@ def load_doppler(txt_file):
     return arr, meta
 
 
-def plot_doppler(arr, meta, out_png, title=None, vmin_db=None):
+def plot_doppler(arr, meta, out_png, title=None, vmin_db=None, ylim=None):
     """arr: [時間窓 x ドップラービン] (正規化済みパワー)"""
     n_win, n_bin = arr.shape
 
@@ -71,6 +71,9 @@ def plot_doppler(arr, meta, out_png, title=None, vmin_db=None):
                          vmin=vmin_db, vmax=0)
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
+    if ylim is not None:
+        # 測定ごとに速度軸の範囲が違う場合に、表示だけそろえて並べられるようにする
+        ax.set_ylim(-abs(ylim), abs(ylim))
     ax.axhline(0.0, color='w', linewidth=0.5, alpha=0.35)
     if title:
         ax.set_title(title)
@@ -92,6 +95,9 @@ def main():
                         help='特定のファイルだけ描画する (拡張子なし)')
     parser.add_argument('--vmin_db', type=float, default=None,
                         help='カラースケールの下限 [dB] (既定は5パーセンタイル)')
+    parser.add_argument('--ylim', type=float, default=None,
+                        help='速度軸の表示範囲 [m/s] を ±この値に固定する。'
+                             '複数の測定の図を並べて比べるときに使う')
     args = parser.parse_args()
 
     if args.name:
@@ -106,7 +112,8 @@ def main():
     for name in names:
         arr, meta = load_doppler(path.join(args.dir, name + '.txt'))
         out_png = path.join(args.out_dir, name + '.png')
-        plot_doppler(arr, meta, out_png, title=name, vmin_db=args.vmin_db)
+        plot_doppler(arr, meta, out_png, title=name,
+                     vmin_db=args.vmin_db, ylim=args.ylim)
         print(f'{name}: {arr.shape} -> {out_png}')
 
 

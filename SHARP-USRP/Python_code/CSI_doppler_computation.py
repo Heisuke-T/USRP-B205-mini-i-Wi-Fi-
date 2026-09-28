@@ -119,6 +119,53 @@ def _finalize(profiles, n_pkt, num_symbols, noise_lev):
     return arr
 
 
+def despike_packets(csi_complex, n_sigmas=8.0, verbose=True):
+    """外れ値パケットを前後の補間で置き換える。
+
+    振幅が飛んだパケットや位相がずれたパケットが 1 つあるだけで、STFT では
+    窓長ぶんの窓すべてに全速度域へ広がるエネルギーが乗る。ドップラーマップ上
+    では「全速度域を貫く縦縞」として現れ、物理的な動きと紛らわしい。
+
+    パケットごとの CFR が前後の中央値からどれだけ外れているかを見て、
+    ロバストな尺度 (中央絶対偏差) で n_sigmas を超えるものを線形補間で置換する。
+    SHARP の前処理にも hampel_filter が用意されているが呼ばれていない。
+
+    前後どちらとの差も大きい「孤立した飛び」だけを対象にする。動きによる変化は
+    連続的なのでこの条件を満たしにくい。閾値を下げすぎると速い動きを消すため、
+    既定は 8 (実測データで 0.5% のパケットが該当) としている。
+    """
+    n = csi_complex.shape[0]
+    if n < 5:
+        return csi_complex, 0
+
+    # 隣接パケットとの差の大きさ (動きがあっても連続的に変わるので小さい)
+    d = np.abs(np.diff(csi_complex, axis=0)).mean(axis=1)
+    med = np.median(d)
+    mad = np.median(np.abs(d - med)) * 1.4826
+    if mad <= 0:
+        return csi_complex, 0
+
+    # 前後どちらとの差も大きいパケットを外れ値とみなす
+    jump = (d - med) / mad > n_sigmas
+    bad = np.zeros(n, dtype=bool)
+    bad[1:-1] = jump[:-1] & jump[1:]
+
+    if not bad.any():
+        return csi_complex, 0
+
+    out = csi_complex.copy()
+    idx = np.arange(n)
+    good = ~bad
+    for k in range(out.shape[1]):
+        out[bad, k] = (np.interp(idx[bad], idx[good], csi_complex[good, k].real)
+                       + 1j * np.interp(idx[bad], idx[good],
+                                        csi_complex[good, k].imag))
+    if verbose:
+        print(f'  外れ値パケットを {int(bad.sum())} 件補間 '
+              f'(全速度域に広がる縦縞の原因)')
+    return out, int(bad.sum())
+
+
 def _strip_static(cut):
     """窓内の時間平均 (= 静止経路) を各サブキャリアから引く。
 
@@ -203,6 +250,25 @@ def process_one(mat_file, out_file, args):
         lo, hi = args.subcarrier_range
         csi_complex = csi_complex[:, lo:hi]
 
+    # --- 外れ値パケットの除去 ---
+    n_despiked = 0
+    if args.despike:
+        csi_complex, n_despiked = despike_packets(
+            csi_complex, n_sigmas=args.despike_sigmas)
+
+    # --- パケットの間引き ---
+    # 速度軸の範囲は v_max = c/(Tc*fc)/2 なので、取得レートが高い測定ほど軸が
+    # 広くなり、同じ窓長での速度分解能 c/(Tc*fc*窓長) も粗くなる。N 個に 1 個へ
+    # 間引くと Tc が N 倍になり、レートの違う測定どうしで軸と分解能を揃えられる。
+    # (SHARPax の --sub_sampling と同じ考え方)
+    if args.sub_sampling > 1:
+        n_before = csi_complex.shape[0]
+        csi_complex = csi_complex[::args.sub_sampling, :]
+        if time_sec is not None:
+            time_sec = time_sec[::args.sub_sampling]
+        print(f'  間引き 1/{args.sub_sampling}: '
+              f'{n_before} -> {csi_complex.shape[0]} パケット')
+
     # --- サンプリング間隔 Tc を決める ---
     resample_stats = None
     Tc = args.Tc
@@ -271,6 +337,8 @@ def process_one(mat_file, out_file, args):
         n_subcarriers=int(csi_complex.shape[1]),
         resample_mode=args.resample,
         remove_static=bool(args.remove_static),
+        sub_sampling=int(args.sub_sampling),
+        despiked_packets=n_despiked,
         interval_cv=cv,
         resample=resample_stats,
     )
@@ -311,6 +379,17 @@ def main():
                              'interp: 線形補間で等間隔化 (比較用。高速側で悪化する)')
     parser.add_argument('--cv_warn_threshold', type=float, default=0.3,
                         help='この変動係数を超えたら nudft を勧める警告を出す')
+    parser.add_argument('--despike', action='store_true',
+                        help='外れ値パケットを前後の補間で置き換える。'
+                             '全速度域を貫く縦縞が出ている場合に使う')
+    parser.add_argument('--despike_sigmas', type=float, default=8.0,
+                        help='外れ値と判定する閾値 (中央絶対偏差の倍数, 既定 8)。'
+                             '小さくすると多く除去するが、速い動きを消す恐れがある'
+                             '(実測: 8 で 0.5%%, 5 で 2.1%% のパケットを置換)')
+    parser.add_argument('--sub_sampling', type=int, default=1,
+                        help='N 個に 1 個へ間引く (既定 1 = 間引かない)。'
+                             '取得レートが高い測定の速度軸と分解能を、'
+                             '他の測定に揃えるために使う')
     parser.add_argument('--remove_static', action='store_true',
                         help='窓内の時間平均 (静止経路) を引いてから変換する。'
                              '直接波が強く動きが埋もれる場合に使う。'

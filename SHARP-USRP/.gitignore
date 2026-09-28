@@ -3,10 +3,16 @@ Python_code/input_files/*.mat
 Python_code/phase_processing/*.txt
 Python_code/phase_processing/*.json
 Python_code/phase_processing/*.npy
-Python_code/processed_phase/**/*.mat
+Python_code/processed_phase*/**/*.mat
+Python_code/processed_phase*/*.mat
 Python_code/doppler_traces/**/*.txt
 Python_code/doppler_traces/**/*.json
-Python_code/plots/**/*.png
+
+# 図とログ
+Python_code/**/*.png
+Python_code/*.log
 
 __pycache__/
 *.pyc
+
+# 共有したい解析結果は明示的に add する (例: doppler_rs/) ので無視しない
