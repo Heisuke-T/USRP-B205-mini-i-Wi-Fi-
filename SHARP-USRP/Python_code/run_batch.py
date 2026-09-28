@@ -72,6 +72,8 @@ class _DopplerArgs:
         self.subcarrier_range = None
         self.remove_static = a.remove_static
         self.sub_sampling = a.sub_sampling
+        self.despike = a.despike
+        self.despike_sigmas = a.despike_sigmas
 
 
 def expand_inputs(patterns):
@@ -196,6 +198,9 @@ def main():
                         default='none')
     parser.add_argument('--ylim', type=float, default=None,
                         help='図の速度軸の表示範囲 [m/s] を ±この値に固定する')
+    parser.add_argument('--despike', action='store_true',
+                        help='外れ値パケットを補間で置き換える')
+    parser.add_argument('--despike_sigmas', type=float, default=8.0)
     parser.add_argument('--sub_sampling', type=int, default=1,
                         help='N 個に 1 個へ間引く。取得レートが高い測定の'
                              '速度軸を他に揃えるために使う')
