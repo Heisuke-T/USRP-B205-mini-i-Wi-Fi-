@@ -73,8 +73,17 @@
 %      pre-HE のサブキャリア本数へ広げる簡易版に自動でフォールバックします。
 %    - captureIQ.m が出力した *_raw.mat
 %
-%  入力ファイル:
-%    <hddInputPath>/<yyyymmddHHMM>_raw.mat   (captureIQ.m の出力。変更不要)
+%  入力ファイル (どちらでもよい。指定が無ければ最新のものを自動選択):
+%    <hddInputPath>/<日時>_raw.mat   captureIQ.m の出力 (complex double)
+%    <hddInputPath>/<日時>_raw.bin   captureIQ_single.m の出力 (int16 の連続
+%                                    ストリーム。取得条件は同名の
+%                                    <日時>_rawmeta.mat から読む)
+%
+%    .bin は必要なところだけを 1 秒ずつ読み進めるので、キャプチャが
+%    何分あってもメモリ使用量は一定 (約 320 MB) のままです。
+%    そのため captureIQ_single.m の writeSegments は false のままでよく、
+%    *_segNN_raw.mat に分割する必要はありません。1 キャプチャ = 1 ファイルで
+%    扱えます。
 %
 %  出力ファイル (HDD と USB メモリの両方に同じ内容を保存):
 %    <hddSavePath>/<yyyymmddHHMM>_<SSID>_CSI.mat
@@ -192,13 +201,23 @@ useBSSColorFallback = true;
 %% ------------------------------------------------------------------------
 %  2. 生IQファイルの読み込み
 %  ------------------------------------------------------------------------
+% 入力は2種類を受け付ける。
+%   *_raw.mat … captureIQ.m の出力。complex double の iq をまるごと読む。
+%   *_raw.bin … captureIQ_single.m の出力。int16 のべた書きストリームで、
+%               取得条件は同名の *_rawmeta.mat にある。
+%               こちらは必要なところだけを少しずつ読むので、キャプチャが
+%               何分あってもメモリ使用量は一定に保たれる。分割された
+%               *_segNN_raw.mat を作る必要はない。
 if isempty(inputRawFile)
-    listing = dir(fullfile(hddInputPath, '*_raw.mat'));
+    listing = [dir(fullfile(hddInputPath, '*_raw.bin')); ...
+               dir(fullfile(hddInputPath, '*_raw.mat'))];
+    % 分割セグメントは 1 ファイルの .bin があれば不要なので候補から外す
+    listing = listing(~contains({listing.name}, '_seg'));
     if isempty(listing)
         error('decodeIQ_HE:noInputFile', ...
-            ['入力ファイルが見つかりません: %s\\*_raw.mat\n', ...
-             '先に captureIQ.m を実行するか、inputRawFile にパスを指定してください。'], ...
-            hddInputPath);
+            ['入力ファイルが見つかりません: %s\\*_raw.bin / *_raw.mat\n', ...
+             '先に captureIQ_single.m か captureIQ.m を実行するか、\n', ...
+             'inputRawFile にパスを指定してください。'], hddInputPath);
     end
     [~, newest] = max([listing.datenum]);
     inputRawFile = fullfile(listing(newest).folder, listing(newest).name);
@@ -212,19 +231,46 @@ if ~isfile(inputRawFile)
     error('decodeIQ_HE:inputNotFound', '入力ファイルが存在しません: %s', inputRawFile);
 end
 
-S = load(inputRawFile, 'iq', 'meta');
-if ~isfield(S, 'iq') || ~isfield(S, 'meta')
-    error('decodeIQ_HE:badInputFile', ...
-        ['入力ファイルに変数 iq / meta がありません: %s\n', ...
-         'captureIQ.m が出力した *_raw.mat を指定してください。'], inputRawFile);
-end
+[~, inName, inExt] = fileparts(inputRawFile);
+isBinInput = strcmpi(inExt, '.bin');
 
-% captureIQ.m は complex double で保存するため通常は変換不要だが、
-% 古い single 形式のファイルも読めるよう double() を通しておく
-% (WLAN Toolbox の関数群は double を前提とする)
-iq   = double(S.iq(:));
-meta = S.meta;
-clear S;
+if isBinInput
+    % --- captureIQ_single.m の .bin (取得条件は *_rawmeta.mat 側) ---
+    metaFile = fullfile(fileparts(inputRawFile), ...
+        [regexprep(inName, '_raw$', '') '_rawmeta.mat']);
+    if ~isfile(metaFile)
+        error('decodeIQ_HE:noMetaFile', ...
+            ['メタデータファイルが見つかりません: %s\n', ...
+             '.bin には取得条件が入っていないため、同時に作られる\n', ...
+             '*_rawmeta.mat が同じフォルダに必要です。'], metaFile);
+    end
+    M = load(metaFile, 'meta');
+    if ~isfield(M, 'meta')
+        error('decodeIQ_HE:badMetaFile', ...
+            'メタデータファイルに変数 meta がありません: %s', metaFile);
+    end
+    meta = M.meta;
+    clear M;
+
+    src = openIQSource(inputRawFile, meta);
+    iqTotalSamples = src.totalSamples;
+else
+    % --- captureIQ.m の .mat (従来どおり全部メモリに載せる) ---
+    S = load(inputRawFile, 'iq', 'meta');
+    if ~isfield(S, 'iq') || ~isfield(S, 'meta')
+        error('decodeIQ_HE:badInputFile', ...
+            ['入力ファイルに変数 iq / meta がありません: %s\n', ...
+             'captureIQ.m が出力した *_raw.mat を指定してください。'], inputRawFile);
+    end
+
+    % captureIQ.m は complex double で保存するため通常は変換不要だが、
+    % 古い single 形式のファイルも読めるよう double() を通しておく
+    % (WLAN Toolbox の関数群は double を前提とする)
+    meta = S.meta;
+    src  = openIQSource(double(S.iq(:)), meta);
+    clear S;
+    iqTotalSamples = src.totalSamples;
+end
 
 % 以降の処理・保存メタデータはキャプチャ時の条件を引き継ぐ
 centerFrequency = meta.centerFrequency;
@@ -239,7 +285,7 @@ timestamp       = meta.captureDatetime;
 fprintf('\n読み込んだ生IQ:\n');
 fprintf('  ファイル        : %s\n', inputRawFile);
 fprintf('  キャプチャ日時  : %s\n', timestamp);
-fprintf('  サンプル数      : %d (%.3f s)\n', numel(iq), numel(iq) / sampleRate);
+fprintf('  サンプル数      : %d (%.3f s)\n', iqTotalSamples, iqTotalSamples / sampleRate);
 fprintf('  中心周波数      : %.4f GHz\n', centerFrequency / 1e9);
 fprintf('  サンプルレート  : %.3f MSps\n', sampleRate / 1e6);
 fprintf('  ゲイン          : %d dB\n', gain);
@@ -278,8 +324,19 @@ end
 % 高次QAM (64QAM以上) のデータ部だけが壊れる、という症状が出る。HE は
 % MCS8〜11 で 1024QAM まで使うため、ここの確認が効く。
 % 全サンプルを評価するとメモリを大量に使うので、間引いて概算する。
-levelStep   = max(1, floor(numel(iq) / 5e6));
-levelSample = iq(1:levelStep:end);
+% 全部読むと長時間キャプチャでは時間もメモリもかかるので、キャプチャ全体に
+% 等間隔で散らした小さなブロックだけを見て概算する。
+nProbe      = 20;
+probeLen    = min(250000, iqTotalSamples);
+levelSample = complex(zeros(nProbe * probeLen, 1));
+nFilled     = 0;
+for pk = 1:nProbe
+    pos = round((pk - 1) / nProbe * max(iqTotalSamples - probeLen, 0));
+    chunk = readIQ(src, pos, probeLen);
+    levelSample(nFilled + (1:numel(chunk))) = chunk;
+    nFilled = nFilled + numel(chunk);
+end
+levelSample = levelSample(1:nFilled);
 peakLevel   = max(max(abs(real(levelSample))), max(abs(imag(levelSample))));
 rmsLevel    = sqrt(mean(abs(levelSample).^2));
 satRatio    = mean(abs(real(levelSample)) > 0.99 * peakLevel | ...
@@ -424,7 +481,32 @@ decodeTic = tic;
 detectWindow  = 400000;   % 20 ms 分
 detectOverlap = 512;      % プリアンブル検出に必要な重なり
 
-while searchOffset + minPreambleLen <= numel(iq)
+% --- ブロック単位でメモリに載せる ---------------------------------------
+% 入力が .bin のときは、ここで指定した分だけをその都度ファイルから読む。
+% キャプチャが 5 秒でも 10 分でも、メモリ使用量はこのブロック1個分で
+% 頭打ちになる。だから長時間キャプチャをセグメント分割する必要がない。
+% 末尾に 1 PPDU 分の重なりを付けて、境界にまたがるパケットを拾う。
+blockSamples = 20e6;      % 1 ブロック = 1 秒分 (complex double で約 320 MB)
+blockStart   = 0;         % このブロック先頭のグローバルサンプル位置 (0-based)
+
+while blockStart < iqTotalSamples
+    iq = readIQ(src, blockStart, blockSamples + maxPPDULen);
+    if numel(iq) < minPreambleLen
+        break;
+    end
+    isLastBlock = (blockStart + numel(iq) >= iqTotalSamples);
+    % このブロックが担当するのは先頭 blockSamples 分だけ。
+    % それ以降に始まるパケットは次のブロックで扱う (二重計上の防止)。
+    if isLastBlock
+        blockLimit = numel(iq);
+    else
+        blockLimit = blockSamples;
+    end
+    searchOffset = 0;
+
+% ここから下はブロック内の走査。iq / searchOffset / pktOffset / pktStart は
+% すべてブロック先頭からの相対位置で、絶対時刻は blockStart を足して求める。
+while searchOffset + minPreambleLen <= numel(iq) && searchOffset < blockLimit
     % --- パケット検出 (窓内の相対位置が返る) ---
     winEnd    = min(numel(iq), searchOffset + detectWindow);
     relOffset = wlanPacketDetect(iq(searchOffset+1 : winEnd), chanBW, 0, pktDetThreshold);
@@ -435,8 +517,11 @@ while searchOffset + minPreambleLen <= numel(iq)
         searchOffset = winEnd - detectOverlap;
         continue;
     end
-    pktOffset = searchOffset + relOffset;   % 0-based の絶対位置
+    pktOffset = searchOffset + relOffset;   % 0-based (ブロック内の位置)
 
+    if ~isLastBlock && pktOffset >= blockLimit
+        break;   % このブロックの担当範囲を超えた。次のブロックで扱う
+    end
     if numel(iq) - pktOffset < minPreambleLen
         break;   % 末尾が足りない
     end
@@ -659,7 +744,7 @@ while searchOffset + minPreambleLen <= numel(iq)
             % MAC は読めなかったが CSI は取れている HE パケット。
             % 後段で BSS Color を手掛かりに対象SSIDへ帰属させる。
             stats.csiOnly = stats.csiOnly + 1;
-            entry.timeSec = pktStart / sampleRate;
+            entry.timeSec = (blockStart + pktStart) / sampleRate;
             pktLog(end+1) = entry; %#ok<SAGROW>
         elseif st > 0
             stats.decodeOK = stats.decodeOK + 1;
@@ -668,7 +753,7 @@ while searchOffset + minPreambleLen <= numel(iq)
                 % ACK/CTS など Address2 を持たないフレーム (BSSID 判定に使えない)
                 stats.noAddr2 = stats.noAddr2 + 1;
             else
-                entry.timeSec = pktStart / sampleRate;
+                entry.timeSec = (blockStart + pktStart) / sampleRate;
                 pktLog(end+1) = entry; %#ok<SAGROW>
 
                 if any(strcmpi(entry.frameType, {'Beacon', 'Probe Response'})) && ~isempty(entry.ssid)
@@ -698,6 +783,12 @@ while searchOffset + minPreambleLen <= numel(iq)
         searchOffset = nextSearch;
     end
 end
+
+    blockStart = blockStart + blockSamples;   % 次のブロックへ
+end   % ブロックループの終わり
+
+closeIQSource(src);
+clear iq;
 
 elapsedDecode = toc(decodeTic);
 
@@ -1288,6 +1379,73 @@ fprintf('すべての処理が完了しました。\n');
 %% ------------------------------------------------------------------------
 %  ローカル関数
 %  ------------------------------------------------------------------------
+function src = openIQSource(input, meta)
+    % 生IQの読み出し口を作る。
+    %   input が数値       … *_raw.mat から読んだ complex double (全部メモリ上)
+    %   input がファイルパス … captureIQ_single.m の *_raw.bin (必要な分だけ読む)
+    % どちらも readIQ(src, 開始サンプル, サンプル数) で同じように読める。
+    src = struct('isBin', false, 'data', [], 'fid', -1, ...
+        'precision', 'int16', 'scale', 1, 'bytesPerSample', 16, 'totalSamples', 0);
+
+    if isnumeric(input)
+        src.data         = input(:);
+        src.totalSamples = numel(src.data);
+        return;
+    end
+
+    src.isBin         = true;
+    src.precision     = char(string(getProp(meta, 'rawPrecision', 'int16')));
+    src.scale         = double(getProp(meta, 'rawScaleFactor', 1/32768));
+    src.bytesPerSample = double(getProp(meta, 'bytesPerSample', 4));
+
+    src.fid = fopen(input, 'r');
+    if src.fid == -1
+        error('decodeIQ_HE:cannotOpenBin', ...
+            '生データ (.bin) を開けませんでした: %s', input);
+    end
+
+    % 実ファイルサイズとメタの記録値の小さい方を採用する。
+    % (キャプチャが途中で止まった場合にメタの値が過大になり得るため)
+    d = dir(input);
+    nFromFile = floor(d.bytes / src.bytesPerSample);
+    nFromMeta = double(getProp(meta, 'totalSamples', nFromFile));
+    src.totalSamples = min(nFromFile, max(nFromMeta, 0));
+end
+
+function v = readIQ(src, startSample, numSamples)
+    % startSample (0-based) から numSamples 個を complex double で返す。
+    % 範囲外は自動で切り詰める。
+    numSamples = min(numSamples, src.totalSamples - startSample);
+    if numSamples <= 0
+        v = complex(zeros(0, 1));
+        return;
+    end
+
+    if ~src.isBin
+        v = src.data(startSample + (1:numSamples));
+        return;
+    end
+
+    % .bin は I,Q が交互に並んだ整数列。読みながら double 化してスケールを戻す。
+    fseek(src.fid, startSample * src.bytesPerSample, 'bof');
+    raw = fread(src.fid, 2 * numSamples, [src.precision '=>double']);
+    n   = floor(numel(raw) / 2);
+    if n == 0
+        v = complex(zeros(0, 1));
+        return;
+    end
+    v = complex(raw(1:2:2*n), raw(2:2:2*n)) * src.scale;
+end
+
+function closeIQSource(src)
+    if src.isBin && src.fid ~= -1
+        try
+            fclose(src.fid);
+        catch
+        end
+    end
+end
+
 function M = stackCSI(entries)
     % パケットごとの CSI 行ベクトルを [パケット数 x サブキャリア数] の行列に積む。
     % サブキャリア数が揃わないものが混ざっていた場合は最頻の長さに合わせる。
