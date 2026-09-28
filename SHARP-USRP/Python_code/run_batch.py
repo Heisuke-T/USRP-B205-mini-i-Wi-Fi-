@@ -71,6 +71,7 @@ class _DopplerArgs:
         self.cv_warn_threshold = 0.3
         self.subcarrier_range = None
         self.remove_static = a.remove_static
+        self.sub_sampling = a.sub_sampling
 
 
 def expand_inputs(patterns):
@@ -143,7 +144,7 @@ def run_one(in_path, args):
         print('  手順5: 描画')
         arr, m = load_doppler(txt_file)
         png = os.path.join(plot_dir, stem + '.png')
-        plot_doppler(arr, m, png, title=stem)
+        plot_doppler(arr, m, png, title=stem, ylim=args.ylim)
         pngs.append(png)
         print(f'    -> {png}')
 
@@ -193,6 +194,11 @@ def main():
     parser.add_argument('--n_fft', type=int, default=100)
     parser.add_argument('--resample', choices=['none', 'nudft', 'interp'],
                         default='none')
+    parser.add_argument('--ylim', type=float, default=None,
+                        help='図の速度軸の表示範囲 [m/s] を ±この値に固定する')
+    parser.add_argument('--sub_sampling', type=int, default=1,
+                        help='N 個に 1 個へ間引く。取得レートが高い測定の'
+                             '速度軸を他に揃えるために使う')
     parser.add_argument('--remove_static', action='store_true',
                         help='窓内の時間平均 (静止経路) を引く。直接波が強く'
                              '動きが埋もれる場合に使う')

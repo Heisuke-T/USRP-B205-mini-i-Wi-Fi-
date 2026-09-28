@@ -203,6 +203,19 @@ def process_one(mat_file, out_file, args):
         lo, hi = args.subcarrier_range
         csi_complex = csi_complex[:, lo:hi]
 
+    # --- パケットの間引き ---
+    # 速度軸の範囲は v_max = c/(Tc*fc)/2 なので、取得レートが高い測定ほど軸が
+    # 広くなり、同じ窓長での速度分解能 c/(Tc*fc*窓長) も粗くなる。N 個に 1 個へ
+    # 間引くと Tc が N 倍になり、レートの違う測定どうしで軸と分解能を揃えられる。
+    # (SHARPax の --sub_sampling と同じ考え方)
+    if args.sub_sampling > 1:
+        n_before = csi_complex.shape[0]
+        csi_complex = csi_complex[::args.sub_sampling, :]
+        if time_sec is not None:
+            time_sec = time_sec[::args.sub_sampling]
+        print(f'  間引き 1/{args.sub_sampling}: '
+              f'{n_before} -> {csi_complex.shape[0]} パケット')
+
     # --- サンプリング間隔 Tc を決める ---
     resample_stats = None
     Tc = args.Tc
@@ -271,6 +284,7 @@ def process_one(mat_file, out_file, args):
         n_subcarriers=int(csi_complex.shape[1]),
         resample_mode=args.resample,
         remove_static=bool(args.remove_static),
+        sub_sampling=int(args.sub_sampling),
         interval_cv=cv,
         resample=resample_stats,
     )
@@ -311,6 +325,10 @@ def main():
                              'interp: 線形補間で等間隔化 (比較用。高速側で悪化する)')
     parser.add_argument('--cv_warn_threshold', type=float, default=0.3,
                         help='この変動係数を超えたら nudft を勧める警告を出す')
+    parser.add_argument('--sub_sampling', type=int, default=1,
+                        help='N 個に 1 個へ間引く (既定 1 = 間引かない)。'
+                             '取得レートが高い測定の速度軸と分解能を、'
+                             '他の測定に揃えるために使う')
     parser.add_argument('--remove_static', action='store_true',
                         help='窓内の時間平均 (静止経路) を引いてから変換する。'
                              '直接波が強く動きが埋もれる場合に使う。'
