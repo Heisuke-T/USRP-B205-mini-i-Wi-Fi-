@@ -73,7 +73,7 @@ centerFrequency = 5.180e9;      % [Hz] 5GHz 帯 ch36 (20MHz 帯域幅)
 sampleRate      = 20e6;         % [Sps] 20 MHz 帯域
 gain            = 40;           % [dB] B200 系は 0〜76 dB 程度
                                  %      飽和するなら下げ、弱すぎるなら上げる
-captureDuration = 5.0;          % [s] Beacon 間隔は通常 100ms なので
+captureDuration = 30.0;          % [s] Beacon 間隔は通常 100ms なので
                                  %     確実に捕捉したい場合は長めに設定。
                                  %     5s で約 1.6 GB (メモリも同量必要)。
                                  %     ※decodeIQ_VHT.m の復号は実測で 5s の
@@ -82,7 +82,7 @@ captureDuration = 5.0;          % [s] Beacon 間隔は通常 100ms なので
                                  %       キャプチャは復号時間に注意。
 samplesPerFrame = 20000;        % [samples/frame]
 usrpPlatform    = 'B200';
-usrpSerialNum   = '3240497';
+usrpSerialNum   = '32275DE';
 
 %% ------------------------------------------------------------------------
 %  2. 保存先の準備
