@@ -1,0 +1,23 @@
+{
+  "source": "static1849_stream_0.mat",
+  "shape": [
+    4905,
+    100
+  ],
+  "Tc": 0.0057936000000005095,
+  "fc": 5180000000.0,
+  "n_fft": 100,
+  "sample_length": 31,
+  "sliding": 1,
+  "noise_level": -1.5,
+  "delta_v_bin": 0.09996385307072084,
+  "delta_v_resolution": 0.3224640421636156,
+  "v_max": 4.998192653536042,
+  "n_subcarriers": 245,
+  "resample_mode": "none",
+  "remove_static": true,
+  "sub_sampling": 1,
+  "despiked_packets": 0,
+  "interval_cv": 0.3986371408257437,
+  "resample": null
+}
