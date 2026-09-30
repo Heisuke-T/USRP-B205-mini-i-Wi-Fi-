@@ -42,10 +42,15 @@
 %          (complex double の iq + meta) に変換したもの。
 %          既存の decodeIQ_*.m / decode_VHT_v2.m がそのまま読める。
 %
-%  なぜ分割するのか:
-%    復号側 (decodeIQ_*.m) も iq をまるごと double でメモリに載せるため、
-%    120 秒を1ファイルにすると復号時に 38.4 GB 必要になり同じ壁にぶつかる。
-%    5 秒ごとに分けておけば 1 ファイル 1.6 GB で処理できる。
+%  分割 (writeSegments) は原則不要:
+%    decodeIQ_HE.m は [1] の .bin を直接読み、1 秒ずつ読み進めるので、
+%    キャプチャが何分あっても復号時のメモリは約 320 MB で頭打ちになる。
+%    つまり 1 キャプチャ = 1 ファイルのまま扱える。
+%
+%    分割が要るのは、.bin に未対応の古い復号スクリプト
+%    (decodeIQ_VHT.m / decode_VHT_v2.m など) に渡したいときだけ。
+%    それらは iq をまるごと complex double でメモリに載せるため、
+%    120 秒を1ファイルにすると 38.4 GB 必要になり同じ壁にぶつかる。
 %
 %    分割は受信の「後」に行うので、受信そのものは 120 秒間途切れない。
 %    各セグメントの meta.segmentStartTimeSec にキャプチャ開始からの
@@ -97,9 +102,14 @@ usrpPlatform    = 'B200';
 usrpSerialNum   = '3240497';
 
 % --- 分割出力の設定 ------------------------------------------------------
+% false のままでよい。decodeIQ_HE.m は *_raw.bin を直接、必要なところだけを
+% 少しずつ読むので、分割しなくても長時間キャプチャを扱える (1キャプチャ=1ファイル)。
 % true にすると、キャプチャ後に .bin を分割して captureIQ.m と同じ形式の
-% *_raw.mat を書き出す。既存の decodeIQ_*.m をそのまま使いたい場合は true。
-writeSegments   = true;
+% *_raw.mat を書き出す。.bin に未対応の古い復号スクリプト
+% (decodeIQ_VHT.m / decode_VHT_v2.m など) に渡したいときだけ true にする。
+% 分割すると .bin と同じ内容がもう一度 complex double で書かれるため、
+% ディスクを 4 倍使う点にも注意。
+writeSegments   = false;
 segmentDuration = 5.0;          % [s] 1セグメントが担当する長さ。
                                  %     5s = complex double で 1.6 GB、
                                  %     変換中のピークで約 3.2 GB 必要。
