@@ -2048,7 +2048,11 @@ function [status, consumed, entry, info] = processHE(pkt, lltfChanEst, noiseEst,
     lsigDemod    = wlanHEDemodulate(pkt(321:480), 'L-SIG', chanBW);   % L-SIG + RL-SIG
     preInfo      = wlanHEOFDMInfo('L-SIG', chanBW);
     chanEstPreHE = preHEChannelEstimateCompat(lsigDemod, lltfChanEst, chanBW);
-    lsigDemod    = heTrackPilotErrorCompat(lsigDemod, chanEstPreHE, cfgRx, 'L-SIG');
+    % L-SIG にはパイロットによる位相追跡をかけない。
+    %   - L-LTF の直後 (8us 後) にあるので、残留 CFO による位相の回りは無視できる
+    %   - wlanHETrackPilotError は L-SIG に対してレガシーの 52 本のチャネル推定を
+    %     要求するが、ここにあるのは HE 用の 56 本の推定なので形式が合わない
+    % 位相追跡が効くのは、数 ms 続く HE-Data (と HE-SIG-A) の方。
 
     [eqLSIG, csiLSIG] = heEqualizeCompat(lsigDemod(preInfo.DataIndices, :, :), ...
         chanEstPreHE(preInfo.DataIndices, :), noiseEst, chanBW, 'L-SIG');
