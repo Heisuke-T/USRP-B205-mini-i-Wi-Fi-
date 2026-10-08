@@ -81,6 +81,9 @@
 %
 %    .bin は必要なところだけを 1 秒ずつ読み進めるので、キャプチャが
 %    何分あってもメモリ使用量は一定 (約 320 MB) のままです。
+%    フォルダ内のファイルをまとめて復号したいときは decodeIQ_HE_batch.m を
+%    使う (このスクリプトを 1 ファイルずつ呼び出す)。
+%
 %    そのため captureIQ_single.m の writeSegments は false のままでよく、
 %    *_segNN_raw.mat に分割する必要はありません。1 キャプチャ = 1 ファイルで
 %    扱えます。
@@ -149,7 +152,12 @@
 %         極端に少ない場合は、しきい値を上げる方が速くなります。
 % =========================================================================
 
-clear; clc;
+clear;
+% 一括処理 (decodeIQ_HE_batch.m) から呼ばれているときは画面を消さない。
+% 前のファイルの結果や全体の進捗が流れて見えなくなるため。
+if isempty(getappdata(0, 'decodeIQ_HE_batch'))
+    clc;
+end
 
 %% ------------------------------------------------------------------------
 %  1. ユーザ設定パラメータ
@@ -197,6 +205,23 @@ verboseErrors   = false;        % true にすると復号エラーを毎回表�
 %       可能性がある。厳密に MAC で確認できたものだけが欲しい場合は false に
 %       する (その場合 fcsVerified が false の HE 記録は出力されない)。
 useBSSColorFallback = true;
+
+% --- 一括処理から呼ばれたときの上書き ------------------------------------
+% decodeIQ_HE_batch.m は、このスクリプトを 1 ファイルずつ呼び出す。
+% 冒頭の clear で消えないよう、入力ファイルや保存先は MATLAB 全体の
+% 共有領域 (appdata) で受け渡している。単体で実行したときは何も起きない。
+batchOutFileName = '';
+batchOverride = getappdata(0, 'decodeIQ_HE_batch');
+if ~isempty(batchOverride)
+    inputRawFile     = batchOverride.inputRawFile;
+    hddInputPath     = batchOverride.hddInputPath;
+    hddSavePath      = batchOverride.hddSavePath;
+    usbSavePath      = batchOverride.usbSavePath;
+    targetSSID       = batchOverride.targetSSID;
+    batchOutFileName = batchOverride.outFileName;
+    fprintf('[一括処理] 入力: %s\n', inputRawFile);
+end
+clear batchOverride;
 
 %% ------------------------------------------------------------------------
 %  2. 生IQファイルの読み込み
@@ -356,6 +381,12 @@ end
 %  ------------------------------------------------------------------------
 ssidSafe   = regexprep(targetSSID, '[^A-Za-z0-9_-]', '_');
 outFileName = [timestamp '_' ssidSafe '_CSI.mat'];
+if ~isempty(batchOutFileName)
+    % 一括処理では入力ファイル名から出力名を決める (呼び出し側で決定済み)。
+    % meta.captureDatetime は分割セグメント間で同じ値になるため、そのままだと
+    % 全セグメントが同じ名前で上書きし合ってしまう。
+    outFileName = batchOutFileName;
+end
 
 outMatFiles = {};   % 実際に書き込めた出力先
 outTargets  = { 'HDD', hddSavePath; 'USB', usbSavePath };
