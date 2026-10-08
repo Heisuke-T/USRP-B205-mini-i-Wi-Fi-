@@ -31,9 +31,15 @@
 %    該当の *_CSI.mat を消すか、skipExisting = false にする。
 %
 %  ログ:
-%    hddSavePath に次の2つを残す。
-%      batch_<日時>.log          … 画面に出た内容すべて
+%    hddSavePath に次のものを残す。
+%      <出力名>_log.txt          … 生IQ ファイルごとの復号結果。decodeIQ_HE.m を
+%                                  単体で実行したときに画面に出る内容と同じ
+%                                  (読み込んだ生IQ・復号サマリ・ネットワーク
+%                                  一覧など)。*_CSI.mat の隣にできる。
+%      batch_<日時>.log          … 一括処理全体の進行 (計画・進捗・最終結果)
 %      batch_<日時>_summary.csv  … ファイルごとの成否・所要時間・件数
+%    showEachPacket = false (既定) なら、パケット 1 個ごとの行は出さないので
+%    ファイルごとのログは百数十行程度に収まる。
 %
 %  途中で止めたいとき:
 %    Ctrl+C で止めてよい。処理中のファイルの出力は作られない (次回
@@ -57,6 +63,12 @@ cfg.targetSSID = 'WAX202';
 
 % --- すでに出力があるファイルを飛ばすか ----------------------------------
 cfg.skipExisting = true;
+
+% --- 復号できたパケットを 1 行ずつ表示するか ------------------------------
+%     false にすると、ファイルごとのログ (*_CSI_log.txt) が復号結果の
+%     サマリ中心の読みやすい分量 (百数十行) になる。true だと 1 ファイル
+%     あたり数千行になるが、パケット単位で追いかけたいときに使う。
+cfg.showEachPacket = false;
 
 % --- 呼び出す復号スクリプト (通常は変更不要) -----------------------------
 %     このファイルと同じフォルダの decodeIQ_HE.m を使う。
@@ -126,6 +138,7 @@ function runBatch(cfg)
         fprintf('#########################################################################\n');
         fprintf('# [%d/%d] %s\n', t, numel(todo), jobs(j).name);
         fprintf('#   出力: %s\n', jobs(j).outName);
+        fprintf('#   ログ: %s\n', jobs(j).logName);
         fprintf('#########################################################################\n');
 
         fileTic = tic;
@@ -154,6 +167,9 @@ function runBatch(cfg)
         end
         fprintf('\n');
 
+        fprintf('[一括処理] このファイルの復号結果: %s\n', ...
+            fullfile(cfg.hddSavePath, jobs(j).logName));
+
         % 途中経過も毎回書き出しておく (途中で止めても結果が残るように)
         writeSummaryCsv(csvFile, jobs);
     end
@@ -161,8 +177,9 @@ function runBatch(cfg)
     % --- 最終報告 ---
     printSummary(jobs, toc(batchTic));
     writeSummaryCsv(csvFile, jobs);
-    fprintf('\nログ        : %s\n', logFile);
-    fprintf('結果の一覧  : %s\n', csvFile);
+    fprintf('\n一括処理のログ       : %s\n', logFile);
+    fprintf('結果の一覧 (CSV)     : %s\n', csvFile);
+    fprintf('ファイルごとの復号結果: %s\\*_CSI_log.txt\n', cfg.hddSavePath);
 end
 
 function jobs = planJobs(cfg)
@@ -187,7 +204,7 @@ function jobs = planJobs(cfg)
     allList = allList(order);
 
     ssidSafe = regexprep(cfg.targetSSID, '[^A-Za-z0-9_-]', '_');
-    jobs = struct('name', {}, 'path', {}, 'ext', {}, 'outName', {}, ...
+    jobs = struct('name', {}, 'path', {}, 'ext', {}, 'outName', {}, 'logName', {}, ...
         'captureSec', {}, 'skip', {}, 'status', {}, 'elapsedSec', {}, ...
         'errMsg', {}, 'counts', {});
     for k = 1:numel(allList)
@@ -197,6 +214,7 @@ function jobs = planJobs(cfg)
         jb.path       = fullfile(allList(k).folder, allList(k).name);
         jb.ext        = ext;
         jb.outName    = [regexprep(base, '_raw$', '') '_' ssidSafe '_CSI.mat'];
+        jb.logName    = '';    % 出力名が確定してから決める (下)
         jb.captureSec = readCaptureSec(jb.path, ext);
         jb.skip       = false;
         jb.status     = '';
@@ -219,6 +237,11 @@ function jobs = planJobs(cfg)
                     ['_' tag '_CSI.mat']);
             end
         end
+    end
+
+    % ファイルごとのログ名 (decodeIQ_HE.m が出力名から同じ規則で作る)
+    for k = 1:numel(jobs)
+        jobs(k).logName = regexprep(jobs(k).outName, '\.mat$', '_log.txt');
     end
 
     % すでに出力があるものを飛ばす
@@ -261,6 +284,7 @@ function [ok, errMsg] = decodeOneFile(job, cfg)
     ovr.usbSavePath  = cfg.usbSavePath;
     ovr.targetSSID   = cfg.targetSSID;
     ovr.outFileName  = job.outName;
+    ovr.showEachPacket = cfg.showEachPacket;
     setappdata(0, 'decodeIQ_HE_batch', ovr);
     ovrCleanup = onCleanup(@() clearBatchOverride()); %#ok<NASGU>
 
@@ -268,6 +292,13 @@ function [ok, errMsg] = decodeOneFile(job, cfg)
     % 止めたままになるので、ファイルごとに元へ戻す。
     warnState   = warning;
     warnCleanup = onCleanup(@() warning(warnState)); %#ok<NASGU>
+
+    % decodeIQ_HE.m は画面の内容を *_CSI_log.txt に残すために diary の
+    % 出力先を一時的に切り替える。途中でエラーになると切り替わったままに
+    % なるので、一括処理のログ (batch_*.log) に必ず戻す。
+    prevDiaryFile = get(0, 'DiaryFile');
+    prevDiaryOn   = strcmp(get(0, 'Diary'), 'on');
+    diaryCleanup  = onCleanup(@() restoreDiary(prevDiaryFile, prevDiaryOn)); %#ok<NASGU>
 
     try
         runDecoder(cfg.decoderScript);
@@ -279,6 +310,9 @@ function [ok, errMsg] = decodeOneFile(job, cfg)
         if ~isempty(ME.stack)
             errMsg = sprintf('%s  (%s, %d 行目)', errMsg, ME.stack(1).name, ME.stack(1).line);
         end
+        % この時点ではまだ diary がこのファイルのログ (*_CSI_log.txt) を
+        % 向いているので、失敗の理由をそちらにも残しておく。
+        fprintf(2, '\n[一括処理] 復号中にエラーが発生しました:\n  %s\n', errMsg);
     end
 end
 
@@ -287,6 +321,13 @@ function runDecoder(scriptPath)
     % decodeIQ_HE.m の clear はこの関数の変数だけを消すので、
     % 一括処理側の状態 (ファイル一覧や進捗) は影響を受けない。
     run(scriptPath);
+end
+
+function restoreDiary(prevFile, prevOn)
+    diary off;
+    if prevOn && ~isempty(prevFile)
+        diary(prevFile);
+    end
 end
 
 function clearBatchOverride()
@@ -391,7 +432,7 @@ function writeSummaryCsv(csvFile, jobs)
         return;
     end
     fprintf(fid, '%s', char(65279));   % Excel 向けの BOM (U+FEFF, 日本語の文字化け防止)
-    fprintf(fid, 'file,status,elapsed_s,capture_s,output,HE,NonHT,HT,VHT,error\n');
+    fprintf(fid, 'file,status,elapsed_s,capture_s,output,log,HE,NonHT,HT,VHT,error\n');
     for k = 1:numel(jobs)
         j = jobs(k);
         if isempty(j.counts)
@@ -400,8 +441,8 @@ function writeSummaryCsv(csvFile, jobs)
             c = j.counts;
         end
         err = strrep(j.errMsg, '"', '""');
-        fprintf(fid, '%s,%s,%.1f,%.1f,%s,%g,%g,%g,%g,"%s"\n', ...
-            j.name, j.status, j.elapsedSec, j.captureSec, j.outName, ...
+        fprintf(fid, '%s,%s,%.1f,%.1f,%s,%s,%g,%g,%g,%g,"%s"\n', ...
+            j.name, j.status, j.elapsedSec, j.captureSec, j.outName, j.logName, ...
             c.HE, c.NonHT, c.HT, c.VHT, err);
     end
     fclose(fid);

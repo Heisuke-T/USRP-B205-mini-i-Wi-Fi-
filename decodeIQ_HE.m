@@ -194,6 +194,11 @@ pktDetThreshold = 0.5;          % wlanPacketDetect のしきい値 (0〜1)
                                  % 復号時間も伸びる
 verboseErrors   = false;        % true にすると復号エラーを毎回表示する
                                  % (通常は最後に集計のみ表示)
+showEachPacket  = true;         % true: 復号できたパケットを 1 行ずつ表示する
+                                 %       (数千行になる)。結果のサマリだけ
+                                 %       見たい・残したいときは false
+saveDecodeLog   = true;         % true: 画面に表示した内容を、出力 (*_CSI.mat)
+                                 %       と同じフォルダに *_CSI_log.txt として残す
 
 % --- MAC が読めなかった HE パケットを BSS Color で拾うか --------------------
 %     高い MCS (1024QAM 等) では受信SNRが少し足りないだけでデータ部の FCS が
@@ -219,6 +224,7 @@ if ~isempty(batchOverride)
     usbSavePath      = batchOverride.usbSavePath;
     targetSSID       = batchOverride.targetSSID;
     batchOutFileName = batchOverride.outFileName;
+    showEachPacket   = batchOverride.showEachPacket;
     fprintf('[一括処理] 入力: %s\n', inputRawFile);
 end
 clear batchOverride;
@@ -307,6 +313,26 @@ usrpSerialNum   = meta.serialNum;
 overrunCount    = meta.overrunCount;
 timestamp       = meta.captureDatetime;
 
+% --- 出力ファイル名 ---
+ssidSafe   = regexprep(targetSSID, '[^A-Za-z0-9_-]', '_');
+outFileName = [timestamp '_' ssidSafe '_CSI.mat'];
+if ~isempty(batchOutFileName)
+    % 一括処理では入力ファイル名から出力名を決める (呼び出し側で決定済み)。
+    % meta.captureDatetime は分割セグメント間で同じ値になるため、そのままだと
+    % 全セグメントが同じ名前で上書きし合ってしまう。
+    outFileName = batchOutFileName;
+end
+
+% --- 画面に表示する内容をテキストファイルにも残す ---
+% 出力 (*_CSI.mat) と同じフォルダに、同じ名前で *_CSI_log.txt を作る。
+% 生IQ ファイルごとに 1 つできるので、あとで復号結果を見比べられる。
+% すでに diary が動いている場合 (一括処理のログなど) は、終わったら元に戻す。
+decodeLog = struct('file', '', 'prevFile', '', 'prevOn', false);
+if saveDecodeLog
+    decodeLog = startDecodeLog(fullfile(hddSavePath, ...
+        regexprep(outFileName, '\.mat$', '_log.txt')));
+end
+
 fprintf('\n読み込んだ生IQ:\n');
 fprintf('  ファイル        : %s\n', inputRawFile);
 fprintf('  キャプチャ日時  : %s\n', timestamp);
@@ -379,15 +405,7 @@ end
 %% ------------------------------------------------------------------------
 %  3. 出力先の準備 (HDD と USB メモリの両方)
 %  ------------------------------------------------------------------------
-ssidSafe   = regexprep(targetSSID, '[^A-Za-z0-9_-]', '_');
-outFileName = [timestamp '_' ssidSafe '_CSI.mat'];
-if ~isempty(batchOutFileName)
-    % 一括処理では入力ファイル名から出力名を決める (呼び出し側で決定済み)。
-    % meta.captureDatetime は分割セグメント間で同じ値になるため、そのままだと
-    % 全セグメントが同じ名前で上書きし合ってしまう。
-    outFileName = batchOutFileName;
-end
-
+% (出力ファイル名 outFileName は第2節で決定済み)
 outMatFiles = {};   % 実際に書き込めた出力先
 outTargets  = { 'HDD', hddSavePath; 'USB', usbSavePath };
 for k = 1:size(outTargets, 1)
@@ -791,10 +809,12 @@ while searchOffset + minPreambleLen <= numel(iq) && searchOffset < blockLimit
                     bssidToSSID(entry.bssid) = entry.ssid;
                 end
 
-                fprintf('  [%7.4fs] %-6s %-16s BSSID=%s%s%s\n', entry.timeSec, ...
-                    entry.phyFormat, entry.frameType, entry.bssid, ...
-                    ternary(~isempty(entry.ssid), sprintf('  SSID="%s"', entry.ssid), ''), ...
-                    ternary(entry.mpduCount > 1, sprintf('  (MPDU集約x%d)', entry.mpduCount), ''));
+                if showEachPacket
+                    fprintf('  [%7.4fs] %-6s %-16s BSSID=%s%s%s\n', entry.timeSec, ...
+                        entry.phyFormat, entry.frameType, entry.bssid, ...
+                        ternary(~isempty(entry.ssid), sprintf('  SSID="%s"', entry.ssid), ''), ...
+                        ternary(entry.mpduCount > 1, sprintf('  (MPDU集約x%d)', entry.mpduCount), ''));
+                end
             end
         end
 
@@ -1406,10 +1426,55 @@ if nSaved == 0
 end
 
 fprintf('すべての処理が完了しました。\n');
+if ~isempty(decodeLog.file)
+    fprintf('この画面の内容は次のファイルにも保存しました:\n  %s\n', decodeLog.file);
+end
+stopDecodeLog(decodeLog);
 
 %% ------------------------------------------------------------------------
 %  ローカル関数
 %  ------------------------------------------------------------------------
+function logState = startDecodeLog(logFile)
+    % 画面に表示する内容を logFile にも記録し始める (MATLAB の diary)。
+    %
+    % diary は同時に 1 つのファイルにしか書けない。一括処理
+    % (decodeIQ_HE_batch.m) が自分のログを取っている最中に呼ばれることが
+    % あるので、そのとき動いていた diary を控えておき、stopDecodeLog で戻す。
+    logState = struct('file', '', ...
+        'prevFile', get(0, 'DiaryFile'), ...
+        'prevOn',   strcmp(get(0, 'Diary'), 'on'));
+    try
+        folder = fileparts(logFile);
+        if ~isempty(folder) && ~exist(folder, 'dir')
+            mkdir(folder);
+        end
+        diary off;
+        if isfile(logFile)
+            delete(logFile);   % diary は追記するので、やり直しのときは消しておく
+        end
+        diary(logFile);
+        logState.file = logFile;
+    catch ME
+        warning('decodeIQ_HE:logFailed', ...
+            'ログファイルを作れませんでした (%s)。画面表示のみで続けます: %s', ...
+            logFile, ME.message);
+        if logState.prevOn
+            diary(logState.prevFile);
+        end
+    end
+end
+
+function stopDecodeLog(logState)
+    % startDecodeLog で始めた記録を閉じ、その前に動いていた diary に戻す
+    if isempty(logState.file)
+        return;
+    end
+    diary off;
+    if logState.prevOn && ~isempty(logState.prevFile)
+        diary(logState.prevFile);
+    end
+end
+
 function src = openIQSource(input, meta)
     % 生IQの読み出し口を作る。
     %   input が数値       … *_raw.mat から読んだ complex double (全部メモリ上)
