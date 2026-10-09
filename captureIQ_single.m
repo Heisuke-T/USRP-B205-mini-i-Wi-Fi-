@@ -48,7 +48,7 @@
 %    つまり 1 キャプチャ = 1 ファイルのまま扱える。
 %
 %    分割が要るのは、.bin に未対応の古い復号スクリプト
-%    (decodeIQ_VHT.m / decode_VHT_v2.m など) に渡したいときだけ。
+%    (decode_VHT_v2.m など) に渡したいときだけ。
 %    それらは iq をまるごと complex double でメモリに載せるため、
 %    120 秒を1ファイルにすると 38.4 GB 必要になり同じ壁にぶつかる。
 %
@@ -106,7 +106,7 @@ usrpSerialNum   = '3240497';
 % 少しずつ読むので、分割しなくても長時間キャプチャを扱える (1キャプチャ=1ファイル)。
 % true にすると、キャプチャ後に .bin を分割して captureIQ.m と同じ形式の
 % *_raw.mat を書き出す。.bin に未対応の古い復号スクリプト
-% (decodeIQ_VHT.m / decode_VHT_v2.m など) に渡したいときだけ true にする。
+% (decode_VHT_v2.m など) に渡したいときだけ true にする。
 % 分割すると .bin と同じ内容がもう一度 complex double で書かれるため、
 % ディスクを 4 倍使う点にも注意。
 writeSegments   = false;
@@ -433,8 +433,8 @@ fprintf('\nメタデータを保存しました: %s\n', metaFile);
 %   「自分の担当区間内で始まったパケット」は必ず丸ごと含まれる。
 %
 %   重なり部分で始まるパケットは次のセグメントの担当なので、両方に現れる。
-%   マージ時は timeSec < segmentCoreDuration のものだけ採用すれば
-%   重複も欠落も無く 120 秒を繋げられる (mergeCSI.m がこれを行う)。
+%   繋ぐときは timeSec < segmentCoreDuration のものだけ採用すれば
+%   重複も欠落も無く 120 秒を繋げられる。
 if writeSegments
     segSamples     = round(segmentDuration * sampleRate);
     overlapSamples = round(segmentOverlap * sampleRate);
@@ -520,14 +520,14 @@ if writeSegments
 
     fprintf('[分割] 完了 (%.1f s)\n', toc(splitTic));
     fprintf(['\n次の手順:\n', ...
-             '  1. decodeIQ_VHT.m / decode_VHT_v2.m 等で各セグメントを復号する\n', ...
-             '     (inputRawFile にセグメントのパスを指定)\n', ...
-             '  2. mergeCSI.m で全セグメントの CSI を1本の時系列に繋ぐ\n', ...
-             '     (時刻のオフセット加算と、重なり部分の重複除去を行う)\n']);
+             '  decode_VHT_v2.m 等の .bin に未対応の復号スクリプトで、\n', ...
+             '  各セグメントを復号する (inputRawFile にセグメントのパスを指定)。\n', ...
+             '  ※decodeIQ_HE.m なら分割せず .bin を直接復号できる。\n']);
 else
-    fprintf(['\n生データ (.bin) のみ保存しました。decodeIQ_*.m は *_raw.mat を\n', ...
-             '前提としているため、そのままでは読めません。writeSegments を\n', ...
-             'true にして再実行するか、別途変換してください。\n']);
+    fprintf(['\n生データ (.bin) を保存しました。次に decodeIQ_HE.m を実行してください\n', ...
+             '(この .bin が自動選択されます。1 秒ずつ読み進めるので、キャプチャが\n', ...
+             '長くてもメモリは約 320 MB で済みます)。\n', ...
+             'フォルダ内をまとめて復号するときは decodeIQ_HE_batch.m を使います。\n']);
 end
 
 fprintf('\nすべての処理が完了しました。\n');

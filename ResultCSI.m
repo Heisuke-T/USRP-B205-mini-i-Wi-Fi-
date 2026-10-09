@@ -4,7 +4,7 @@
 %  フォーマット (Non-HT / HT / VHT / HE) ごとに作成・保存するスクリプト
 % -------------------------------------------------------------------------
 %  概要:
-%    decodeIQ_VHT.m / decode_VHT_v2.m / decodeIQ_VHT_Pico.m / decodeIQ_HE.m
+%    decodeIQ_HE.m / decode_VHT_v2.m
 %    の出力 (<入力名>_CSI.mat) を読み込み、
 %    Non-HT / HT / VHT / HE のうちファイルに含まれているものそれぞれについて、
 %      振幅マップ : Amplitude(packet, subcarrier) = |H(k)|        [dB]
@@ -51,7 +51,7 @@ clear; clc;
 inputCsiFile = '';
 
 % CSI ファイルを探すフォルダ。inputCsiFile 指定時は無視。
-%   decodeIQ_VHT.m の hddSavePath と揃えること。現在の環境: HDPC-UT (D:)
+%   decodeIQ_HE.m の hddSavePath と揃えること。現在の環境: HDPC-UT (D:)
 csiSearchPath = 'D:\IQ_csi';
 
 %% ------------------------------------------------------------------------
@@ -73,7 +73,7 @@ end
 
 fprintf('入力 CSI ファイル: %s\n', inputCsiFile);
 
-% load が失敗する主因は「decodeIQ_VHT.m の保存が完了していない (実行中・中断)」
+% load が失敗する主因は「decodeIQ_HE.m の保存が完了していない (実行中・中断)」
 % ため。原因が分かるようファイルサイズを添えて報告する。
 try
     S = load(inputCsiFile);
@@ -85,7 +85,7 @@ catch loadErr
          '  サイズ    : %d バイト\n', ...
          '  更新日時  : %s\n', ...
          '  エラー    : %s\n', ...
-         'decodeIQ_VHT.m が「すべての処理が完了しました。」まで到達しているか\n', ...
+         'decodeIQ_HE.m が「すべての処理が完了しました。」まで到達しているか\n', ...
          '確認してください。実行中・中断されたファイルは読み込めません。'], ...
         inputCsiFile, dInfo.bytes, dInfo.date, loadErr.message);
 end
