@@ -1312,13 +1312,17 @@ end
 if ~isempty(matched)
     fprintf('  内訳: Non-HT=%d, HT=%d, VHT=%d, HE=%d\n', ...
         size(csiNonHT, 1), size(csiHT, 1), size(csiVHT, 1), size(csiHE, 1));
-    totalMPDU = sum([matched.mpduCount]);
-    % MAC が読めた分だけで PPDU と MPDU の関係を見る
-    % (MAC未復号のものは MPDU 数が分からないので分母から外す)
-    macKnown = ~strcmp(allFrameType, '(MAC未復号)');
+    % MAC を信頼できる分だけで PPDU と MPDU の関係を見る。
+    % FCS で確認できていない HE パケットは、ヘッダのみ推定で何か読めていても
+    % 壊れていることが多く (帰属は BSS Color で行っている)、MPDU 数も当て
+    % にならないので外す。MAC未復号のものは MPDU 数がそもそも分からない。
+    heUnverifiedM = strcmpi(allFormats, 'HE') & ~allFcs;
+    macKnown   = ~strcmp(allFrameType, '(MAC未復号)') & ~heUnverifiedM;
+    mpduCounts = [matched.mpduCount].';
     if any(macKnown)
-        fprintf(['  MACが読めた %d 件について、PPDU(電波上の送信単位)数に対する\n', ...
-                 '  集約されたMPDU(データ単位)の合計=%d\n'], sum(macKnown), totalMPDU);
+        fprintf(['  MACが確認できた %d 件について、PPDU(電波上の送信単位)数に対する\n', ...
+                 '  集約されたMPDU(データ単位)の合計=%d\n'], ...
+            sum(macKnown), sum(mpduCounts(macKnown)));
     end
 
     nHeaderOnly = sum(~allFcs & macKnown);
