@@ -1140,15 +1140,25 @@ end
 %       ダウンリンクなら Address2、アップリンクなら Address1 が BSSID になる。
 %       Beacon 由来の BSSID に錨を下ろすことで、クライアントの MAC アドレスを
 %       誤って BSSID として登録することも防げる。
+%
+% 学習の根拠は2種類ある。
+%   ビーコン / Probe Response … 802.11ax の AP はビーコンの HE Operation 要素で
+%       自分の BSS Color を告知している。ビーコンは最も低い変調方式で送られる
+%       ので、HE データが 1 件も復号できない受信品質でも確実に読める。
+%       主な根拠はこちら。
+%   FCS が通った HE パケット … HE-SIG-A の Color と MAC アドレスの組。
+%       受信品質に余裕があるときの補助的な根拠。
 allColors  = [pktLog.bssColor];
 colorToBSSID   = containers.Map('KeyType', 'double', 'ValueType', 'char');
-colorEvidence  = containers.Map('KeyType', 'double', 'ValueType', 'double');
+colorEvidence  = containers.Map('KeyType', 'double', 'ValueType', 'double');   % HE パケット
+colorEvidenceBcn = containers.Map('KeyType', 'double', 'ValueType', 'double'); % ビーコン
 colorConflicts = containers.Map('KeyType', 'double', 'ValueType', 'logical');
 for k = 1:numel(pktLog)
     c = pktLog(k).bssColor;
     if c < 0 || ~pktLog(k).fcsVerified
-        continue;   % HE以外、または MAC を確証できていないパケット
+        continue;   % Color を持たない、または MAC を確証できていないパケット
     end
+    fromBeacon = ~strcmpi(pktLog(k).phyFormat, 'HE');
 
     % Beacon で確認済みの BSSID に一致する方を採用する
     bs = '';
@@ -1161,22 +1171,25 @@ for k = 1:numel(pktLog)
         continue;   % どちらの向きでも既知の BSS に結びつかない
     end
 
-    if isKey(colorToBSSID, c)
-        if ~strcmp(colorToBSSID(c), bs)
-            % 別々の BSS が同じ Color を使っている。6bit しかないので
-            % 起こり得る。この Color での帰属は諦める。
-            colorConflicts(c) = true;
-        else
-            colorEvidence(c) = colorEvidence(c) + 1;
-        end
+    if ~isKey(colorToBSSID, c)
+        colorToBSSID(c)     = bs;
+        colorEvidence(c)    = 0;
+        colorEvidenceBcn(c) = 0;
+    elseif ~strcmp(colorToBSSID(c), bs)
+        % 別々の BSS が同じ Color を使っている。6bit しかないので
+        % 起こり得る。この Color での帰属は諦める。
+        colorConflicts(c) = true;
+        continue;
+    end
+    if fromBeacon
+        colorEvidenceBcn(c) = colorEvidenceBcn(c) + 1;
     else
-        colorToBSSID(c) = bs;
-        colorEvidence(c) = 1;
+        colorEvidence(c) = colorEvidence(c) + 1;
     end
 end
 
 if colorToBSSID.Count > 0
-    fprintf('\nBSS Color と BSSID の対応 (FCS検証済みパケットから学習):\n');
+    fprintf('\nBSS Color と BSSID の対応 (ビーコンの告知と、FCS検証済みの HE パケットから学習):\n');
     cKeys = sort(cell2mat(keys(colorToBSSID)));
     for k = 1:numel(cKeys)
         bs = colorToBSSID(cKeys(k));
@@ -1188,14 +1201,16 @@ if colorToBSSID.Count > 0
             end
         end
         conflict = isKey(colorConflicts, cKeys(k)) && colorConflicts(cKeys(k));
-        fprintf('  Color%-2d -> BSSID=%s%s  (根拠 %d件)%s\n', cKeys(k), bs, ...
+        fprintf('  Color%-2d -> BSSID=%s%s  (根拠: ビーコン %d件, HEパケット %d件)%s\n', ...
+            cKeys(k), bs, ...
             ternary(~isempty(ss), sprintf('  SSID="%s"', ss), ''), ...
-            colorEvidence(cKeys(k)), ...
+            colorEvidenceBcn(cKeys(k)), colorEvidence(cKeys(k)), ...
             ternary(conflict, '   <-- 複数のBSSIDと衝突。Colorでの帰属は行いません', ''));
     end
 elseif stats.csiOnly > 0
     fprintf(['\nBSS Color と BSSID の対応を学習できませんでした。\n', ...
-             '  (FCS 検証まで通った HE パケットが 1 件も無いため)\n', ...
+             '  (ビーコンに BSS Color の告知 (HE Operation 要素) が無く、\n', ...
+             '   FCS 検証まで通った HE パケットも 1 件も無いため)\n', ...
              '  MAC未復号の HE パケット %d 件は、どの SSID にも帰属させられません。\n'], ...
         stats.csiOnly);
 end
@@ -1222,9 +1237,14 @@ else
             end
         end
         if ~isempty(targetColors)
-            noMAC     = cellfun(@isempty, allBssid);
-            byColor   = noMAC & ismember(allColors, targetColors);
-            nByColor  = sum(byColor);
+            % FCS で MAC を確認できていない HE パケットは、アドレスではなく
+            % Color で判定する。受信品質が足りないとき、FCS を通らなかった
+            % ヘッダは壊れていることが多く、「ヘッダのみ推定」で読めた
+            % アドレスも偶然の値になっているため。CSI はプリアンブル由来
+            % なのでこれらも有効。
+            heUnverified = strcmpi({pktLog.phyFormat}, 'HE') & ~logical([pktLog.fcsVerified]);
+            byColor   = heUnverified & ismember(allColors, targetColors);
+            nByColor  = sum(byColor & ~isMatch);
             isMatch   = isMatch | byColor;
         end
     end
@@ -1233,9 +1253,9 @@ else
     fprintf('\n対象 SSID "%s" (BSSID=%s) のパケット数: %d (アップリンク+ダウンリンク)\n', ...
         targetSSID, targetBSSID, numel(matched));
     if nByColor > 0
-        fprintf(['  うち %d 件は MAC ヘッダが読めず、HE-SIG-A の BSS Color 一致で\n', ...
-                 '  帰属させたものです (CSI はプリアンブル由来なので有効。\n', ...
-                 '  fcsVerified = false、frameType = "(MAC未復号)" が目印)。\n'], nByColor);
+        fprintf(['  うち %d 件は MAC ヘッダを FCS で確認できず、HE-SIG-A の BSS Color\n', ...
+                 '  一致で帰属させたものです (CSI はプリアンブル由来なので有効。\n', ...
+                 '  fcsVerified = false が目印)。\n'], nByColor);
     end
 end
 
@@ -1613,6 +1633,45 @@ function y = applyCFO(x, fs, cfoHz)
     y = x .* exp(1j * 2 * pi * cfoHz * n / fs);
 end
 
+function color = parseBeaconBSSColor(psduBits)
+    % ビーコン / Probe Response の本体から HE Operation 要素を探し、
+    % AP が告知している BSS Color (0〜63) を返す。見つからなければ -1。
+    %
+    % HE Operation 要素 (IEEE 802.11ax, Element ID 255 / Extension ID 36):
+    %   [ID=255][長さ][拡張ID=36][HE Operation Parameters 3byte][BSS Color Information 1byte]...
+    %   BSS Color Information: bit0-5 = BSS Color, bit6 = Partial, bit7 = Disabled
+    % FCS は呼び出し前に wlanMPDUDecode で確認済みなので、中身は信頼できる。
+    color = -1;
+    [dfmt, oct] = mpduDataFormat(psduBits);
+    if isempty(dfmt)
+        return;
+    end
+    oct = double(oct(:)).';
+
+    hdrLen = 24;
+    if numel(oct) >= 2 && bitand(oct(2), 128) ~= 0
+        hdrLen = 28;   % Order ビットが立っていれば HT Control が付く
+    end
+    % 本体の先頭は固定フィールド: Timestamp 8 + Beacon Interval 2 + Capability 2
+    p    = hdrLen + 12 + 1;
+    last = numel(oct) - 4;   % 末尾 4 バイトは FCS
+    while p + 1 <= last
+        id  = oct(p);
+        len = oct(p + 1);
+        if p + 1 + len > last
+            return;   % 要素の長さが本体からはみ出している
+        end
+        if id == 255 && len >= 5 && oct(p + 2) == 36
+            info = oct(p + 6);   % 拡張ID(1) + HE Operation Parameters(3) の次
+            if bitand(info, 128) == 0   % BSS Color Disabled でない
+                color = bitand(info, 63);
+            end
+            return;
+        end
+        p = p + 2 + len;
+    end
+end
+
 function [status, consumed, entry] = processNonHT(pkt, chanEst, noiseEst, chanBW)
     % Non-HT (802.11a/g) パケットを復号する。
     %   status: 1=成功(entryあり), 0=失敗/読み捨て, -1=サンプル不足
@@ -1662,6 +1721,12 @@ function [status, consumed, entry] = processNonHT(pkt, chanEst, noiseEst, chanBW
     end
 
     entry = buildEntry(cfgMAC, payload, 'Non-HT', chanEst);
+
+    % ビーコン / Probe Response なら、AP が告知している BSS Color を読む。
+    % HE の CSI を対象 SSID に帰属させるときの、確実な手掛かりになる。
+    if ~isempty(entry) && any(strcmpi(entry.frameType, {'Beacon', 'Probe Response'}))
+        entry.bssColor = parseBeaconBSSColor(rxPSDU);
+    end
     status = 1;
 end
 
