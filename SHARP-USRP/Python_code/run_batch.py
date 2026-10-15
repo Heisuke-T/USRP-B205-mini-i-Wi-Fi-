@@ -219,6 +219,12 @@ def main():
                         help='完了済み (PNG がある) のファイルもやり直す')
     args = parser.parse_args()
 
+    if args.noise_level >= 0:
+        parser.error(
+            f'noise_level は負の値で指定してください (指定値 {args.noise_level})。'
+            f'10^{args.noise_level:g} = {10**args.noise_level:g} となり、'
+            f'正規化後の全ビンが切り捨てられて一様な図になります。例: -3.0')
+
     files = expand_inputs(args.inputs)
     if not files:
         print('処理対象のファイルがありません。')

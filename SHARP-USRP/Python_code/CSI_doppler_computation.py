@@ -414,6 +414,15 @@ def main():
                         help='使用するサブキャリアの範囲 (既定は全部)')
     args = parser.parse_args()
 
+    # 雑音床は 10^x として使う。x >= 0 だと 10^x >= 1 となり、窓ごとの
+    # 最大値 1.0 を含む全ビンが切り捨てられて真っ平らな図になる。
+    if args.noise_level >= 0:
+        parser.error(
+            f'noise_level は負の値で指定してください (指定値 {args.noise_level})。'
+            f'10^{args.noise_level:g} = {10**args.noise_level:g} となり、'
+            f'正規化後の全ビン (最大 1.0) が切り捨てられて一様な図になります。'
+            f'例: -3.0 (= -30 dB)')
+
     for subdir in args.subdirs.split(','):
         exp_dir = path.join(args.dir, subdir) if subdir != '.' else args.dir
         out_dir = (path.join(args.dir_doppler, subdir) if subdir != '.'
