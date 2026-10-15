@@ -326,6 +326,20 @@ def process_one(mat_file, out_file, args):
     with open(out_file, 'wb') as fp:
         pickle.dump(arr, fp)
 
+    # 各窓の実時刻 (窓の中央) を保存する。パケット到着が不均一だと
+    # 「窓番号 x ずらし x Tc」で合成した時間軸は実時間とずれていくため、
+    # 描画側はこちらを使う。
+    if time_sec is not None and time_sec.size >= args.sample_length:
+        ts = np.sort(time_sec)
+        centers = np.array([
+            ts[i:i + args.sample_length].mean()
+            for i in range(0, ts.size - args.sample_length, args.sliding)])
+        if centers.size >= arr.shape[0]:
+            centers = centers[:arr.shape[0]] - ts[0]
+            np.save(out_file[:-4] + '_time.npy', centers)
+            print(f'  実測の長さ: {ts[-1]-ts[0]:.1f} s '
+                  f'(Tc から合成すると {arr.shape[0]*args.sliding*Tc:.1f} s)')
+
     meta = dict(
         source=path.basename(mat_file),
         shape=list(arr.shape),

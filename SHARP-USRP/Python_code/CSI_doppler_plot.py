@@ -33,6 +33,10 @@ def load_doppler(txt_file):
     if path.exists(meta_file):
         with open(meta_file, encoding='utf-8') as fp:
             meta = json.load(fp)
+    # 各窓の実時刻があれば読む (無ければ描画側で Tc から合成)
+    time_file = txt_file[:-4] + '_time.npy'
+    if path.exists(time_file):
+        meta['window_times'] = np.load(time_file)
     return arr, meta
 
 
@@ -54,9 +58,16 @@ def plot_doppler(arr, meta, out_png, title=None, vmin_db=None, ylim=None):
         y_label = 'Doppler bin'
 
     # 横軸 (時間)
-    if Tc is not None:
-        t_axis = np.arange(n_win) * sliding * Tc
+    # パケット到着が不均一な測定では「窓番号 x ずらし x Tc」で合成すると
+    # 実時間とずれる (バーストが多いと長く、欠落が多いと短く出る)。
+    # 手順4 が残した実測時刻があればそれを使う。
+    wt = meta.get('window_times')
+    if wt is not None and len(wt) == n_win:
+        t_axis = np.asarray(wt)
         x_label = 'Time [s]'
+    elif Tc is not None:
+        t_axis = np.arange(n_win) * sliding * Tc
+        x_label = 'Time [s]  (estimated from Tc)'
     else:
         t_axis = np.arange(n_win)
         x_label = 'Window index'
