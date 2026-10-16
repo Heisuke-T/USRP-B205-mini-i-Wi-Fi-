@@ -8,6 +8,11 @@ Python_code/processed_phase*/*.mat
 Python_code/doppler_traces/**/*.txt
 Python_code/doppler_traces/**/*.json
 
+# 活動認識の学習 (データセットの窓は doppler_traces 内の *.txt として上で無視される)
+Python_code/*_cache_*
+Python_code/*.keras
+Python_code/outputs/
+
 # 図とログ
 Python_code/**/*.png
 Python_code/*.log

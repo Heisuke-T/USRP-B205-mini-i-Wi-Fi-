@@ -257,6 +257,151 @@ python3 CSI_doppler_computation.py ./processed_phase/ . ./doppler_traces/ 10 10 
 python3 CSI_doppler_plot.py ./doppler_traces/ ./plots/ --ylim 5
 ```
 
+### 活動認識の学習とテスト (手順6〜8)
+
+SHARP の学習側 (データセット作成・ネットワーク・評価) を USRP の測定に合わせて
+移植したもの。ここでは S1 で学習し、S2・S3 でテストする例を示す。
+
+```
+doppler_traces/<S>/*.txt            ドップラーデータ (手順4 の出力)
+   │  ★ 手順6: CSI_doppler_create_dataset_train.py (学習用) / _test.py (テスト用)
+   ▼
+doppler_traces/<S>/train_... など    窓に切ったデータセット [アンテナ x ドップラービン x 時間]
+   │  ★ 手順7: CSI_network.py (学習)
+   ▼
+usrp_<アンテナ>_<活動>_network.keras 学習したモデル
+   │  ★ 手順8: CSI_network_test.py (テスト)
+   ▼
+outputs/, plots/                     正解率・F 値・混同行列
+```
+
+**準備**
+
+```bash
+pip install tensorflow scikit-learn matplotlib
+```
+
+Windows でネイティブに入れた TensorFlow は CPU でしか動かないが、ネットワークが
+小さいので CPU で十分学習できる。
+
+**ファイルの置き方**
+
+セッション (S1, S2, S3) ごとにサブディレクトリを分け、ファイル名を次の形にする。
+
+```
+Python_code/doppler_traces/
+├── S1/
+│   ├── S1_E_antenna1_WAX202_aligned_CSI_stream_0.txt
+│   ├── S1_E_antenna1_WAX202_aligned_CSI_stream_0_meta.json
+│   ├── S1_E_antenna2_WAX202_aligned_CSI_stream_0.txt
+│   ├── S1_W_antenna1_WAX202_aligned_CSI_stream_0.txt
+│   └── ...
+├── S2/
+└── S3/
+```
+
+- **4 文字目** (`S1_E_...` の `E`) が活動ラベル (SHARP は `S1a_E_...` の 5 文字目)
+- `antenna1` / `antenna2` がアンテナ。アンテナ名以外が同じファイルどうしを
+  同じ測定として束ねる
+- `_meta.json` はそのまま置いておいてよい (読み込み対象から外している)
+
+`alignCSI.m` の出力をセッションごとに `run_batch.py` へ通すと、この形になる。
+ドップラー計算の設定 (`--remove_static` など) は S1〜S3 で揃えること。
+
+```powershell
+python run_batch.py "D:\IQ_csi\S1_*_aligned_CSI.mat" --label S1
+python run_batch.py "D:\IQ_csi\S2_*_aligned_CSI.mat" --label S2
+python run_batch.py "D:\IQ_csi\S3_*_aligned_CSI.mat" --label S3
+```
+
+**実行**
+
+活動ラベル `E,L,W,R,J` は例。実際に使うラベルに置き換える。
+
+```powershell
+cd SHARP-USRP\Python_code
+
+# 手順6: データセット作成
+#   S1 は測定ごとに時間方向で 学習 60% / 検証 20% / テスト 20% に分ける
+#   S2, S3 は分けずに全区間をテストに使う
+python CSI_doppler_create_dataset_train.py ./doppler_traces/ S1 31 1 340 30 E,L,W,R,J antenna1,antenna2
+python CSI_doppler_create_dataset_test.py ./doppler_traces/ S2,S3 31 1 340 30 E,L,W,R,J antenna1,antenna2
+
+# 手順7: 学習 (S1)。最後に S1 から取り分けたテスト区間での結果を表示する
+python CSI_network.py ./doppler_traces/ S1 100 340 1 32 antenna1,antenna2 usrp E,L,W,R,J
+
+# 手順8: テスト (S2,S3) と混同行列の描画
+python CSI_network_test.py ./doppler_traces/ S2,S3 100 340 1 32 antenna1,antenna2 usrp E,L,W,R,J
+python CSI_network_metrics_plot.py complete_different_antenna1,antenna2_E,L,W,R,J_S2,S3 E,L,W,R,J
+```
+
+| 引数 | 意味 |
+|---|---|
+| `31 1` | 手順4 の窓長とずらし幅。学習・検証・テストの境目で窓が重ならないよう空ける幅に使う |
+| `340 30` | 学習の 1 サンプルの時間方向の長さ (ドップラーの時間窓 340 個) とずらし幅。170 pkt/s なら約 2 秒 |
+| `100` | ドップラービン数 (= 手順4 の `--n_fft`) |
+| `1 32` | チャネル数、バッチサイズ |
+| `antenna1,antenna2` | 使うアンテナ |
+| `usrp` | モデルなどのファイル名の先頭 (任意) |
+
+`S2,S3` のように並べるとまとめて 1 つの評価になる。別々に見たいときは
+`S2` と `S3` で 1 回ずつ実行する。学習の最大エポック数は `--epochs` で変えられる
+(既定 25。検証損失が 3 エポック改善しなければ早めに止まる)。
+
+**アンテナを 1 本にする**
+
+アンテナの指定を `antenna1` に変えるだけでよい。データセット・モデル・結果の
+ファイル名に使ったアンテナが入るので、2 本のときの結果は上書きされない。
+`2` のように本数で書くと `antenna1,antenna2` と同じ意味になる。
+
+```powershell
+python CSI_doppler_create_dataset_train.py ./doppler_traces/ S1 31 1 340 30 E,L,W,R,J antenna1
+python CSI_doppler_create_dataset_test.py ./doppler_traces/ S2,S3 31 1 340 30 E,L,W,R,J antenna1
+python CSI_network.py ./doppler_traces/ S1 100 340 1 32 antenna1 usrp E,L,W,R,J
+python CSI_network_test.py ./doppler_traces/ S2,S3 100 340 1 32 antenna1 usrp E,L,W,R,J
+```
+
+ネットワークはアンテナ 1 本ぶんの入力を受け取り、複数のアンテナは評価のときに
+予測を統合する (SHARP と同じ)。そのため、2 本で学習したモデルを antenna1 だけで
+評価することもできる (`--model usrp_antenna1,antenna2_E,L,W,R,J_network.keras`)。
+テスト結果には「使うアンテナの本数ごと」の正解率も表示される。
+
+**2 台の受信機の長さの違い**
+
+2 台の USRP は受けたパケットの数が違うので、ドップラーデータの時間方向の長さが
+揃わない (SHARP は 4 コアが同じパケットを受けるため常に一致していた)。
+データセット作成時に、短いほうに合わせて末尾を切る (画面に表示される)。
+速度軸の範囲 (取得レートで決まる) がファイル間で 10% 以上違うと警告を出すので、
+そのときは手順4 の `--sub_sampling` でレートを揃える。
+
+**出力**
+
+| | |
+|---|---|
+| `doppler_traces/S1/train_antenna1,antenna2_E,L,W,R,J/` など | データセット (窓ごとのファイル) |
+| `usrp_antenna1,antenna2_E,L,W,R,J_network.keras` | 学習したモデル (検証正解率が最良のエポック) |
+| `outputs/complete_different_antenna1,antenna2_E,L,W,R,J_S2,S3.txt` | テスト結果。`CSI_network_metrics.py` で再表示できる |
+| `plots/complete_different_..._max_merge.png` | 混同行列 (アンテナ統合後) |
+
+**VS Code で実行する**
+
+リポジトリのフォルダを VS Code で開き、Python 拡張機能を入れて、上の `pip install`
+をした環境をインタープリタに選ぶ (コマンドパレット → `Python: Select Interpreter`)。
+あとは次のどちらかで実行できる。
+
+- ターミナル (`` Ctrl+@ ``) で上のコマンドを実行する
+- 「実行とデバッグ」(`Ctrl+Shift+D`) で `SHARP 1.` 〜 `SHARP 5.` を順に選んで
+  F5 (デバッグなしで速く回すなら `Ctrl+F5`)。起動時に使うアンテナと活動ラベルを
+  聞かれる。設定はリポジトリ直下の `.vscode/launch.json` にあり、データの場所や
+  セッション名を変えるときはその `args` を書き換える
+
+**表示されるが無視してよい警告**
+
+- `The calling iterator did not fully read the dataset being cached` —
+  TensorFlow のキャッシュの既知の警告。キャッシュは正しく作られる
+- `shuffle=True was passed, but will be ignored` — データセット側でシャッフル
+  しているので問題ない
+
 **重要 — SHARP のドップラー計算をそのまま使ってはいけない理由**
 
 SHARP の `CSI_doppler_computation.py` はアルゴリズム自体 (ハン窓 → FFT →
@@ -519,13 +664,11 @@ python3 Python_code/tests/test_matlab_parity.py
 
 ## 今後の課題
 
-### 活動認識ネットワークへの接続
+### 活動認識の実データでの検証
 
-SHARP は `doppler_traces` からデータセットを作り (`CSI_doppler_create_dataset_*.py`)、
-CNN で活動を分類する (`CSI_network.py`)。本システムはドップラーマップの生成までを
-カバーしている。学習側へ進む場合、SHARP の学習コードは入力サイズ (特徴量方向の長さ)
-を引数で受け取るため、20MHz のサブキャリア数に合わせて指定すれば流用できる見込みだが、
-未検証である。
+学習側 (手順6〜8) は移植済みで、合成ドップラーデータでは S1 で学習 → S2・S3 で
+テストの流れが通り、正しく分類できることを確認している
+(`python3 Python_code/tests/test_har.py`)。実測データでの精度はまだ確かめていない。
 
 ### パケット取得レートの安定化
 
@@ -561,12 +704,22 @@ SHARP-USRP/
     ├── CSI_doppler_plot.py         手順5: ドップラーマップの描画
     ├── run_phase_sanitization.py   手順0〜3の一括実行 (1ファイル)
     ├── run_batch.py                手順0〜5の一括実行 (複数ファイル)
+    ├── CSI_doppler_create_dataset_train.py  手順6: 学習用データセット
+    ├── CSI_doppler_create_dataset_test.py   手順6: テスト用データセット
+    ├── CSI_network.py              手順7: 学習
+    ├── CSI_network_test.py         手順8: テスト
+    ├── CSI_network_metrics.py      評価結果の表示
+    ├── CSI_network_metrics_plot.py 混同行列の描画
+    ├── dataset_utility.py          ファイル名の解釈・アンテナの束ね方・窓切り
+    ├── metrics_utility.py          アンテナごとの予測の統合と指標
+    ├── network_utility.py          SHARP 由来 (無変更)
     ├── optimization_utility.py     SHARP 由来 (無変更)
     ├── pipeline_meta.py            段間の設定引き継ぎ
     └── tests/
         ├── make_synthetic_usrp_mat.py  合成データ生成
         ├── test_pipeline.py            パイプライン全体のテスト
         ├── test_doppler.py             ドップラー計算の検証
+        ├── test_har.py                 データセット作成〜学習〜テストの検証
         └── test_matlab_parity.py       MATLAB/Python 一致テスト
 ```
 

@@ -3,7 +3,8 @@
 SHARP-USRP が、オリジナルの [SHARP](https://github.com/francescamen/SHARP) および
 [SHARPax](https://github.com/francescamen/SHARPax) から何をどう変えたかの一覧。
 
-対象は位相サニタイゼーション (手順1〜3) とドップラーマップ生成 (手順4〜5)。
+対象は位相サニタイゼーション (手順1〜3)、ドップラーマップ生成 (手順4〜5)、
+活動認識の学習と評価 (手順6〜8)。
 
 ---
 
@@ -42,6 +43,12 @@ SHARP-USRP が、オリジナルの [SHARP](https://github.com/francescamen/SHAR
 | `CSI_phase_sanitization_signal_reconstruction.py` | SHARP | (A)(C)(D) |
 | `CSI_doppler_computation.py` | SHARP | (A)(C) |
 | `CSI_doppler_plot.py` | SHARP (plots_utility) | 軸を実測値から決める (C) |
+| `network_utility.py` | SHARP | **無変更** (そのまま利用) |
+| `dataset_utility.py` | SHARP | ラベル位置、アンテナの束ね方 (B)(C) |
+| `CSI_doppler_create_dataset_train.py` / `_test.py` | SHARP | ラベル位置、アンテナの選択 (B)(C) |
+| `CSI_network.py` / `CSI_network_test.py` | SHARP | アンテナの選択、評価の一般化 (B)(D) |
+| `CSI_network_metrics.py` / `CSI_network_metrics_plot.py` | SHARP | 任意のクラス数・アンテナ数に一般化 (B) |
+| `metrics_utility.py` | 新規 | 上 2 つに重複していた評価処理をまとめた |
 
 ---
 
@@ -321,7 +328,70 @@ prof = np.exp(-1j * 2 * np.pi * np.outer(f_grid, t)) @ (x * w[:, None])
 
 ---
 
-## 5. 新規に追加したもの (オリジナルに対応物が無い)
+## 5. 活動認識 (手順6〜8) の変更点
+
+次は**変えていない**: ネットワークの構造 (`network_utility.py`)、学習の設定
+(Adam 1e-4、損失、`val_loss` で patience 3 の早期終了、最大 25 エポック)、
+データセットの分け方 (測定ごとに時間方向で 学習 60% / 検証 20% / テスト 20%、
+境目に窓長ぶんの間隔)、窓の切り方、アンテナごとの予測を統合する規則。
+
+### 5.1 活動ラベルを読む位置 (C)
+
+```python
+# SHARP オリジナル (S1a_E_stream_0 の 'E' = 5 文字目)
+label = name[4]
+```
+```python
+# SHARP-USRP (S1_E_antenna1_... の 'E' = 4 文字目)
+LABEL_CHAR_INDEX = 3
+label = name[LABEL_CHAR_INDEX]
+```
+
+### 5.2 アンテナの束ね方と選択 (B)(C)
+
+```python
+# SHARP オリジナル: 名前順に並べたファイルを n_tot 個ずつ区切って 1 測定とみなす
+if i_name % n_tot == 0 and i_name != 0 and processed:
+```
+
+SHARP-USRP はファイル名中の `antenna1` / `antenna2` を見て、アンテナ名以外が
+同じファイルどうしを 1 測定として束ねる。最後の引数 `n_tot` (本数) は、使う
+アンテナの指定 (`antenna1,antenna2` / `antenna1`。本数 `2` も可) に置き換えた。
+
+オリジナルの区切り方で antenna1 だけを使おうとして `n_tot=1` にすると、antenna2 の
+ファイルも別の測定として混ざってしまう。相方のアンテナが無い測定は警告して使わない。
+データセット・モデル・結果のファイル名に使ったアンテナを含めたので、本数を変えた
+結果どうしは上書きされない。
+
+### 5.3 アンテナ間の長さの違い (C)
+
+SHARP は 4 コアが同じパケットを受けるので長さが常に一致し、一致しなければエラーに
+していた。USRP 2 台では受けたパケットの数が違うため、短いほうに揃える (末尾を切る)。
+速度軸の範囲 `v_max` が 10% 以上違うファイルが混ざると警告する
+(`_meta.json` から読む。ネットワークはビン番号しか見ないため)。
+
+### 5.4 `_meta.json` を読み込み対象から外す (C)
+
+オリジナルは `S` で始まるファイルをすべてドップラーデータとみなし、末尾 4 文字を
+落として `.txt` を付け直して開く。本実装の手順4 が横に出す `S1_..._meta.json` も
+対象になり、存在しない `..._meta..txt` を開こうとして失敗する。
+
+### 5.5 学習・評価の修正 (D)
+
+| | SHARP オリジナル | SHARP-USRP |
+|---|---|---|
+| 評価に使うモデル | 最良エポックを保存した後、最終エポックのモデルで上書きしてから評価 | 検証正解率が最良のエポックのモデル |
+| アンテナ本数ごとの評価 | 4 本決め打ち (`[[0],[1],[2],[3]]` など)。2 本では IndexError | 任意の本数の全組み合わせ |
+| その評価のクラス | `labels=[0, 1, 2, 3, 4]` 決め打ち | 活動の数に従う |
+| `confusion_matrix(..., labels_considered)` | 位置引数 (scikit-learn 1.x では TypeError) | キーワード引数 |
+| モデルの保存形式 | `.h5` | `.keras` (Keras 3 では `.h5` は旧形式として警告が出る) |
+| テスト用データセットの作成 | 同じサブディレクトリの学習用データセットを削除 | 削除しない |
+| `--bandwidth` / `--sub_band` | 出力ファイル名にのみ使われていた | 廃止 |
+| 窓の保存 | float64 | float32 (容量が半分。学習時はどのみち float32 に変換される) |
+
+---
+
+## 6. 新規に追加したもの (オリジナルに対応物が無い)
 
 | ファイル | 役割 |
 |---|---|
@@ -333,10 +403,11 @@ prof = np.exp(-1j * 2 * np.pi * np.outer(f_grid, t)) @ (x * w[:, None])
 | `tests/test_pipeline.py` | 変換の可逆性・位相安定化の効果を VHT20/HE20 で検証 |
 | `tests/test_doppler.py` | 非等間隔サンプリングの 3 手法を比較検証 |
 | `tests/test_matlab_parity.py` | MATLAB 版と Python 版の一致を Octave で検証 |
+| `tests/test_har.py` | データセット作成 (ラベル位置・アンテナの束ね方) と、S1 で学習 → S2,S3 でテストの流れを合成データで検証 |
 
 ---
 
-## 6. 検証結果まとめ
+## 7. 検証結果まとめ
 
 | 検証 | 結果 |
 |---|---|
@@ -346,15 +417,15 @@ prof = np.exp(-1j * 2 * np.pi * np.outer(f_grid, t)) @ (x * w[:, None])
 | MATLAB 版 vs Python 版 | `csi_buff` がビット単位で一致 |
 | ドップラー: `none` vs `nudft` (実データ) | マップ相関 0.9996 |
 | 実データのドップラーマップ | 0 m/s に静止成分、0.9/1.65/2.45 秒付近に ±2 m/s の拡がり |
+| 活動認識 (合成ドップラーデータ, 3 クラス, アンテナ 2 台で長さ違い) | S1 で学習 → S2,S3 で正解率 1.0 (アンテナ 2 本統合 / antenna1 のみ) |
 
 ---
 
-## 7. まだ確認していないこと
+## 8. まだ確認していないこと
 
 - **Wi-Fi 6 の実データ** — HE20 の経路は合成データでのみ検証。
   `decodeIQ_HE.m` は復号できたパケットからサブキャリア番号を実測して
   `subcarrierIndicesHE20` を上書きするため、実データ取得後に手順0 が
   構成の不一致を報告しないか確認すること
-- **活動認識ネットワークへの接続** — SHARP の `CSI_doppler_create_dataset_*.py`
-  以降は未検証。入力サイズを引数で受け取る作りなので 20MHz のサブキャリア数に
-  合わせれば流用できる見込み
+- **活動認識の実データでの精度** — 手順6〜8 は合成ドップラーデータでのみ検証。
+  実測の S1〜S3 での精度はまだ確かめていない

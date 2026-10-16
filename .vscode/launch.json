@@ -1,0 +1,69 @@
+{
+    // SHARP-USRP の活動認識 (S1 で学習、S2・S3 でテスト) を VS Code から実行する設定。
+    // 「実行とデバッグ」(Ctrl+Shift+D) で項目を選び F5 (デバッグなしなら Ctrl+F5)。
+    // 起動時に、使うアンテナと活動ラベルを聞かれる。
+    // データの場所やセッション名 (S1 / S2,S3) を変えるときは args を書き換える。
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "SHARP 1. データセット作成 (学習用: S1)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/SHARP-USRP/Python_code/CSI_doppler_create_dataset_train.py",
+            "cwd": "${workspaceFolder}/SHARP-USRP/Python_code",
+            "args": ["./doppler_traces/", "S1", "31", "1", "340", "30", "${input:activities}", "${input:antennas}"],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "SHARP 2. データセット作成 (テスト用: S2,S3)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/SHARP-USRP/Python_code/CSI_doppler_create_dataset_test.py",
+            "cwd": "${workspaceFolder}/SHARP-USRP/Python_code",
+            "args": ["./doppler_traces/", "S2,S3", "31", "1", "340", "30", "${input:activities}", "${input:antennas}"],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "SHARP 3. 学習 (S1)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/SHARP-USRP/Python_code/CSI_network.py",
+            "cwd": "${workspaceFolder}/SHARP-USRP/Python_code",
+            "args": ["./doppler_traces/", "S1", "100", "340", "1", "32", "${input:antennas}", "usrp", "${input:activities}"],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "SHARP 4. テスト (S2,S3)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/SHARP-USRP/Python_code/CSI_network_test.py",
+            "cwd": "${workspaceFolder}/SHARP-USRP/Python_code",
+            "args": ["./doppler_traces/", "S2,S3", "100", "340", "1", "32", "${input:antennas}", "usrp", "${input:activities}"],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "SHARP 5. 混同行列の描画 (S2,S3)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/SHARP-USRP/Python_code/CSI_network_metrics_plot.py",
+            "cwd": "${workspaceFolder}/SHARP-USRP/Python_code",
+            "args": ["complete_different_${input:antennas}_${input:activities}_S2,S3", "${input:activities}"],
+            "console": "integratedTerminal"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "antennas",
+            "type": "pickString",
+            "description": "使うアンテナ",
+            "options": ["antenna1,antenna2", "antenna1", "antenna2"],
+            "default": "antenna1,antenna2"
+        },
+        {
+            "id": "activities",
+            "type": "promptString",
+            "description": "活動ラベル (カンマ区切り。ファイル名の 4 文字目)",
+            "default": "E,L,W,R,J"
+        }
+    ]
+}
