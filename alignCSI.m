@@ -9,17 +9,24 @@
 %    揃えられない。
 %
 %  揃え方 (パケットの到着時刻の突き合わせ):
-%    2 台は同じ AP・同じクライアントの同じパケットを受信している。各パケットの
-%    到着時刻の並び方は、送信のたびの待ち時間 (バックオフ) などで不規則なので、
-%    指紋のように一致する場所が 1 か所しかない。これを使って、
-%      1. 粗い位置合わせ   antenna1 の中ほど 5 秒分の並びを、antenna2 の中で
-%                          ±maxOffsetSec の範囲で探す (相互相関, 50 us 単位)
-%      2. パケットの対応づけ 同じ種類のパケット同士 (HE の下り同士、RTS 同士、
-%                          Block Ack 同士 …) を 1 対 1 で対応づける
-%      3. ずれの追跡      2 秒ごとにずれを求め直す。これでクロックのわずかな
-%                          差 (数 ppm) や、オーバーランによる時刻の段差にも
-%                          追従できる
-%    の順に揃える。精度は数 us 程度 (パケット間隔は数 ms)。
+%    2 台は同じ AP・同じクライアントの同じパケットを受信している。同じパケット
+%    なら、2 台での到着時刻の差 (= 2 台の時計のずれ) は 1 us 以下の精度で
+%    そろう。一方、iperf3 で飽和した通信は数 ms 周期でほぼ同じ形が繰り返される
+%    ので、粗い時間分解能で比べると「1 周期ずれた位置」とも区別がつかない。
+%    違うパケット同士はバックオフ (9 us 単位のランダムな待ち時間) の分だけ
+%    ずれるので、10 us の細かさで比べれば本当の位置だけが際立つ。これを使って、
+%      1. 粗い位置合わせ   antenna1 の 5 か所 (各 1 秒) のパケットについて、
+%                          antenna2 の同じ種類のパケットとの時刻差を
+%                          ±maxOffsetSec の範囲で全部求め、10 us の幅に
+%                          一番多く集まる時刻差を採る
+%      2. ずれの追跡      1 秒ごとに、前の区間のずれの近く (±20 ms、見つから
+%                          なければ ±2 s) で同じように求め直す。これでクロック
+%                          のわずかな差 (数 ppm) や、オーバーランによる時刻の
+%                          段差にも追従できる
+%      3. パケットの対応づけ 同じ種類のパケット同士 (HE の下り同士、RTS 同士、
+%                          Block Ack 同士 …) を、その区間のずれ ±20 us で
+%                          1 対 1 で対応づけ、その間を直線で補間する
+%    の順に揃える。精度は 1 us 程度 (パケット間隔は数 ms)。
 %
 %    すでに復号済みの *_CSI.mat だけを使うので、復号し直す必要はない。
 %
@@ -185,10 +192,14 @@ function res = alignPair(pr, cfg)
     B = load(pr.otherFile);
     evA = collectEvents(A);
     evB = collectEvents(B);
+    [evA, evB] = indexKinds(evA, evB);
     D1  = max([captureLength(A); evA.t]);
     D2  = max([captureLength(B); evB.t]);
     fprintf('  パケット数 (対象SSIDの全形式): %s %d 件 / %s %d 件\n', ...
         cfg.refTag, numel(evA.t), cfg.otherTag, numel(evB.t));
+    fprintf('  キャプチャ時のオーバーラン  : %s %g 回 / %s %g 回\n', ...
+        cfg.refTag, fieldOr(A.csiMeta, 'overrunCount', NaN), ...
+        cfg.otherTag, fieldOr(B.csiMeta, 'overrunCount', NaN));
     if numel(evA.t) < 200 || numel(evB.t) < 200
         res = failResult(res, sprintf( ...
             'パケットが少なすぎて揃えられません (%d 件 / %d 件)。', numel(evA.t), numel(evB.t)));
@@ -196,10 +207,21 @@ function res = alignPair(pr, cfg)
     end
 
     % --- 1. 粗い位置合わせ ---
-    [L0, conf] = coarseOffset(evA, evB, D1, cfg.maxOffsetSec);
+    co = coarseOffset(evA, evB, D1, cfg.maxOffsetSec);
+    if isempty(co.conf)
+        res = failResult(res, '位置合わせに使える区間がありません (パケットが少なすぎます)。');
+        return;
+    end
+    fprintf('  粗い位置合わせ (%s の 1 秒区間ごとに、±%g 秒の範囲を 10 us の細かさで探索):\n', ...
+        cfg.refTag, cfg.maxOffsetSec);
+    for s = 1:numel(co.conf)
+        fprintf('    %5.1f s 付近: ずれ %+.6f s, 一致 %4d / %4d 件, 確信度 %5.1f\n', ...
+            co.segCenter(s), co.offset(s), co.count(s), co.nRef(s), co.conf(s));
+    end
+    [conf, best] = max(co.conf);
+    L0 = co.offset(best);
     res.confidence = conf;
-    fprintf('  粗い位置合わせ: ずれ %.4f s (確信度 %.1f)\n', L0, conf);
-    if conf < 1.5
+    if conf < 3
         res = failResult(res, sprintf( ...
             ['パケットの並びが一致する位置をはっきり見つけられませんでした (確信度 %.1f)。', ...
              '開始時刻のずれが %g 秒を超えている、または 2 台で共通に受けた', ...
@@ -207,8 +229,8 @@ function res = alignPair(pr, cfg)
         return;
     end
 
-    % --- 2, 3. パケットの対応づけと、ずれの追跡 ---
-    fm = fineMatch(evA, evB, L0);
+    % --- 2, 3. ずれの追跡と、パケットの対応づけ ---
+    fm = fineMatch(evA, evB, D1, co.segCenter(best), L0);
     res.nPairs     = numel(fm.t1);
     res.residualUs = fm.residualUs;
     res.driftPpm   = fm.driftPpm;
@@ -240,8 +262,8 @@ function res = alignPair(pr, cfg)
 
     fprintf('  対応づけたパケット: %d 組 (%s の %.0f%%)、残差 %.1f us\n', ...
         numel(fm.t1), cfg.refTag, 100 * res.matchRatio, fm.residualUs);
-    fprintf('  ずれの変化: 開始時 %.3f ms -> 終了時 %.3f ms (クロック差 %.1f ppm)\n', ...
-        1e3 * offP(1), 1e3 * offP(end), fm.driftPpm);
+    fprintf('  ずれ (%s - %s): 最初 %+.6f s -> 最後 %+.6f s (クロック差 %.1f ppm)\n', ...
+        cfg.otherTag, cfg.refTag, offP(1), offP(end), fm.driftPpm);
     if ~isempty(fm.stepTimes)
         for s = 1:numel(fm.stepTimes)
             fprintf('  時刻の段差: %.1f s 付近で %.2f ms (どちらかのオーバーランと思われる。追従済み)\n', ...
@@ -362,142 +384,63 @@ function D = captureLength(S)
     end
 end
 
-function [L0, conf] = coarseOffset(evA, evB, D1, M)
-    % ref の中ほど 5 秒分のパケットの並びを、other の中で ±M 秒の範囲で探す。
-    % 種類ごとに 50 us 単位の相互相関を取って足し合わせる。
-    binW   = 50e-6;
-    segLen = 5;
-    s0     = max(0, D1 / 2 - segLen / 2);
-    inSeg  = evA.t >= s0 & evA.t < s0 + segLen;
-    if nnz(inSeg) < 100
-        segLen = 15;
-        s0     = max(0, D1 / 2 - segLen / 2);
-        inSeg  = evA.t >= s0 & evA.t < s0 + segLen;
+function [evA, evB] = indexKinds(evA, evB)
+    % 種類を番号にし、other は種類ごとのパケット番号の一覧を作っておく
+    % (対応づけで何度も使うので、文字列の比較を毎回しないため)。
+    [~, ~, id] = unique([evA.kind; evB.kind]);
+    nA = numel(evA.t);
+    evA.kid = id(1:nA);
+    evB.kid = id(nA+1:end);
+    nK = max([id; 0]);
+    evB.byKind = cell(nK, 1);
+    for q = 1:nK
+        evB.byKind{q} = find(evB.kid == q);
     end
-
-    nR   = ceil(segLen / binW);
-    nO   = ceil((segLen + 2 * M) / binW);
-    nfft = 2^nextpow2(nR + nO);
-    C    = zeros(nfft, 1);
-    kinds = unique(evA.kind(inSeg));
-    for q = 1:numel(kinds)
-        r = evA.t(inSeg & strcmp(evA.kind, kinds{q})) - s0;
-        o = evB.t(strcmp(evB.kind, kinds{q})) - (s0 - M);
-        o = o(o >= 0 & o < segLen + 2 * M);
-        if isempty(r) || isempty(o)
-            continue;
-        end
-        R = accumarray(min(floor(r / binW) + 1, nR), 1, [nR 1]);
-        O = accumarray(min(floor(o / binW) + 1, nO), 1, [nO 1]);
-        C = C + real(ifft(conj(fft(R, nfft)) .* fft(O, nfft)));
-    end
-
-    K  = nO - nR + 1;              % 調べるずれの数
-    Cs = movsum(C(1:K), 5);        % ±100 us をまとめて数える
-    [pk, kIdx] = max(Cs);
-    L0 = (kIdx - 1) * binW - M;
-
-    % 確信度 = 一番の山 / それ以外 (±1 ms の外) で一番の山
-    guard = 20;
-    Cs2 = Cs;
-    Cs2(max(1, kIdx - guard):min(K, kIdx + guard)) = 0;
-    conf = pk / max(max(Cs2), 1);
 end
 
-function fm = fineMatch(evA, evB, L0)
-    % 同じ種類のパケット同士を 1 対 1 で対応づけ、2 秒ごとのずれを追跡する。
-    W      = 10e-3;     % 粗い位置合わせからのずれとして探す範囲
-    winLen = 2;         % ずれを求め直す間隔 [s]
+function co = coarseOffset(evA, evB, D1, M)
+    % ref の 5 か所 (各 1 秒) について、other とのずれを ±M 秒の範囲で探す。
+    % 同じ種類のパケット同士の時刻差を全部求め、幅 10 us に一番多く集まる
+    % 時刻差を、その区間のずれとする。
+    % 確信度 = その山の件数 / ±1 ms より外で 2 番目に大きい山の件数
+    segLen = 1;
+    fracs  = [0.3 0.4 0.5 0.6 0.7];
+    bw     = 10e-6;
+    co = struct('segCenter', [], 'offset', [], 'count', [], 'nRef', [], 'conf', []);
+    for f = fracs
+        s0  = max(0, D1 * f - segLen / 2);
+        sel = find(evA.t >= s0 & evA.t < s0 + segLen);
+        if numel(sel) < 50
+            continue;
+        end
+        d = pairDiffs(evA, sel, evB, -M, M);
+        if isempty(d)
+            continue;
+        end
+        [loc, cnt] = diffPeaks(d, bw, 1e-3, 2);
+        co.segCenter(end+1) = s0 + segLen / 2;
+        co.offset(end+1)    = loc(1);
+        co.count(end+1)     = cnt(1);
+        co.nRef(end+1)      = numel(sel);
+        co.conf(end+1)      = cnt(1) / max(cnt(2), 1);
+    end
+end
+
+function fm = fineMatch(evA, evB, D1, anchorT, L0)
+    % 1 秒ごとにずれを追跡し、同じ種類のパケット同士を 1 対 1 で対応づける。
+    winLen = 1;         % ずれを求め直す間隔 [s]
     tolAcc = 20e-6;     % その区間のずれからの許容幅
 
-    [cRef, cOth, cD] = candidatePairs(evA, evB, L0, W);
-    if isempty(cRef)
-        fm = struct('t1', [], 't2', [], 'residualUs', NaN, 'driftPpm', NaN, ...
-            'stepTimes', [], 'stepSizes', []);
-        return;
-    end
-
-    cT1 = evA.t(cRef);
-    wIdx = floor(cT1 / winLen) + 1;
-    nW   = max(max(wIdx), floor(max(evA.t) / winLen) + 1);
-    nRefWin = accumarray(floor(evA.t / winLen) + 1, 1, [nW 1]);
-
-    edges = -W:10e-6:W;
-    offW  = NaN(nW, 1);       % 区間ごとの主なずれ (一番大きい山)
-    peaksW = cell(nW, 1);     % 区間ごとのずれの山 (段差を含む区間では 2 つ)
-    for w = 1:nW
-        sel = (wIdx == w);
-        if nnz(sel) < 5
-            continue;
-        end
-        cnt = movsum(histcounts(cD(sel), edges), 3);
-        % 2 台がそろっていない区間では、たまたまの一致しかないので採用しない
-        thr = max(5, 0.1 * nRefWin(w));
-        pk = [];
-        while true
-            [cmax, m] = max(cnt);
-            if cmax < thr
-                break;
-            end
-            center = (edges(m) + edges(m + 1)) / 2;
-            near = sel & abs(cD - center) < tolAcc;
-            if nnz(near) >= thr
-                pk(end+1) = median(cD(near)); %#ok<AGROW>
-            end
-            cnt(max(1, m - 4):min(numel(cnt), m + 4)) = 0;
-        end
-        peaksW{w} = pk;
-        if ~isempty(pk)
-            offW(w) = pk(1);
-        end
-    end
-
-    % 各候補を、自分の区間の山と、隣の区間の主なずれに照らして採否を決める。
-    % オーバーランで時刻に段差がある区間では、段差の手前は前の区間と、
-    % 後ろは次の区間と同じずれになる。少数派の側も取りこぼさないため。
-    resid = inf(size(cD));
-    for w = 1:nW
-        cand = peaksW{w};
-        if w > 1 && ~isnan(offW(w - 1))
-            cand(end+1) = offW(w - 1); %#ok<AGROW>
-        end
-        if w < nW && ~isnan(offW(w + 1))
-            cand(end+1) = offW(w + 1); %#ok<AGROW>
-        end
-        if isempty(cand)
-            continue;
-        end
-        sel = find(wIdx == w);
-        for c = cand
-            resid(sel) = min(resid(sel), abs(cD(sel) - c));
-        end
-    end
-    idx = find(resid < tolAcc);
-    % 1 つのパケットに複数の相手が残った場合は、ずれに一番近いものを採る
-    [~, ord] = sort(resid(idx));
-    idx = idx(ord);
-    [~, first] = unique(cRef(idx), 'stable');  idx = idx(first);
-    [~, first] = unique(cOth(idx), 'stable');  idx = idx(first);
-
-    t1 = evA.t(cRef(idx));
-    t2 = evB.t(cOth(idx));
-    [t2, ord] = sort(t2);
-    t1  = t1(ord);
-    idx = idx(ord);
-    keep = [true; diff(t2) > 0 & diff(t1) > 0];
-    t1 = t1(keep); t2 = t2(keep); idx = idx(keep);
-
-    % 前後 7 組の中央値から外れた対応を除く。孤立した取り違えだけが消え、
-    % オーバーランによる本物の段差は (多数派が切り替わるだけなので) 残る。
-    off  = t2 - t1;
-    keep = abs(off - movmedian(off, 15)) < tolAcc;
-    t1 = t1(keep); t2 = t2(keep); idx = idx(keep);
+    nW   = max(1, ceil(max([D1; evA.t]) / winLen));
+    wOf  = min(floor(evA.t / winLen) + 1, nW);   % ref の各パケットの区間番号
+    offW = trackOffset(evA, evB, wOf, nW, winLen, anchorT, L0);
+    [t1, t2, resid] = matchPackets(evA, evB, offW, wOf, tolAcc);
 
     % --- 品質の指標 ---
     fm = struct();
     fm.t1 = t1;
     fm.t2 = t2;
-    fm.residualUs = 1e6 * sqrt(mean(resid(idx).^2));
+    fm.residualUs = 1e6 * sqrt(mean(resid .^ 2));
 
     valid = find(~isnan(offW));
     tw = (valid - 0.5) * winLen;
@@ -511,56 +454,199 @@ function fm = fineMatch(evA, evB, L0)
     fm.driftPpm = 1e6 * median(slopes, 'omitnan');
 end
 
-function [cRef, cOth, cD] = candidatePairs(evA, evB, L0, W)
-    % ref の各パケットについて、同じ種類の other のパケットのうち
-    % 粗いずれ L0 から ±W に入るものを候補として全部挙げる。
-    kinds = unique(evA.kind);
-    parts = cell(numel(kinds), 3);
-    for q = 1:numel(kinds)
-        ia = find(strcmp(evA.kind, kinds{q}));
-        ib = find(strcmp(evB.kind, kinds{q}));
-        if isempty(ia) || isempty(ib)
+function offW = trackOffset(evA, evB, wOf, nW, winLen, anchorT, L0)
+    % 粗い位置合わせをした区間から前後へ 1 区間ずつ進み、前の区間のずれの
+    % 近くで、その区間のずれを求める。2 台がそろっていない区間は NaN。
+    offW = NaN(nW, 1);
+    a = min(max(floor(anchorT / winLen) + 1, 1), nW);
+    orders = {a:nW, a-1:-1:1};
+    for k = 1:2
+        p = L0;
+        for w = orders{k}
+            offW(w) = windowOffset(evA, find(wOf == w), evB, p);
+            if ~isnan(offW(w))
+                p = offW(w);
+            end
+        end
+    end
+end
+
+function off = windowOffset(evA, sel, evB, p)
+    % 1 区間分のずれ。まず前の区間のずれ p の ±20 ms で探し、見つからなければ
+    % (大きなオーバーランの段差など) ±2 s に広げる。
+    off = NaN;
+    if numel(sel) < 5
+        return;
+    end
+    thr = max(5, 0.1 * numel(sel));   % 2 台がそろっていない区間はここで落ちる
+    for W = [20e-3, 2]
+        d = pairDiffs(evA, sel, evB, p - W, p + W);
+        if isempty(d)
             continue;
         end
-        r = evA.t(ia);
-        o = evB.t(ib);
-        nA = numel(r);
-        nB = numel(o);
-
-        jLo = zeros(nA, 1);
-        jHi = zeros(nA, 1);
-        j = 1;
-        for a = 1:nA
-            lo = r(a) + L0 - W;
-            while j <= nB && o(j) < lo
-                j = j + 1;
-            end
-            jLo(a) = j;
+        [loc, cnt] = diffPeaks(d, 10e-6, 1e-3, 2);
+        if cnt(1) >= thr && cnt(1) >= 2 * cnt(2)
+            off = loc(1);
+            return;
         end
-        j = 1;
-        for a = 1:nA
-            hi = r(a) + L0 + W;
-            while j <= nB && o(j) <= hi
-                j = j + 1;
-            end
-            jHi(a) = j - 1;
-        end
-
-        cnt = max(jHi - jLo + 1, 0);
-        pr = zeros(sum(cnt), 1);
-        po = zeros(sum(cnt), 1);
-        p = 0;
-        for a = find(cnt > 0).'
-            n = cnt(a);
-            pr(p + (1:n)) = ia(a);
-            po(p + (1:n)) = ib(jLo(a):jHi(a));
-            p = p + n;
-        end
-        parts(q, :) = {pr, po, evB.t(po) - evA.t(pr) - L0};
     end
-    cRef = vertcat(parts{:, 1});
-    cOth = vertcat(parts{:, 2});
-    cD   = vertcat(parts{:, 3});
+end
+
+function [t1, t2, resid] = matchPackets(evA, evB, offW, wOf, tol)
+    % 各区間のパケットを、その区間と前後の区間のずれ ±tol で対応づける。
+    % オーバーランで段差がある区間では、段差の手前は前の区間と、後ろは
+    % 次の区間と同じずれになるので、前後の区間のずれも候補に入れる。
+    nW = numel(offW);
+    parts = cell(nW, 3);
+    for w = 1:nW
+        nb   = [w, w - 1, w + 1];
+        nb   = nb(nb >= 1 & nb <= nW);
+        cand = offW(nb);
+        cand = cand(~isnan(cand));
+        sel  = find(wOf == w);
+        if isempty(cand) || isempty(sel)
+            continue;
+        end
+        IA = []; IB = []; R = [];
+        for c = cand(:).'
+            [d, ia, ib] = pairDiffs(evA, sel, evB, c - tol, c + tol);
+            IA = [IA; ia]; IB = [IB; ib]; R = [R; abs(d - c)]; %#ok<AGROW>
+        end
+        parts(w, :) = {IA, IB, R};
+    end
+    ia = vertcat(parts{:, 1});
+    ib = vertcat(parts{:, 2});
+    r  = vertcat(parts{:, 3});
+    if isempty(ia)
+        t1 = zeros(0, 1); t2 = zeros(0, 1); resid = zeros(0, 1);
+        return;
+    end
+
+    % 1 つのパケットに複数の相手が残った場合は、ずれに一番近いものを採る
+    [r, ord] = sort(r);
+    ia = ia(ord); ib = ib(ord);
+    [~, first] = unique(ia, 'stable');  ia = ia(first); ib = ib(first); r = r(first);
+    [~, first] = unique(ib, 'stable');  ia = ia(first); ib = ib(first); r = r(first);
+
+    t1 = evA.t(ia);
+    t2 = evB.t(ib);
+    [t2, ord] = sort(t2);
+    t1 = t1(ord);
+    r  = r(ord);
+    keep = [true; diff(t2) > 0 & diff(t1) > 0];
+    t1 = t1(keep); t2 = t2(keep); r = r(keep);
+
+    % 前後 7 組の中央値から外れた対応を除く。孤立した取り違えだけが消え、
+    % オーバーランによる本物の段差は (多数派が切り替わるだけなので) 残る。
+    off  = t2 - t1;
+    keep = abs(off - movmedian(off, 15)) < tol;
+    t1 = t1(keep); t2 = t2(keep); resid = r(keep);
+end
+
+function [d, ia, ib] = pairDiffs(evA, selA, evB, lo, hi)
+    % ref のパケット selA のそれぞれについて、同じ種類の other のパケットの
+    % うち (other の時刻) - (ref の時刻) が [lo, hi] に入るものを全部挙げる。
+    % d = その時刻差、ia / ib = ref / other のパケット番号
+    d = zeros(0, 1); ia = zeros(0, 1); ib = zeros(0, 1);
+    selA = selA(:);
+    if isempty(selA)
+        return;
+    end
+    wantIdx = (nargout > 1);
+    kA = evA.kid(selA);
+    parts = cell(0, 3);
+    for q = unique(kA).'
+        a = selA(kA == q);
+        b = evB.byKind{q};
+        if isempty(b)
+            continue;
+        end
+        r = evA.t(a);
+        % other は関係する範囲 [r(1)+lo, r(end)+hi] だけに先に絞る
+        o  = evB.t(b);
+        i0 = bisect(o, r(1) + lo, false);
+        i1 = bisect(o, r(end) + hi, true) - 1;
+        if i1 < i0
+            continue;
+        end
+        b = b(i0:i1);
+        o = o(i0:i1);
+        jLo = firstIndex(o, r + lo, false);       % o >= r+lo となる最初
+        jHi = firstIndex(o, r + hi, true) - 1;    % o <= r+hi となる最後
+        n   = max(jHi - jLo + 1, 0);
+        N   = sum(n);
+        if N == 0
+            continue;
+        end
+        rep = repelem((1:numel(a)).', n);
+        jj  = jLo(rep) + (1:N).' - 1 - repelem(cumsum(n) - n, n);
+        if wantIdx
+            parts(end+1, :) = {o(jj) - r(rep), a(rep), b(jj)}; %#ok<AGROW>
+        else
+            parts(end+1, :) = {o(jj) - r(rep), [], []}; %#ok<AGROW>
+        end
+    end
+    if ~isempty(parts)
+        d  = vertcat(parts{:, 1});
+        ia = vertcat(parts{:, 2});
+        ib = vertcat(parts{:, 3});
+    end
+end
+
+function k = bisect(o, x, orEqual)
+    % 昇順の o で、o(k) >= x (orEqual なら o(k) > x) となる最初の k
+    % (なければ numel(o)+1)。x はスカラー。
+    lo = 1; hi = numel(o) + 1;
+    while lo < hi
+        mid = floor((lo + hi) / 2);
+        if o(mid) < x || (orEqual && o(mid) == x)
+            lo = mid + 1;
+        else
+            hi = mid;
+        end
+    end
+    k = lo;
+end
+
+function j = firstIndex(o, x, orEqual)
+    % o と x は昇順。各 x(i) について、o(j) >= x(i) (orEqual なら o(j) > x(i))
+    % となる最初の j (なければ numel(o)+1)。
+    % o と x をまとめて並べ替え、各 x(i) より前に来た o の数を数える。
+    % sort は同じ値の順序を保つので、同じ値のときに o と x のどちらを先に
+    % 置くかで「>=」と「>」を切り替えられる。
+    n = numel(o);
+    m = numel(x);
+    if orEqual
+        v   = [o(:); x(:)];                 % 同じ値なら o が前 -> o <= x を数える
+        isX = [false(n, 1); true(m, 1)];
+    else
+        v   = [x(:); o(:)];                 % 同じ値なら x が前 -> o <  x を数える
+        isX = [true(m, 1); false(n, 1)];
+    end
+    [~, ord] = sort(v);
+    posX = find(isX(ord));                  % x は昇順なので元の順に並ぶ
+    j = reshape(posX - (1:m).' + 1, size(x));
+end
+
+function [loc, cnt] = diffPeaks(d, bw, guard, nMax)
+    % 時刻差 d の中で、幅 bw に一番多く集まる位置を大きい順に nMax 個。
+    % 2 つ目以降は、それまでの山から ±guard 以上離れたところから探す。
+    loc = NaN(nMax, 1);
+    cnt = zeros(nMax, 1);
+    if isempty(d)
+        return;
+    end
+    d = sort(d(:));
+    c = firstIndex(d, d + bw, true) - (1:numel(d)).';   % [d(i), d(i)+bw] の件数
+    for p = 1:nMax
+        [cp, i1] = max(c);
+        if cp <= 0
+            break;
+        end
+        cnt(p) = cp;
+        loc(p) = median(d(i1 : i1 + cp - 1));
+        c(abs(d - loc(p)) < guard) = 0;
+    end
 end
 
 function off = offsetAt(t2, t2p, offP)
