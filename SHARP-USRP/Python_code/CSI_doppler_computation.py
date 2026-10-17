@@ -326,6 +326,20 @@ def process_one(mat_file, out_file, args):
     with open(out_file, 'wb') as fp:
         pickle.dump(arr, fp)
 
+    # 各窓の実時刻 (窓の中央) を保存する。パケット到着が不均一だと
+    # 「窓番号 x ずらし x Tc」で合成した時間軸は実時間とずれていくため、
+    # 描画側はこちらを使う。
+    if time_sec is not None and time_sec.size >= args.sample_length:
+        ts = np.sort(time_sec)
+        centers = np.array([
+            ts[i:i + args.sample_length].mean()
+            for i in range(0, ts.size - args.sample_length, args.sliding)])
+        if centers.size >= arr.shape[0]:
+            centers = centers[:arr.shape[0]] - ts[0]
+            np.save(out_file[:-4] + '_time.npy', centers)
+            print(f'  実測の長さ: {ts[-1]-ts[0]:.1f} s '
+                  f'(Tc から合成すると {arr.shape[0]*args.sliding*Tc:.1f} s)')
+
     meta = dict(
         source=path.basename(mat_file),
         shape=list(arr.shape),
@@ -399,6 +413,15 @@ def main():
                         metavar=('LO', 'HI'),
                         help='使用するサブキャリアの範囲 (既定は全部)')
     args = parser.parse_args()
+
+    # 雑音床は 10^x として使う。x >= 0 だと 10^x >= 1 となり、窓ごとの
+    # 最大値 1.0 を含む全ビンが切り捨てられて真っ平らな図になる。
+    if args.noise_level >= 0:
+        parser.error(
+            f'noise_level は負の値で指定してください (指定値 {args.noise_level})。'
+            f'10^{args.noise_level:g} = {10**args.noise_level:g} となり、'
+            f'正規化後の全ビン (最大 1.0) が切り捨てられて一様な図になります。'
+            f'例: -3.0 (= -30 dB)')
 
     for subdir in args.subdirs.split(','):
         exp_dir = path.join(args.dir, subdir) if subdir != '.' else args.dir

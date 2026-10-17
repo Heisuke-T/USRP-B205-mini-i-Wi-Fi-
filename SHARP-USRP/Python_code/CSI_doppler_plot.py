@@ -33,6 +33,10 @@ def load_doppler(txt_file):
     if path.exists(meta_file):
         with open(meta_file, encoding='utf-8') as fp:
             meta = json.load(fp)
+    # 各窓の実時刻があれば読む (無ければ描画側で Tc から合成)
+    time_file = txt_file[:-4] + '_time.npy'
+    if path.exists(time_file):
+        meta['window_times'] = np.load(time_file)
     return arr, meta
 
 
@@ -54,9 +58,16 @@ def plot_doppler(arr, meta, out_png, title=None, vmin_db=None, ylim=None):
         y_label = 'Doppler bin'
 
     # 横軸 (時間)
-    if Tc is not None:
-        t_axis = np.arange(n_win) * sliding * Tc
+    # パケット到着が不均一な測定では「窓番号 x ずらし x Tc」で合成すると
+    # 実時間とずれる (バーストが多いと長く、欠落が多いと短く出る)。
+    # 手順4 が残した実測時刻があればそれを使う。
+    wt = meta.get('window_times')
+    if wt is not None and len(wt) == n_win:
+        t_axis = np.asarray(wt)
         x_label = 'Time [s]'
+    elif Tc is not None:
+        t_axis = np.arange(n_win) * sliding * Tc
+        x_label = 'Time [s]  (estimated from Tc)'
     else:
         t_axis = np.arange(n_win)
         x_label = 'Window index'
@@ -80,9 +91,16 @@ def plot_doppler(arr, meta, out_png, title=None, vmin_db=None, ylim=None):
     cbar = fig.colorbar(mesh, ax=ax)
     cbar.set_label('Normalized power [dB]')
 
-    os.makedirs(path.dirname(path.abspath(out_png)), exist_ok=True)
-    fig.savefig(out_png, dpi=150)
-    plt.close(fig)
+    # 保存先は絶対パスに直してから作る。'./plots/' のような相対表記のまま
+    # Pillow に渡すと、Windows で原因の分かりにくい OSError (Errno 22) に
+    # なることがあるため。ファイルもこちらで開いて渡す。
+    out_png = path.normpath(path.abspath(out_png))
+    os.makedirs(path.dirname(out_png), exist_ok=True)
+    try:
+        with open(out_png, 'wb') as fp:
+            fig.savefig(fp, format='png', dpi=150)
+    finally:
+        plt.close(fig)
     return out_png
 
 
@@ -109,12 +127,30 @@ def main():
         print(f'{args.dir}: .txt がありません')
         return
 
+    out_dir = path.normpath(path.abspath(args.out_dir))
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 1 枚失敗しても残りを描く。途中で例外を上げると、後続のファイルが
+    # まるごと描かれないまま終わってしまうため。
+    failed = []
     for name in names:
-        arr, meta = load_doppler(path.join(args.dir, name + '.txt'))
-        out_png = path.join(args.out_dir, name + '.png')
-        plot_doppler(arr, meta, out_png, title=name,
-                     vmin_db=args.vmin_db, ylim=args.ylim)
+        out_png = path.join(out_dir, name + '.png')
+        try:
+            arr, meta = load_doppler(path.join(args.dir, name + '.txt'))
+            plot_doppler(arr, meta, out_png, title=name,
+                         vmin_db=args.vmin_db, ylim=args.ylim)
+        except Exception as exc:
+            failed.append((name, f'{type(exc).__name__}: {exc}'))
+            print(f'{name}: 描画に失敗 ({type(exc).__name__}: {exc})')
+            continue
         print(f'{name}: {arr.shape} -> {out_png}')
+
+    if failed:
+        print(f'\n描画できなかったファイル {len(failed)} 件:')
+        for name, msg in failed:
+            print(f'  {name}: {msg}')
+        print('  (保存先が別のプログラムに開かれていないか、'
+              '出力先フォルダに書き込めるかを確認してください)')
 
 
 if __name__ == '__main__':
