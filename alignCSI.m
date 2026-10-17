@@ -132,7 +132,12 @@ function runAlign(cfg)
                 res = newResult(pairs(k));
                 res.status = 'FAIL';
                 res.message = ME.message;
-                fprintf(2, '\n  失敗しました: %s\n', ME.message);
+                if ~isempty(ME.stack)
+                    % 想定外のエラーは、どこで起きたかも残す
+                    res.message = sprintf('%s (%s の %d 行目)', ME.message, ...
+                        ME.stack(1).name, ME.stack(1).line);
+                end
+                fprintf(2, '\n  失敗しました: %s\n', res.message);
             end
         end
         results(end+1) = res; %#ok<AGROW>
@@ -578,8 +583,11 @@ function [d, ia, ib] = pairDiffs(evA, selA, evB, lo, hi)
         if N == 0
             continue;
         end
-        rep = repelem((1:numel(a)).', n);
-        jj  = jLo(rep) + (1:N).' - 1 - repelem(cumsum(n) - n, n);
+        % repelem は対象が 1 個 (スカラー) だと行ベクトルを返すので、
+        % 必ず列ベクトルにそろえる (その種類が区間に 1 回だけのとき)
+        rep  = reshape(repelem((1:numel(a)).', n), [], 1);
+        base = reshape(repelem(cumsum(n) - n, n), [], 1);
+        jj   = jLo(rep) + (1:N).' - 1 - base;
         if wantIdx
             parts(end+1, :) = {o(jj) - r(rep), a(rep), b(jj)}; %#ok<AGROW>
         else
